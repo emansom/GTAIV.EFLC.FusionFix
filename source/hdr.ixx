@@ -189,6 +189,56 @@ public:
         pDevice->SetPixelShaderConstantF(kParamRegister, params, 1);
     }
 
+    // The pause menu (labels, settings, map) and the splash / loading screens
+    // run at the panel's peak instead of paper white - a deliberate "HDR is on"
+    // signature, chosen over BT.2408's reference level for those surfaces. This
+    // is applied per DRAW, not per frame: the gta_im / rage_im pixel shaders
+    // scale their colour output by (1 + c207.y), so UI elements self-emit above
+    // 1.0 into the fp16 back buffer and the final blit lands them at peak,
+    // while the world seen through the menu's translucent backdrop - and
+    // everything a local-dimming panel keeps dark around splash artwork -
+    // stays at the calibrated paper white. The mad form is deliberate: an
+    // unset constant reads 0.0, which makes the scale an exact identity, so
+    // stock behaviour needs no upload, no flow control, and no flag - frames
+    // before the first upload and non-HDR sessions are untouched by
+    // construction. The ramp is smoothed (~120 ms) so opening the menu
+    // brightens rather than strobes.
+    static void UploadUiBoost(IDirect3DDevice9* pDevice)
+    {
+        const bool menu = CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive;
+        const bool loading = CMenuManager::bLoadscreenShown && *CMenuManager::bLoadscreenShown;
+        const bool active = bEnabled && bContainerHdr && (menu || loading);
+
+        // The uploaded gain is factor^(1/2.2) - 1: the im shaders run in gamma
+        // space and the final blit decodes with pow(2.2), so this makes the
+        // boost an exact UNIFORM luminance multiply in linear light. Uniformity
+        // matters: a per-pixel-level weight warps midtones and blended layers,
+        // which read as the menu changing colour whenever paper white changes.
+        const float paperWhite = (std::max)(fPaperWhiteNits, 50.0f);
+        const float target = active ? (std::max)(fPeakNits, paperWhite) / paperWhite : 1.0f;
+
+        static float fSmoothed = 1.0f;
+        static ULONGLONG lastTick = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (lastTick == 0 || now - lastTick > 1000)
+            fSmoothed = target;                     // first frame or long stall: snap
+        else
+            fSmoothed += (target - fSmoothed) * (1.0f - std::exp(-float(now - lastTick) / 120.0f));
+        lastTick = now;
+
+        // z: a small black floor, load screens only. Their dark artwork carries
+        // block-compression residue (a few code values of single-channel tint)
+        // that any gain would lift into visibility; flooring crushes it to true
+        // black before the gain, and 0 stays 0. The pause menu gets no floor -
+        // there the world shows through the translucent backdrop and must not
+        // be crushed.
+        const float gain = std::pow((std::max)(fSmoothed, 1.0f), 1.0f / 2.2f) - 1.0f;
+        const float floor = (loading && !menu && gain > 0.0f) ? 0.02f : 0.0f;
+
+        const float params[4] = { 0.0f, gain, floor, 0.0f };
+        pDevice->SetPixelShaderConstantF(207, params, 1);
+    }
+
 public:
     // Establishes the HDR10 container once, then does nothing. NOT a runtime switch:
     // dxvk.conf pins the colour space (it has to - DXVK disables the swapchain
@@ -335,6 +385,7 @@ public:
         if (!pDevice) return;
         SyncFromSettings();
         EnsureContainer(pDevice);
+        UploadUiBoost(pDevice);
     }
 };
 
