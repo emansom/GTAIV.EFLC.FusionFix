@@ -223,16 +223,15 @@ public:
 
     // Menu index -> nits. A short list of named presets rather than a fine-grained
     // slider: GTA IV can only show a bar for a slider, with no numeric readout, so
-    // a five-entry enum with real nits figures in its labels is both simpler and
-    // far more useful for calibration. Labels live in text/americanFF.txt as
-    // HDRPaperWhite0..4 / HDRPeak0..4 - keep the two in step.
+    // a three-entry option list with real nits figures is both simpler and far
+    // more useful for calibration.
     //
     //   paper white: 100 / 200 / 300 nits        (default index 1 = 200)
     //   peak:        Auto / 400 / 1000 nits      (default index 0 = Auto)
     //
-    // Both rows register their own enum in settings.ixx (HdrPaperWhiteText /
-    // HdrPeakText), so these indices line up with the strings shown in the menu -
-    // keep the two in step. Borrowing a stock MENU_DISPLAY_* enum instead would show
+    // The rows borrow the dormant MENU_DISPLAY_EXTRA_1 / EXTRA_2 enums and their
+    // option strings live in the <menupc> blocks of frontend_menus.xml - keep
+    // these indices in step with those blocks. Borrowing a LIVE stock enum would show
     // that enum's own fixed strings, which is why the option text lives there rather
     // than in text/americanFF.txt.
     static float PaperWhiteFromIndex(int32_t i)
@@ -261,16 +260,43 @@ public:
         if (!pHdr)        pHdr        = FusionFixSettings.GetRef("PREF_HDR");
         if (!pPaperWhite) pPaperWhite = FusionFixSettings.GetRef("PREF_HDR_PAPERWHITE");
         if (!pPeak)       pPeak       = FusionFixSettings.GetRef("PREF_HDR_PEAK");
-        if (!pHdr || !pPaperWhite || !pPeak) return;
 
-        bEnabled = pHdr->get() != 0;
-        fPaperWhiteNits = PaperWhiteFromIndex(pPaperWhite->get());
+        int32_t hdr, paperWhite, peak;
+        if (pHdr && pPaperWhite && pPeak)
+        {
+            hdr        = pHdr->get();
+            paperWhite = pPaperWhite->get();
+            peak       = pPeak->get();
+        }
+        else
+        {
+            // The settings table is not populated for the game's first frames -
+            // the Rockstar legal splash and the episode intros - which is exactly
+            // when correct encoding matters most, because those frames otherwise
+            // hit the PQ container raw and present at its 10000 nit peak. Bridge
+            // the gap straight from the ini; the menu-backed references above
+            // take over the moment they resolve.
+            static int32_t iniHdr = -1, iniPaperWhite = 1, iniPeak = 0;
+            if (iniHdr < 0)
+            {
+                CIniReader ini("");
+                iniHdr        = ini.ReadInteger("HDR", "HDR", 0);
+                iniPaperWhite = ini.ReadInteger("HDR", "PaperWhiteLevel", 1);
+                iniPeak       = ini.ReadInteger("HDR", "PeakLevel", 0);
+            }
+            hdr        = iniHdr;
+            paperWhite = iniPaperWhite;
+            peak       = iniPeak;
+        }
+
+        bEnabled = hdr != 0;
+        fPaperWhiteNits = PaperWhiteFromIndex(paperWhite);
 
         // Auto (index 0) resolves to the panel's reported peak, but the display is
         // not probed until the colour space is first negotiated. Fall back to a sane
         // figure meanwhile rather than leaving the peak at zero, which would collapse
         // the shader's roll-off.
-        const float requested = PeakFromIndex(pPeak->get());
+        const float requested = PeakFromIndex(peak);
         if (requested > 0.0f)
             fPeakNits = requested;
         else if (bProbed && sOutput.MaxLuminance > 0.0f)

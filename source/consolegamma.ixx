@@ -420,6 +420,16 @@ private:
 
     static void Render(IDirect3DDevice9* device)
     {
+        if (!device)
+            return;
+
+        // The earliest frames arrive before the grcSetup hook has seen a draw,
+        // so negotiate the container and refresh the settings snapshot from
+        // here as well - otherwise EffectiveMode() cannot know the swapchain is
+        // PQ and the splash frames fall through unencoded. Both calls are
+        // re-entrant and cheap once initialised.
+        HDR::BeginFrame(device);
+
         int current = EffectiveMode();
 
         if (current != g_lastGammaSetting)
@@ -503,17 +513,17 @@ private:
 public:
     ConsoleGamma()
     {
-        FusionFix::onInitEventAsync() += []()
+        // Registered synchronously, not from onInitEventAsync: the async path
+        // raced the game's first frames, so the Rockstar legal splash and the
+        // episode intros reached the PQ swapchain without the output transform -
+        // SDR 1.0 presented as the container's 10000 nit peak. The blit has no
+        // d3dx dependency either; its shaders ship precompiled in the module's
+        // resources, so there is nothing to wait for.
+        FusionFix::onEndScene() += []()
         {
-            if (GetD3DX9_43DLL())
-            {
-                FusionFix::onEndScene() += []()
-                {
-                    IDirect3DDevice9* device = rage::grcDevice::GetD3DDevice();
+            IDirect3DDevice9* device = rage::grcDevice::GetD3DDevice();
 
-                    ConsoleGamma::Render(device);
-                };
-            }
+            ConsoleGamma::Render(device);
         };
     }
 } ConsoleGamma;
