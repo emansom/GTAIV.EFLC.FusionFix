@@ -364,7 +364,7 @@
              short - the longest stock entry is "PlayStation 3". -->
         <menupc enum="MENU_DISPLAY_EXTRA_1">
           <options text="100 nits" action="ACTION_NONE" value="1" />
-          <options text="200 nits" action="ACTION_NONE" value="2" />
+          <options text="203 nits" action="ACTION_NONE" value="2" />
           <options text="300 nits" action="ACTION_NONE" value="3" />
         </menupc>
 

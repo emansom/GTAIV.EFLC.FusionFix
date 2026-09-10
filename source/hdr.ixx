@@ -226,7 +226,8 @@ public:
     // a three-entry option list with real nits figures is both simpler and far
     // more useful for calibration.
     //
-    //   paper white: 100 / 200 / 300 nits        (default index 1 = 200)
+    //   paper white: 100 / 203 / 300 nits        (default index 1 = 203,
+    //                                             ITU-R BT.2408 reference white)
     //   peak:        Auto / 400 / 1000 nits      (default index 0 = Auto)
     //
     // The rows borrow the dormant MENU_DISPLAY_EXTRA_1 / EXTRA_2 enums and their
@@ -236,7 +237,7 @@ public:
     // than in text/americanFF.txt.
     static float PaperWhiteFromIndex(int32_t i)
     {
-        static constexpr float kNits[] = { 100.0f, 200.0f, 300.0f };
+        static constexpr float kNits[] = { 100.0f, 203.0f, 300.0f };
         return kNits[std::clamp(i, 0, 2)];
     }
 
