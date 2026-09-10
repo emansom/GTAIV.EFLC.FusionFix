@@ -13,6 +13,14 @@ import gxtloader;
 import natives;
 import timecycext;
 
+// Raised by hdr.ixx for the menu rows the PQ output owns. A locked row is
+// genuinely inert: CSettings::Set drops its writes outright (no snap-back a
+// frame later) and CText greys its label. Tone Mapping locks only while HDR
+// is on; Console Gamma locks whenever the container is PQ - a gamma ramp
+// layered onto a PQ-encoded frame is wrong in both modes.
+export inline bool bHdrLockToneMapping = false;
+export inline bool bHdrLockConsoleGamma = false;
+
 namespace CText
 {
     using CText = void;
@@ -20,23 +28,51 @@ namespace CText
 
     const wchar_t* (__fastcall* Get)(CText* text, void* edx, const char* key);
 
+    // Grey out the rows HDR has locked. The menu has no disabled state to set,
+    // but every label passes through these hooks, so the ~c~ (grey) colour
+    // token can be prepended exactly while the lock holds. The VALUE column is
+    // covered by draw order: the menu fetches a row's value text immediately
+    // after its label, so a matched locked label arms a one-shot that greys
+    // whatever single lookup comes next.
+    bool bGreyNextText = false;
+    const wchar_t* greyIfHdrLocked(uint32_t hash, const wchar_t* base)
+    {
+        if (!base || !base[0])
+            return base;
+
+        static const uint32_t hTM = GetHash("Tone Mapping");
+        static const uint32_t hCG = GetHash("Console Gamma");
+        const bool lockedLabel = (hash == hTM && bHdrLockToneMapping) ||
+                                 (hash == hCG && bHdrLockConsoleGamma);
+        const bool greyValue = bGreyNextText && !lockedLabel;
+        bGreyNextText = lockedLabel;
+        if (!lockedLabel && !greyValue)
+            return base;
+
+        static std::wstring wTM, wCG, wValue;
+        auto& slot = lockedLabel ? (hash == hTM ? wTM : wCG) : wValue;
+        if (slot.size() != wcslen(base) + 3 || slot.compare(3, std::wstring::npos, base) != 0)
+            slot = std::wstring(L"~c~") + base;
+        return slot.c_str();
+    }
+
     SafetyHookInline shGetText{};
     const wchar_t* __fastcall getText(CText* text, void* edx, const char* key)
     {
         auto hash = GetHash(key);
         if (gxtEntries.contains(hash))
-            return gxtEntries[hash].c_str();
+            return greyIfHdrLocked(hash, gxtEntries[hash].c_str());
 
-        return shGetText.fastcall<const wchar_t*>(text, edx, key);
+        return greyIfHdrLocked(hash, shGetText.fastcall<const wchar_t*>(text, edx, key));
     }
 
     SafetyHookInline shGetTextByKey{};
     const wchar_t* __fastcall getTextByKey(CText* text, void* edx, uint32_t hash, int a3)
     {
         if (gxtEntries.contains(hash))
-            return gxtEntries[hash].c_str();
+            return greyIfHdrLocked(hash, gxtEntries[hash].c_str());
 
-        return shGetTextByKey.fastcall<const wchar_t*>(text, edx, hash, a3);
+        return greyIfHdrLocked(hash, shGetTextByKey.fastcall<const wchar_t*>(text, edx, hash, a3));
     }
 
     SafetyHookInline shDoesTextLabelExist{};
@@ -532,6 +568,18 @@ public:
     }
     auto Set(int32_t prefID, int32_t value)
     {
+        // While the PQ output owns them, these rows are inert: the menu's
+        // adjust input lands here and is dropped outright, so the value never
+        // changes - rather than changing and snapping back a frame later.
+        if (bHdrLockToneMapping || bHdrLockConsoleGamma)
+        {
+            static const auto tm = GetPrefIDByName("PREF_TONEMAPPING");
+            static const auto cg = GetPrefIDByName("PREF_CONSOLE_GAMMA");
+            if ((bHdrLockToneMapping && tm && prefID == *tm) ||
+                (bHdrLockConsoleGamma && cg && prefID == *cg))
+                return;
+        }
+
         if (prefID >= firstCustomID)
         {
             mFusionPrefs[prefID].SetValue(value);

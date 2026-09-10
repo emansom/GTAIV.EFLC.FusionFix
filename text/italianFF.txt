@@ -259,5 +259,20 @@ Usa ~PAD_LSTICK_ALL~ per muoverti in aria. ~n~Premi ~INPUT_MOUSE_LMB~ per aprire
 [ESS_PARA1_PC]
 Quando sei in aria usa ~PAD_LSTICK_ALL~ per muoverti.~n~In caduta libera premi ~INPUT_MOUSE_LMB~ per aprire il paracadute.~n~Tieni premuto ~INPUT_VEH_CIN_CAM~ per provare diverse visuali.
 
+[HDR]
+HDR
+
+[HDRPaperWhite]
+Bianco di riferimento HDR
+
+[HDRPeak]
+Luminosità di picco HDR
+
+[HDRWarnTM]
+~y~Il tone mapping è gestito dall'HDR quando è attivo.
+
+[HDRWarnCG]
+~y~La gamma console è sostituita dall'uscita HDR, con HDR attivo o meno.
+
 [DUMMY_l11]
 Dummy label.

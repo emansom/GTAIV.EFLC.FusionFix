@@ -85,7 +85,7 @@ public:
                     {
                         static std::wstring extra = L"";
 
-                        if (CGameConfigReader::ms_imgFiles && pMenuTab && (*pMenuTab == 49 || *pMenuTab == 0 || *pMenuTab == 7)) // Graphics || Game || Audio
+                        if (CGameConfigReader::ms_imgFiles && pMenuTab && (*pMenuTab == 49 || *pMenuTab == 0 || *pMenuTab == 7 || *pMenuTab == 8)) // Graphics || Game || Audio || Display
                         {
                             auto s = std::wstring_view((wchar_t*)(reg == 0x50 ? regs.eax : regs.edx));
                             extra = s;
@@ -163,11 +163,34 @@ public:
                                         extra += FF_WARN6[0] ? FF_WARN6 : L"~r~WARNING: CHSS only takes effect with Shadow Quality set to Very High.";
                                     }
                                 }
+
+                                // Explains the greyed-out Tone Mapping row, but only while it is
+                                // the selected one - live index 18 in the Graphics list
+                                // (calibrated in-game; the XML element count lands one higher).
+                                if (bHdrLockToneMapping && CMenu::getSelectedItem() == 18)
+                                {
+                                    extra += L"~n~";
+                                    extra += L"                        ";
+                                    auto HDRWarnTM = CText::getText("HDRWarnTM");
+                                    extra += HDRWarnTM[0] ? HDRWarnTM : L"~y~Tone Mapping is managed by HDR while it is enabled.";
+                                }
                             }
                             else if (*pMenuTab == 7)
                             {
                                 auto FF_WARN7 = CText::getText("FF_WARN7");
                                 extra += FF_WARN7[0] ? FF_WARN7 : L"~r~WARNING: Set Cutscene Audio Sync ON if you have audio desynchronization, OFF for animation smoothness. It can be toggled in a cutscene via ~PAD_UP~";
+                            }
+                            else if (*pMenuTab == 8) // Display: Console Gamma lives here
+                            {
+                                // Explains the greyed-out Console Gamma row while it is the
+                                // selected one - index 13 in the Display list. Gated on its own
+                                // lock, which also holds in SDR-in-PQ: a gamma ramp on a PQ
+                                // frame is wrong in both modes.
+                                if (bHdrLockConsoleGamma && CMenu::getSelectedItem() == 13)
+                                {
+                                    auto HDRWarnCG = CText::getText("HDRWarnCG");
+                                    extra += HDRWarnCG[0] ? HDRWarnCG : L"~y~Console Gamma is superseded by the HDR output, whether HDR is on or off.";
+                                }
                             }
 
                             if (reg == 0x50)

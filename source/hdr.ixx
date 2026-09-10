@@ -389,6 +389,14 @@ public:
         if (!pToneMapping)  pToneMapping  = FusionFixSettings.GetRef("PREF_TONEMAPPING");
         if (!pConsoleGamma) pConsoleGamma = FusionFixSettings.GetRef("PREF_CONSOLE_GAMMA");
 
+        // Locks the rows the PQ output owns: CSettings::Set drops their menu
+        // input and CText greys their labels, so they are visibly disabled
+        // rather than merely snapping back. Console Gamma locks in both modes,
+        // Tone Mapping only while HDR is on (in SDR-in-PQ the game's tone map
+        // is legitimate and stays user-controlled).
+        bHdrLockToneMapping = bEnabled;
+        bHdrLockConsoleGamma = true;    // only reached while IsContainerHdr()
+
         // Console gamma is wrong in BOTH modes: it is a ramp applied after the
         // scene, and anything layered onto a PQ-encoded frame corrupts it.
         if (pConsoleGamma) pConsoleGamma->get() = 0;
