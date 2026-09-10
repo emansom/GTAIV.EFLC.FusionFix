@@ -1,0 +1,12 @@
+// Final HDR output transform, blitted full-screen at onEndScene.
+//
+// Kept in its own .rc rather than appended to Shaders.rc because that file is
+// UTF-16 encoded; a separate ASCII file avoids any chance of corrupting it.
+//
+// IDs start at 190, well clear of the 101-137 range Shaders.rc uses.
+
+#define IDR_VS_HDR_PQ 190
+#define IDR_PS_HDR_PQ 191
+
+IDR_VS_HDR_PQ   RCDATA "shaders/win32_30/VS_HDR_PQ.cso"
+IDR_PS_HDR_PQ   RCDATA "shaders/win32_30/PS_HDR_PQ.cso"

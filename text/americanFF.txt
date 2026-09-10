@@ -259,5 +259,14 @@ Use ~PAD_LSTICK_ALL~ to move in the air. ~n~Press ~INPUT_MOUSE_LMB~ to activate 
 [ESS_PARA1_PC]
 When airborne use ~PAD_LSTICK_ALL~ to move. In freefall press ~INPUT_MOUSE_LMB~ to activate parachute. ~n~Hold ~INPUT_VEH_CIN_CAM~ to view different cameras.
 
+[HDR]
+HDR
+
+[HDRPaperWhite]
+HDR Paper White
+
+[HDRPeak]
+HDR Peak Brightness
+
 [DUMMY_l11]
 Dummy label.

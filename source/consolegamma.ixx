@@ -7,6 +7,7 @@ export module consolegamma;
 import common;
 import comvars;
 import d3dx9_43;
+import hdr;
 import settings;
 
 #ifndef SAFE_RELEASE
@@ -18,6 +19,16 @@ import settings;
 
 #define IDR_VS_BlitCellGamma_Dither 136
 #define IDR_PS_BlitCellGamma_Dither 137
+
+// Final HDR output transform. Reuses this class's full-screen blit because it
+// already runs at exactly the right moment - onEndScene, after postfx AND after
+// the HUD, video and every other 2D element. See source/resources/HDRShaders.rc.
+#define IDR_VS_HDR_PQ 190
+#define IDR_PS_HDR_PQ 191
+
+// Pseudo "console gamma" mode used internally to select the HDR program. Never
+// stored in the ini or shown in a menu; PREF_CONSOLE_GAMMA only ever holds 0-2.
+#define CONSOLE_GAMMA_MODE_HDR 3
 
 class ConsoleGamma
 {
@@ -157,6 +168,9 @@ private:
     static inline IDirect3DVertexShader9* VS_BlitCellGamma_Dither = nullptr;
     static inline IDirect3DPixelShader9* PS_BlitCellGamma_Dither = nullptr;
 
+    static inline IDirect3DVertexShader9* VS_HDR_PQ = nullptr;
+    static inline IDirect3DPixelShader9* PS_HDR_PQ = nullptr;
+
     static const DWORD* LoadCompiledShaderResource(HMODULE hModule, int resourceId)
     {
         HRSRC hRes = FindResourceW(hModule, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
@@ -180,9 +194,26 @@ private:
         {
             return { IDR_VS_BlitCellGamma_Dither, IDR_PS_BlitCellGamma_Dither, &VS_BlitCellGamma_Dither, &PS_BlitCellGamma_Dither };
         }
+        else if (ConsoleGamma == CONSOLE_GAMMA_MODE_HDR)
+        {
+            return { IDR_VS_HDR_PQ, IDR_PS_HDR_PQ, &VS_HDR_PQ, &PS_HDR_PQ };
+        }
 
         return { 0, 0, nullptr, nullptr };
     };
+
+    // The blit's mode. HDR takes precedence over the console gamma ramps: both
+    // rewrite the whole frame's transfer function, so they cannot both run, and
+    // the HDR path subsumes what they do.
+    static int EffectiveMode()
+    {
+        if (HDR::IsContainerHdr())
+            return CONSOLE_GAMMA_MODE_HDR;
+
+        static std::optional<std::reference_wrapper<int32_t>> pConsoleGamma;
+        if (!pConsoleGamma) pConsoleGamma = FusionFixSettings.GetRef("PREF_CONSOLE_GAMMA");
+        return pConsoleGamma ? pConsoleGamma->get() : 0;
+    }
 
     // It would be nice to create an onMenuOptionChanged event for this, to just call it each time the option is changed
     static void ReloadShaders()
@@ -341,13 +372,14 @@ private:
         }
 
         static auto ConsoleGamma = FusionFixSettings.GetRef("PREF_CONSOLE_GAMMA");
-        if (ConsoleGamma->get() != 1 && ConsoleGamma->get() != 2)
+        const int mode = EffectiveMode();
+        if (mode != 1 && mode != 2 && mode != CONSOLE_GAMMA_MODE_HDR)
             return false;
 
         HMODULE hModule = NULL;
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&Initialize, &hModule);
 
-        auto shaderProgram = GetShaderProgram(ConsoleGamma->get());
+        auto shaderProgram = GetShaderProgram(mode);
 
         if (shaderProgram.vsResourceId == 0)
             return false;
@@ -382,14 +414,13 @@ private:
         OnDeviceReset();
 
         g_initialized = true;
-        g_lastGammaSetting = FusionFixSettings.GetRef("PREF_CONSOLE_GAMMA")->get();
+        g_lastGammaSetting = EffectiveMode();
         return true;
     }
 
     static void Render(IDirect3DDevice9* device)
     {
-        static auto ConsoleGamma = FusionFixSettings.GetRef("PREF_CONSOLE_GAMMA");
-        int current = ConsoleGamma->get();
+        int current = EffectiveMode();
 
         if (current != g_lastGammaSetting)
         {
@@ -455,6 +486,11 @@ private:
         device->SetTexture(0, pSceneRT->mD3DTexture);
         device->SetVertexShader(g_vertexShader);
         device->SetPixelShader(g_pixelShader);
+
+        // Paper white / peak / shoulder for the HDR transform. Uploaded here rather
+        // than per-draw elsewhere because this is now the only place that encodes.
+        if (current == CONSOLE_GAMMA_MODE_HDR)
+            HDR::UploadBlitConstants(device);
 
         device->DrawPrimitive(D3DPT_TRIANGLELIST, 0, 2);
 

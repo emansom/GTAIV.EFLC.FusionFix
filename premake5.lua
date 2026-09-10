@@ -74,6 +74,7 @@ workspace "GTAIV.EFLC.FusionFix"
    files { "source/**.h", "source/*.hpp", "source/*.cpp", "source/*.hxx", "source/**.ixx" }
    files { "source/resources/Versioninfo.rc" }
    files { "source/resources/Shaders.rc" }
+   files { "source/resources/HDRShaders.rc" }
    files { "source/resources/LODLights.rc" }
    files { "source/resources/snow/*.rc" }
    links { "LogitechLEDLib.lib" }
@@ -93,6 +94,7 @@ workspace "GTAIV.EFLC.FusionFix"
    files { "data/plugins/*.ini" }
 
    os.mkdir("shaders/external/gamma/asm")
+   os.mkdir("shaders/external/hdr/asm")
    os.mkdir("source/resources/shaders/win32_30")
 
    -- Compile hlsl shaders to .cso (Output to "../source/resources/shaders/win32_30"). Assembly variants are still output for convenience to "../shaders/external/%shadername%/asm".
@@ -100,6 +102,8 @@ workspace "GTAIV.EFLC.FusionFix"
       -- Gamma
       "\"../source/dxsdk/lib/x86/fxc.exe\" /T vs_3_0 /nologo /E VSMain /Fo \"../source/resources/shaders/win32_30/VS_BlitXenonGamma_Dither.cso\" /Fc \"../shaders/external/gamma/asm/VS_BlitXenonGamma_Dither.asm\" \"../shaders/external/gamma/hlsl/XenonGamma_Dither.hlsl\" && \"../source/dxsdk/lib/x86/fxc.exe\" /T ps_3_0 /nologo /E PSMain /Fo \"../source/resources/shaders/win32_30/PS_BlitXenonGamma_Dither.cso\" /Fc \"../shaders/external/gamma/asm/PS_BlitXenonGamma_Dither.asm\" \"../shaders/external/gamma/hlsl/XenonGamma_Dither.hlsl\"",
       "\"../source/dxsdk/lib/x86/fxc.exe\" /T vs_3_0 /nologo /E VSMain /Fo \"../source/resources/shaders/win32_30/VS_BlitCellGamma_Dither.cso\"  /Fc \"../shaders/external/gamma/asm/VS_BlitCellGamma_Dither.asm\"  \"../shaders/external/gamma/hlsl/CellGamma_Dither.hlsl\"  && \"../source/dxsdk/lib/x86/fxc.exe\" /T ps_3_0 /nologo /E PSMain /Fo \"../source/resources/shaders/win32_30/PS_BlitCellGamma_Dither.cso\"  /Fc \"../shaders/external/gamma/asm/PS_BlitCellGamma_Dither.asm\"  \"../shaders/external/gamma/hlsl/CellGamma_Dither.hlsl\"",
+      -- HDR final output transform (BT.2020 PQ)
+      "\"../source/dxsdk/lib/x86/fxc.exe\" /T vs_3_0 /nologo /E VSMain /Fo \"../source/resources/shaders/win32_30/VS_HDR_PQ.cso\" /Fc \"../shaders/external/hdr/asm/VS_HDR_PQ.asm\" \"../shaders/external/hdr/hlsl/HDR_PQ.hlsl\" && \"../source/dxsdk/lib/x86/fxc.exe\" /T ps_3_0 /nologo /E PSMain /Fo \"../source/resources/shaders/win32_30/PS_HDR_PQ.cso\" /Fc \"../shaders/external/hdr/asm/PS_HDR_PQ.asm\" \"../shaders/external/hdr/hlsl/HDR_PQ.hlsl\"",
     }
 
    prebuildcommands {

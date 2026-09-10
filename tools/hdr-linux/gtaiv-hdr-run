@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Steam launch wrapper for GTA IV with FusionFix's native HDR10 support.
+#
+# Steam launch options:
+#   WINEDLLOVERRIDES="dinput8=n,b" /home/ewout/Projects/fusionfix-hdr/tools/gtaiv-hdr-run %command% -norestrictions -nomemrestrict
+#
+# Why the config is passed inline rather than through dxvk.conf:
+#
+# DXVK looks for "$DXVK_CONFIG_FILE, else $PWD/dxvk.conf" - the process working
+# directory, NOT the directory holding the .exe. GTA IV starts as PlayGTAIV.exe,
+# hands off to the Rockstar Games Launcher, and that launcher spawns GTAIV.exe with
+# a different working directory, so a dxvk.conf sitting beside the game is never
+# found. Worse, pointing DXVK_CONFIG_FILE at an unresolvable path REPLACES the
+# default lookup, so DXVK then loads no configuration at all - silently, with no
+# warning, leaving an 8-bit sRGB swapchain and no render-target upgrades.
+#
+# $DXVK_CONFIG carries the same options inline (";"-separated) and involves no path
+# resolution, so it cannot fail that way.
+#
+# Note what is NOT set here: d3d9.upgradeSwapChainColorSpaceTo. The mod owns the
+# colour space via ID3D9VkExtSwapchain::SetColorSpace() so the in-game HDR toggle
+# can switch it at runtime; setting it here would clobber that on every swapchain
+# recreation. See GTAIV.EFLC.FusionFix.ini [HDR].
+set -uo pipefail
+
+_opts=(
+  # 10-bit BT.2020 PQ swapchain.
+  #
+  # upgradeSwapChainColorSpaceTo is REQUIRED, not optional. d3d9_options.cpp does:
+  #
+  #   if (upgradeSwapChainFormatTo     == VK_FORMAT_UNDEFINED
+  #    || upgradeSwapChainColorSpaceTo == VK_COLOR_SPACE_MAX_ENUM_KHR)
+  #       enableSwapChainUpgrade = false;
+  #
+  # so omitting the colour space silently disables the WHOLE upgrade - no 10-bit, no
+  # HDR, just B8G8R8A8_UNORM/sRGB, with nothing louder than an info-level
+  # "swap chain upgrade disabled". An earlier revision left it out so the mod could
+  # own the colour space at runtime; the result was a black screen, because the
+  # shaders PQ-encoded into an 8-bit sRGB buffer.
+  #
+  # The consequence is that the container is fixed for the process lifetime, so the
+  # in-game HDR toggle changes the transform rather than the container - the same
+  # thing Windows does with SDR content while the desktop is in HDR mode.
+  "d3d9.enableSwapChainUpgrade = True"
+  "d3d9.upgradeSwapChainFormatTo = rgb10a2_unorm"
+  "d3d9.upgradeSwapChainColorSpaceTo = pq"
+  # fp16 back buffer so the postfx composite has range before the PQ encode.
+  "d3d9.enableBackBufferUpgrade = True"
+  "d3d9.upgradeBackBufferTo = rgba16_sfloat"
+  # Stop the postfx chain clipping at 1.0 before the HDR transform runs.
+  "d3d9.enableRenderTargetUpgrades = True"
+  "d3d9.upgrade_RGBA8_UNORM_renderTargetTo = rgba16_sfloat"
+  "d3d9.upgrade_RGBX8_UNORM_renderTargetTo = rgba16_sfloat"
+  "d3d9.upgrade_BGRA8_UNORM_renderTargetTo = rgba16_sfloat"
+  "d3d9.upgrade_BGRX8_UNORM_renderTargetTo = rgba16_sfloat"
+  "d3d9.upgrade_RGB10A2_UNORM_renderTargetTo = rgba16_sfloat"
+  "d3d9.upgrade_BGR10A2_UNORM_renderTargetTo = rgba16_sfloat"
+)
+_joined=$(IFS=';'; echo "${_opts[*]}")
+export DXVK_CONFIG="${DXVK_CONFIG:+$DXVK_CONFIG;}$_joined"
+
+# GTAIV_HDR_DEBUG=1 makes DXVK log "Found config env:" and dump the effective
+# configuration, which is the quickest way to confirm the options actually landed.
+#
+# DXVK_LOG_PATH matters as much as the level: without it DXVK writes its log to the
+# process working directory, which for GTA IV is set by the Rockstar Games Launcher
+# and is not the game folder - so the log exists but is effectively unfindable, and
+# its absence looks identical to "DXVK never loaded".
+if [[ "${GTAIV_HDR_DEBUG:-0}" == "1" ]]; then
+  export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-info}"
+  export DXVK_LOG_PATH="${DXVK_LOG_PATH:-/tmp/gtaiv-dxvk}"
+  mkdir -p "$DXVK_LOG_PATH" 2>/dev/null || true
+  rm -f "$DXVK_LOG_PATH"/*.log 2>/dev/null || true
+fi
+
+exec /usr/bin/dxvk-hdr-steam-wrap "$@"
