@@ -97,11 +97,6 @@ float4 PSMain(VS_OUTPUT In) : COLOR0
 {
     float4 color = tex2D(FrameBufferSampler, In.TexCoord);
 
-    // SDR: clamp to the displayable range so the result is the game's normal
-    // image rather than raw overbright out of the fp16 targets.
-    if (hdrParams.x > 0.5f)
-        color.rgb = saturate(color.rgb);
-
     // The frame is display-referred gamma 2.2. Decode to scene-linear; overbright
     // above 1.0 expands rather than clipping.
     color.rgb = pow(max(color.rgb, 0.0f), 2.2f);
@@ -111,9 +106,12 @@ float4 PSMain(VS_OUTPUT In) : COLOR0
     // is in HDR mode - multiply by (SDR white level / 80) in linear light.
     color.rgb *= hdrParams.y;
 
-    // HDR only. In SDR nothing exceeds paper white, so a roll-off would only darken.
-    if (hdrParams.x <= 0.5f)
-        color.rgb = RollOffHighlights(color.rgb, hdrParams.z, hdrParams.w);
+    // Both modes roll off rather than clip - the fp16 targets carry real
+    // overbright in SDR too, and a hard saturate there blows out every light.
+    // The ASI sets the targets per mode: panel peak in HDR, the SDR white
+    // point itself in SDR-in-PQ, so SDR highlights compress into the top of
+    // the SDR range exactly like a display-side tone map would.
+    color.rgb = RollOffHighlights(color.rgb, hdrParams.z, hdrParams.w);
 
     color.rgb = mul(BT709_TO_BT2020, color.rgb);
     color.rgb = LinearToPQ(max(color.rgb, 0.0f));

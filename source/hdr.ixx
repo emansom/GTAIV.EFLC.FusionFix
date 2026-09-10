@@ -96,6 +96,7 @@ public:
 
     static inline bool  bEnabled = false;
     static inline float fPaperWhiteNits = 203.0f;   // ITU reference white
+    static inline float fSdrPaperWhiteNits = 100.0f; // BT.1886 SDR reference, used when HDR is off
     static inline float fPeakNits = 0.0f;           // 0 = probe the display
     static inline float fShoulderFraction = 0.5f;   // roll-off starts at 50% of peak
 
@@ -179,12 +180,25 @@ public:
         const float peak = (std::max)(fPeakNits, 100.0f);
         const float shoulder = peak * std::clamp(fShoulderFraction, 0.0f, 0.95f);
 
+        // With the toggle off the container is still PQ, but white maps to the
+        // SDR reference level instead of the HDR paper white - the user chose a
+        // dimmer plain-SDR look over the Windows model of one unified white.
+        const float white = (std::max)(bEnabled ? fPaperWhiteNits : fSdrPaperWhiteNits, 50.0f);
+
+        // The shader rolls off in BOTH modes; only the target differs. HDR
+        // compresses into the panel's peak, SDR-in-PQ into its own white point,
+        // so the fp16 scene's overbright folds into the top of the SDR range
+        // instead of clipping at saturate ("blown out lights").
+        const float effPeak = bEnabled ? peak : white;
+        const float effShoulder = bEnabled ? shoulder
+                                           : effPeak * std::clamp(fShoulderFraction, 0.0f, 0.95f);
+
         const float params[4] =
         {
-            bEnabled ? 0.0f : 1.0f,   // 0 = HDR, 1 = SDR-in-PQ
-            (std::max)(fPaperWhiteNits, 50.0f) / 10000.0f,
-            peak / 10000.0f,
-            shoulder / 10000.0f,
+            bEnabled ? 0.0f : 1.0f,   // 0 = HDR, 1 = SDR-in-PQ (informational to the shader now)
+            white / 10000.0f,
+            effPeak / 10000.0f,
+            effShoulder / 10000.0f,
         };
         pDevice->SetPixelShaderConstantF(kParamRegister, params, 1);
     }
@@ -374,8 +388,29 @@ public:
         static std::optional<std::reference_wrapper<int32_t>> pToneMapping, pConsoleGamma;
         if (!pToneMapping)  pToneMapping  = FusionFixSettings.GetRef("PREF_TONEMAPPING");
         if (!pConsoleGamma) pConsoleGamma = FusionFixSettings.GetRef("PREF_CONSOLE_GAMMA");
-        if (pToneMapping)  pToneMapping->get()  = 0;
+
+        // Console gamma is wrong in BOTH modes: it is a ramp applied after the
+        // scene, and anything layered onto a PQ-encoded frame corrupts it.
         if (pConsoleGamma) pConsoleGamma->get() = 0;
+
+        // Tone mapping is mode-dependent. In HDR the final blit's roll-off
+        // replaces it, so it must be off. In SDR-in-PQ the game's own tone map
+        // is load-bearing: it is what compresses the fp16 scene's overbright
+        // into [0,1] before the blit's saturate - without it highlight detail
+        // clips away and lights render blown out. On the HDR->SDR transition
+        // the user's ini preference is handed back (the runtime value was
+        // zeroed while HDR was on; the ini itself was never touched).
+        static bool bWasHdr = true;
+        if (bEnabled)
+        {
+            if (pToneMapping) pToneMapping->get() = 0;
+        }
+        else if (bWasHdr && pToneMapping)
+        {
+            CIniReader ini("");
+            pToneMapping->get() = ini.ReadInteger("MISC", "ToneMapping", 0);
+        }
+        bWasHdr = bEnabled;
     }
 
     // Per-frame housekeeping: pick up menu changes and negotiate the container once.
@@ -402,6 +437,7 @@ public:
             // something worth a menu row.
             CIniReader iniReader("");
             HDR::fShoulderFraction = std::clamp(iniReader.ReadFloat("HDR", "ShoulderFraction", 0.5f), 0.0f, 1.0f);
+            HDR::fSdrPaperWhiteNits = std::clamp(iniReader.ReadFloat("HDR", "SdrPaperWhite", 100.0f), 50.0f, 400.0f);
         };
 
         // The game's SDR tone map and console gamma ramp cannot coexist with PQ
