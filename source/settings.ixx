@@ -335,6 +335,11 @@ public:
         // would otherwise change the reference count from run to run.
         const bool bOptionListRelocated = []() -> bool
         {
+            // HIJACK-VARIANT (this branch only): the relocation is compiled out
+            // so the borrowed stock enums are validated against the game's own
+            // array under exactly upstream's conditions.
+            return false;
+#if 0
             static constexpr uint32_t kEntrySize = 24;
             static constexpr uint32_t kStockCapacity = 75;
             static constexpr size_t kExpectedRefs = 225;   // 220 interior + 5 walker bounds
@@ -436,6 +441,7 @@ public:
             for (auto p : sites)
                 injector::WriteMemory<uint32_t>(p, newBase + (*(uint32_t*)p - oldBase), true);
             return true;
+#endif
         }();
 
         MenuPrefs* originalPrefs = nullptr;
@@ -538,13 +544,19 @@ public:
             // that yields arbitrary wording. Borrowing a stock enum instead inherits
             // its fixed strings. Index-to-nits mapping lives in hdr.ixx.
             { 0, "PREF_HDR",                    "HDR",        "HDR",                                "",                           0, nullptr, 0, 1 },
-            // Native HDR10. Both calibration rows register their own enum; the
-            // option strings shown for them live in the <menupc> blocks of
-            // frontend_menus.xml. Custom enum ids land at 75 and up inside the
-            // relocated option-list array - see the relocation block further down
-            // for why ids 60..74 can never hold a custom enum.
-            { 0, "PREF_HDR_PAPERWHITE",         "HDR",        "PaperWhiteLevel",                    "MENU_DISPLAY_HDRWHITE",      1, nullptr, 0, std::distance(std::begin(HdrPaperWhiteText.data), std::end(HdrPaperWhiteText.data)) - 1 },
-            { 0, "PREF_HDR_PEAK",               "HDR",        "PeakLevel",                          "MENU_DISPLAY_HDRPEAK",       0, nullptr, 0, std::distance(std::begin(HdrPeakText.data), std::end(HdrPeakText.data)) - 1 },
+            // HIJACK VARIANT (this branch): the upstream-minimal shape, validated
+            // in-game. Both calibration rows borrow MENU_DISPLAY_EXTRA_1/EXTRA_2 -
+            // two of the eleven placeholder enums (ids 23..33) Rockstar registered
+            // in the exe's own table and never used - and frontend_menus.xml
+            // supplies their <menupc> blocks. No strEnum, no new ids, no code.
+            // EXTRA_1..EXTRA_10 are safe donors: registered names with idle,
+            // game-managed array entries (skip EXTRA_0 - it has a runtime writer).
+            // Do NOT borrow the netstats/player enums instead: NETSTATS_RACETYPE
+            // and PLAYERSETTINGS_GENRE render the game's own text even with block
+            // overrides - their entries are rewritten at runtime through the
+            // computed field paths, invisible to static reference analysis.
+            { 0, "PREF_HDR_PAPERWHITE",         "HDR",        "PaperWhiteLevel",                    "",                           1, nullptr, 0, 2 }, // MENU_DISPLAY_EXTRA_1
+            { 0, "PREF_HDR_PEAK",               "HDR",        "PeakLevel",                          "",                           0, nullptr, 0, 2 }, // MENU_DISPLAY_EXTRA_2
             // Enums are at capacity, to use more enums, replace multiplayer ones. On/Off toggles should still be possible to add.
         };
 
