@@ -429,43 +429,13 @@ public:
                 }
             }
 
-            // Temporary bisection rig while the relocation is being proven out:
-            // C:\hdr-reloc-limit.txt holding "N S" rebases only the first N of
-            // the sites (scan order) and, when S is 0, keeps custom enum ids at
-            // 60+ even after a full rebase. No file = the full fix. Remove this
-            // and the diagnostic below once the faulting site is found.
-            int limit = (int)kExpectedRefs;
-            int shift = 1;
-            if (auto f = fopen("C:\\hdr-reloc-limit.txt", "r"))
-            {
-                fscanf(f, "%d %d", &limit, &shift);
-                fclose(f);
-            }
+            if (sites.size() != kExpectedRefs)
+                return false;
 
-            const bool matched = sites.size() == kExpectedRefs;
-            size_t patched = 0;
-            if (matched)
-            {
-                const uint32_t newBase = (uint32_t)&aOptionListEntries[0];
-                for (auto p : sites)
-                {
-                    if ((int)patched >= limit)
-                        break;
-                    injector::WriteMemory<uint32_t>(p, newBase + (*(uint32_t*)p - oldBase), true);
-                    patched++;
-                }
-            }
-
-            const bool apply = matched && (int)patched == (int)kExpectedRefs && shift != 0;
-            if (auto f = fopen("C:\\hdr-reloc-debug.txt", "w"))
-            {
-                fprintf(f, "matched %zu of %zu, patched %zu, shift %d -> %s\n",
-                    sites.size(), kExpectedRefs, patched, shift,
-                    apply ? "relocated+shifted" : "partial/stock");
-                fclose(f);
-            }
-
-            return apply;
+            const uint32_t newBase = (uint32_t)&aOptionListEntries[0];
+            for (auto p : sites)
+                injector::WriteMemory<uint32_t>(p, newBase + (*(uint32_t*)p - oldBase), true);
+            return true;
         }();
 
         MenuPrefs* originalPrefs = nullptr;
