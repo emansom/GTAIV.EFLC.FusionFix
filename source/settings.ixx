@@ -285,165 +285,6 @@ public:
             }
         }
 
-        // ---- Relocate the menu option-list array ---------------------------
-        // Every enum's option strings live in one fixed array of 24-byte entries
-        // at 0x19D3390, indexed by enum id. The <menupc> parser and the menu
-        // renderer both address it as base + id*24:
-        //
-        //   .text:005BE54E  call    resolve_enum_name_to_id
-        //   .text:005BE556  lea     eax, [eax+eax*2]
-        //   .text:005BE55B  lea     ebx, [eax*8+19D3390h]   ; parse target
-        //   .text:008BB112  mov     eax, [edx*8+19D33A0h]   ; field +16 read
-        //
-        // Its capacity is 75. The game's own init loop clears fields +16/+20 of
-        // exactly entries 0..74, and unrelated scalar globals begin at
-        // 0x19D3A98 = base + 75*24:
-        //
-        //   .text:00E5E2D0  mov     ecx, 4Ah
-        //   .text:00E5E2D5  mov     eax, 19D33A6h           ; base + 22
-        //   .text:00E5E2E3  mov     dword ptr [eax-6], 0    ; clear +16
-        //   .text:00E5E2EA  mov     [eax-2], edx            ; clear +20
-        //   .text:00E5E2ED  lea     eax, [eax+18h]          ; stride 24, 75 turns
-        //
-        // Ids 0..59 are fed from XML. Ids 60..66 and 68 are populated by game
-        // code at runtime (push of the entry address plus the frontend object at
-        // 0x116BFF0 - the same idiom used for the stock dynamic lists in entries
-        // 2/3/4/5/7/8/15/23/49/57/59; the Complete Edition's multiplayer removal
-        // is likely why squatting some of them goes unpunished). No id below 75
-        // can safely hold a custom enum: the two HDR enums initially landed on
-        // the live entries 68/70, which rendered their rows as glyph soup and
-        // leaked option text into the Game page.
-        //
-        // The fix: move the whole array into FusionFix memory with room to
-        // spare, rebase every absolute reference to it, and hand custom enums
-        // ids from 75 up. References are recognised by their encoding. The few
-        // constants inside the numeric range that do NOT belong to the array are
-        // excluded: seven "add eax,0Ch / inc r / cmp eax,imm" end bounds of the
-        // stride-12 array that ends at 0x19D3390, two "cmp esi, 19D3394h" bounds
-        // and one "mov esi, 19D3394h" backwards walker over that same neighbour,
-        // and two immediates that merely straddle unrelated instructions.
-        //
-        // The scan is all-or-nothing: unless it finds exactly the 225 references
-        // verified against GTAIV.exe 1.2.0.59 (220 interior + 4 walker loop
-        // bounds + 1 backward-walker start just past the end - see the window
-        // handling below) it patches nothing and reports false, and the caller
-        // must then keep custom enum ids at 60+ (upstream
-        // behaviour) - ids 75+ against the UNRELOCATED array would land on the
-        // scalar globals behind it. It also runs before this constructor writes
-        // any heap pointers into .text (the pref-table patches below), since a
-        // heap address that happens to fall inside the scanned numeric range
-        // would otherwise change the reference count from run to run.
-        const bool bOptionListRelocated = []() -> bool
-        {
-            // HIJACK-VARIANT (this branch only): the relocation is compiled out
-            // so the borrowed stock enums are validated against the game's own
-            // array under exactly upstream's conditions.
-            return false;
-#if 0
-            static constexpr uint32_t kEntrySize = 24;
-            static constexpr uint32_t kStockCapacity = 75;
-            static constexpr size_t kExpectedRefs = 225;   // 220 interior + 5 walker bounds
-            alignas(16) static uint8_t aOptionListEntries[256 * kEntrySize] = {};
-
-            auto exe = (uint8_t*)GetModuleHandleA(nullptr);
-            auto nt = (PIMAGE_NT_HEADERS)(exe + ((PIMAGE_DOS_HEADER)exe)->e_lfanew);
-            uint8_t* text = nullptr;
-            uint32_t textSize = 0;
-            auto sec = IMAGE_FIRST_SECTION(nt);
-            for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
-            {
-                if (memcmp(sec->Name, ".text", 6) == 0)
-                {
-                    text = exe + sec->VirtualAddress;
-                    textSize = sec->Misc.VirtualSize;
-                    break;
-                }
-            }
-            if (!text)
-                return false;
-
-            const uint32_t oldBase = 0x019D3390 + uint32_t(exe - (uint8_t*)0x00400000);
-            const uint32_t oldEnd = oldBase + kStockCapacity * kEntrySize;
-            const uint32_t boundEnd = oldEnd + kEntrySize;
-
-            auto isModrmOpcode = [](uint8_t o)
-            {
-                switch (o)
-                {
-                case 0x03: case 0x38: case 0x39: case 0x3A: case 0x3B: // add/cmp
-                case 0x88: case 0x89: case 0x8A: case 0x8B: case 0x8D: // mov/lea
-                case 0xB6: case 0xB7: case 0xBE: case 0xBF:            // 0F-prefixed movzx/movsx
-                case 0xC6: case 0xC7: case 0xF6: case 0xF7: case 0xFF: // mov imm/test/push
-                case 0x80: case 0x83:                                  // grp1 imm8
-                    return true;
-                default:
-                    return false;
-                }
-            };
-
-            std::vector<uint8_t*> sites;
-            for (uint8_t* p = text + 5; p + 4 <= text + textSize; p++)
-            {
-                const uint32_t v = *(uint32_t*)p;
-                if (v < oldBase || v >= boundEnd)
-                    continue;
-
-                const uint8_t m = p[-1], op = p[-2];
-                const uint32_t delta = v - oldBase;
-                bool take = false;
-
-                if (v >= oldEnd)
-                {
-                    // One-past-the-end window [end, end+24). The array walkers'
-                    // LOOP BOUNDS live here (cmp esi, end+field) - numerically
-                    // overlapping the first scalar globals, which is exactly how
-                    // the first relocation attempt died: it moved the walkers'
-                    // start constants but not these bounds, so the walk at
-                    // .text:005B5AA0 ran from the new array to the old end
-                    // address across foreign memory during frontend load
-                    // (fatal error MMA10). Only two encodings here are array
-                    // references; every other constant in the window belongs to
-                    // the scalars (A3 zero-stores, object this-pointers at
-                    // end+0, dword tables indexed from end+0) and must stay:
-                    //   .text:005B5B0A  cmp esi, 19D3AACh  ; forward walker bound
-                    //   .text:005A61C3 / 005BE1B8 / 005BE238 (bounds, field +16)
-                    //   .text:00E6EE5F  mov esi, 19D3AA8h  ; backward free-walker
-                    if (op == 0x81 && m >= 0xF8)
-                        take = true;                    // cmp reg, imm32 walker bound
-                    else if (m >= 0xB8 && m <= 0xBF && delta == kStockCapacity * kEntrySize + 16)
-                        take = true;                    // backward walker start at end+16
-                }
-                else if (m == 0x3D && p[-5] == 0x83 && p[-4] == 0xC0 && p[-3] == 0x0C)
-                    take = false;                       // neighbour array end bound
-                else if (m == 0x68 || m == 0xA1 || m == 0xA3)
-                    take = true;                        // push imm32 / mov eax,[abs] / mov [abs],eax
-                else if (m >= 0xB8 && m <= 0xBF)        // mov reg,imm32 field walkers;
-                    take = delta == 16 || delta == 20 || delta == 22; // excludes the neighbour walker (+4)
-                else if ((m == 0xC5 || m == 0xCD || m == 0xD5 || m == 0xDD ||
-                          m == 0xE5 || m == 0xED || m == 0xF5 || m == 0xFD) && (op & 0xC7) == 0x04)
-                    take = true;                        // op reg, [reg*8+disp32]
-                else if ((m & 0xC7) == 0x05 && isModrmOpcode(op))
-                    take = true;                        // op reg, [disp32]
-                else if ((m & 0xC0) == 0x80 && (m & 0x07) != 0x04 && isModrmOpcode(op))
-                    take = true;                        // op reg, [reg+disp32]
-
-                if (take)
-                {
-                    sites.push_back(p);
-                    p += 3;
-                }
-            }
-
-            if (sites.size() != kExpectedRefs)
-                return false;
-
-            const uint32_t newBase = (uint32_t)&aOptionListEntries[0];
-            for (auto p : sites)
-                injector::WriteMemory<uint32_t>(p, newBase + (*(uint32_t*)p - oldBase), true);
-            return true;
-#endif
-        }();
-
         MenuPrefs* originalPrefs = nullptr;
         MenuPrefs** ppOriginalPrefs = nullptr;
 
@@ -598,23 +439,13 @@ public:
         aMenuEnums.reserve(aMenuEnums.size() * 2);
         auto firstEnumCustomID = aMenuEnums.back().prefID + 1;
 
-        // Enum ids double as indices into the option-list array; entries 60..74
-        // of the stock array belong to the game (60..66 and 68 are populated by
-        // its own code at runtime, the rest are covered by its init loop), and
-        // entries past 74 are not array memory at all. So custom ids may only
-        // move up to 75+ TOGETHER with the array relocation below - shifting the
-        // ids against the stock array would park them on the scalar globals that
-        // sit right behind it. If the relocation cannot be applied, stay at 60+,
-        // which is upstream behaviour. Padding entries keep index == prefID.
-        if (bOptionListRelocated)
-        {
-            while (firstEnumCustomID < 75)
-            {
-                aMenuEnums.emplace_back(firstEnumCustomID, (char*)"MENU_DISPLAY_RESERVED");
-                firstEnumCustomID += 1;
-            }
-        }
-
+        // Custom enum ids double as indices into the game's option-list array
+        // (base 0x19D3390, 24-byte entries, capacity 75). Ids 60..66 and 68 are
+        // populated by game code at runtime and ids past 74 are not array memory
+        // at all, so the eight registrations below (60..67) are the most this
+        // mechanism can carry. For further options, borrow one of the dormant
+        // placeholder enums MENU_DISPLAY_EXTRA_1..EXTRA_10 (ids 24..33) with a
+        // <menupc> block in frontend_menus.xml instead - see PREF_HDR_PAPERWHITE.
         for (auto& it : arr)
         {
             if (!it.strEnum.empty())
