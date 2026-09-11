@@ -360,6 +360,11 @@ public:
                             // update, so the value provably survives to the im
                             // draws - the pause menu's render path restores a
                             // state block that wipes a frame-start upload.
+                            // Gate the boost to the ortho 2D/HUD pass: perspective
+                            // viewports are the 3D world/reflections/cutscene, so
+                            // the boost stays identity there and only shared glyph
+                            // shaders drawing the HUD get lifted.
+                            HDR::SetUiPass(!viewport->mIsPerspective);
                             HDR::UploadUiPaperWhite(pDevice);
                         }
                     }

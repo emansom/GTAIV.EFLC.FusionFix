@@ -110,9 +110,19 @@ public:
     // while the desktop is in HDR mode.
     static bool IsContainerHdr() { return bContainerHdr; }
 
+    // The UI paper-white boost must apply only to the 2D/HUD pass, never the 3D
+    // world: gta_default and the other glyph shaders are shared with world/LOD
+    // geometry, so a frame-global boost would also lift distant scenery whenever
+    // UI Brightness is raised. grcViewport::mIsPerspective is true for the world,
+    // reflection and cutscene passes and false for the orthographic 2D HUD/menu,
+    // giving an exact, cheap pass discriminator. The viewport hook flips this.
+    static void SetUiPass(bool ortho) { bUiPass = ortho; }
+    static bool IsUiPass() { return bUiPass; }
+
 private:
     static inline bool bContainerHdr = false;
     static inline bool bProbed = false;
+    static inline bool bUiPass = false;                 // true only during the ortho 2D/HUD pass
     static inline const void* pLastSwapchain = nullptr; // identity of the swapchain we last negotiated
 
     // Reported to the compositor as the mastering display. Overwritten by the
@@ -236,8 +246,38 @@ public:
         // zero - the old menu/splash boost used them; a plain UI level does not.
         const float gain = std::pow((std::max)(factor, 1e-4f), 1.0f / 2.2f) - 1.0f;
 
-        const float params[4] = { 0.0f, gain, 0.0f, 0.0f };
+        // Gate the boost to the 2D/HUD pass. Identity (0) during the 3D world pass
+        // so shaders shared between the HUD and world geometry (gta_default, etc.)
+        // leave the world untouched; the full gain during the ortho HUD/menu pass.
+        const float gatedGain = bUiPass ? gain : 0.0f;
+
+        const float params[4] = { 0.0f, gatedGain, 0.0f, 0.0f };
         pDevice->SetPixelShaderConstantF(207, params, 1);
+
+        // UI paper-white ceiling for gta_imPS3 (HUD glyphs). The per-draw wanted-star
+        // boost multiplies the dim star glyphs up to paper white, but it also shares
+        // the shader with already-bright glyphs (money/ammo) that would then overshoot
+        // to ~2x paper white. Clamping the glyph output to (1 + gain) = the UI level
+        // caps them: dim stars are still lifted up to it, bright text is held at it.
+        // Large outside the HUD pass so in-world gta_im sprites keep their highlights.
+        const float uiCeil[4] = { bUiPass ? (1.0f + gain) : 1.0e6f, 0.0f, 0.0f, 0.0f };
+        pDevice->SetPixelShaderConstantF(204, uiCeil, 1);
+    }
+
+    // The wanted-level stars draw through gta_imPS3 like the rest of the HUD and
+    // do receive the c207 boost, but the game emits the star glyphs far darker at
+    // source than the radar/text, so the uniform boost leaves them dim. This is the
+    // c207.y to use just around the star draw so they land at UI paper white:
+    // fStarBaseDeficit compensates for how much darker the source is. Zero outside
+    // HDR so SDR is untouched. Tunable via [HDR] WantedStarDeficit.
+    static inline float fStarBaseDeficit = 8.0f;
+    static float StarBoostGain()
+    {
+        if (!(bEnabled && bContainerHdr)) return 0.0f;
+        const float scenePw = (std::max)(fPaperWhiteNits, 50.0f);
+        const float uiPw = (fUiPaperWhiteNits > 0.0f) ? fUiPaperWhiteNits : scenePw;
+        const float factor = (std::max)(fStarBaseDeficit, 1.0f) * (uiPw / scenePw);
+        return std::pow((std::max)(factor, 1e-4f), 1.0f / 2.2f) - 1.0f;
     }
 
 public:
@@ -458,6 +498,7 @@ public:
         if (!pDevice) return;
         SyncFromSettings();
         EnsureContainer(pDevice);
+        bUiPass = false; // a frame starts with the 3D world; the viewport hook flips this for the ortho HUD
         UploadUiPaperWhite(pDevice);
     }
 };
@@ -476,6 +517,7 @@ public:
             CIniReader iniReader("");
             HDR::fShoulderFraction = std::clamp(iniReader.ReadFloat("HDR", "ShoulderFraction", 0.5f), 0.0f, 1.0f);
             HDR::fSdrPaperWhiteNits = std::clamp(iniReader.ReadFloat("HDR", "SdrPaperWhite", 100.0f), 50.0f, 400.0f);
+            HDR::fStarBaseDeficit = std::clamp(iniReader.ReadFloat("HDR", "WantedStarDeficit", 8.0f), 1.0f, 32.0f);
         };
 
         // The game's SDR tone map and console gamma ramp cannot coexist with PQ
