@@ -270,7 +270,7 @@ public:
     // c207.y to use just around the star draw so they land at UI paper white:
     // fStarBaseDeficit compensates for how much darker the source is. Zero outside
     // HDR so SDR is untouched. Tunable via [HDR] WantedStarDeficit.
-    static inline float fStarBaseDeficit = 8.0f;
+    static inline float fStarBaseDeficit = 11.0f;
     static float StarBoostGain()
     {
         if (!(bEnabled && bContainerHdr)) return 0.0f;
@@ -517,7 +517,7 @@ public:
             CIniReader iniReader("");
             HDR::fShoulderFraction = std::clamp(iniReader.ReadFloat("HDR", "ShoulderFraction", 0.5f), 0.0f, 1.0f);
             HDR::fSdrPaperWhiteNits = std::clamp(iniReader.ReadFloat("HDR", "SdrPaperWhite", 100.0f), 50.0f, 400.0f);
-            HDR::fStarBaseDeficit = std::clamp(iniReader.ReadFloat("HDR", "WantedStarDeficit", 8.0f), 1.0f, 32.0f);
+            HDR::fStarBaseDeficit = std::clamp(iniReader.ReadFloat("HDR", "WantedStarDeficit", 11.0f), 1.0f, 32.0f);
         };
 
         // The game's SDR tone map and console gamma ramp cannot coexist with PQ
