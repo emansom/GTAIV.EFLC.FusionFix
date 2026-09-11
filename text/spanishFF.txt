@@ -268,11 +268,17 @@ Blanco de referencia HDR
 [HDRPeak]
 Brillo máximo HDR
 
+[HDRUIBright]
+Brillo de interfaz HDR
+
 [HDRWarnTM]
 ~y~El mapeo de tonos lo gestiona el HDR mientras está activado.
 
 [HDRWarnCG]
 ~y~La gamma de consola queda sustituida por la salida HDR, con el HDR activado o no.
+
+[HDRWarnNA]
+~y~HDR no disponible: esta sesión de pantalla no tiene salida HDR.
 
 [DUMMY_l11]
 Dummy label.

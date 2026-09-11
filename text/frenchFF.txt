@@ -268,11 +268,17 @@ Blanc de référence HDR
 [HDRPeak]
 Luminosité max. HDR
 
+[HDRUIBright]
+Luminosité de l'interface HDR
+
 [HDRWarnTM]
 ~y~Le mappage tonal est géré par le HDR lorsqu'il est activé.
 
 [HDRWarnCG]
 ~y~Le gamma console est remplacé par la sortie HDR, que le HDR soit activé ou non.
+
+[HDRWarnNA]
+~y~HDR indisponible : cette session d'affichage n'a pas de sortie HDR.
 
 [DUMMY_l11]
 Dummy label.

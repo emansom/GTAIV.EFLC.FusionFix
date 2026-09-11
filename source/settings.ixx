@@ -15,11 +15,15 @@ import timecycext;
 
 // Raised by hdr.ixx for the menu rows the PQ output owns. A locked row is
 // genuinely inert: CSettings::Set drops its writes outright (no snap-back a
-// frame later) and CText greys its label. Tone Mapping locks only while HDR
-// is on; Console Gamma locks whenever the container is PQ - a gamma ramp
-// layered onto a PQ-encoded frame is wrong in both modes.
+// frame later) and CText greys its label. Tone Mapping locks only while HDR is
+// on - its LUT+shoulder clamp the scene to SDR, which cannot coexist with real
+// HDR. (Console Gamma is not locked: it is fused into the blit and works in both
+// modes.)
 export inline bool bHdrLockToneMapping = false;
-export inline bool bHdrLockConsoleGamma = false;
+// Raised when the display session offers no ST2084 support at all: the HDR
+// row itself greys out and stops reacting, since the toggle could not do
+// anything on this output.
+export inline bool bHdrLockHdrToggle = false;
 
 namespace CText
 {
@@ -41,16 +45,16 @@ namespace CText
             return base;
 
         static const uint32_t hTM = GetHash("Tone Mapping");
-        static const uint32_t hCG = GetHash("Console Gamma");
+        static const uint32_t hHDR = GetHash("HDR");
         const bool lockedLabel = (hash == hTM && bHdrLockToneMapping) ||
-                                 (hash == hCG && bHdrLockConsoleGamma);
+                                 (hash == hHDR && bHdrLockHdrToggle);
         const bool greyValue = bGreyNextText && !lockedLabel;
         bGreyNextText = lockedLabel;
         if (!lockedLabel && !greyValue)
             return base;
 
-        static std::wstring wTM, wCG, wValue;
-        auto& slot = lockedLabel ? (hash == hTM ? wTM : wCG) : wValue;
+        static std::wstring wTM, wHDR, wValue;
+        auto& slot = lockedLabel ? (hash == hTM ? wTM : wHDR) : wValue;
         if (slot.size() != wcslen(base) + 3 || slot.compare(3, std::wstring::npos, base) != 0)
             slot = std::wstring(L"~c~") + base;
         return slot.c_str();
@@ -434,6 +438,7 @@ public:
             // computed field paths, invisible to static reference analysis.
             { 0, "PREF_HDR_PAPERWHITE",         "HDR",        "PaperWhiteLevel",                    "",                           1, nullptr, 0, 2 }, // MENU_DISPLAY_EXTRA_1
             { 0, "PREF_HDR_PEAK",               "HDR",        "PeakLevel",                          "",                           0, nullptr, 0, 2 }, // MENU_DISPLAY_EXTRA_2
+            { 0, "PREF_HDR_UIPAPERWHITE",       "HDR",        "UIPaperWhiteLevel",                  "",                           0, nullptr, 0, 2 }, // MENU_DISPLAY_EXTRA_3
             // Enums are at capacity, to use more enums, replace multiplayer ones. On/Off toggles should still be possible to add.
         };
 
@@ -571,12 +576,12 @@ public:
         // While the PQ output owns them, these rows are inert: the menu's
         // adjust input lands here and is dropped outright, so the value never
         // changes - rather than changing and snapping back a frame later.
-        if (bHdrLockToneMapping || bHdrLockConsoleGamma)
+        if (bHdrLockToneMapping || bHdrLockHdrToggle)
         {
             static const auto tm = GetPrefIDByName("PREF_TONEMAPPING");
-            static const auto cg = GetPrefIDByName("PREF_CONSOLE_GAMMA");
+            static const auto hdr = GetPrefIDByName("PREF_HDR");
             if ((bHdrLockToneMapping && tm && prefID == *tm) ||
-                (bHdrLockConsoleGamma && cg && prefID == *cg))
+                (bHdrLockHdrToggle && hdr && prefID == *hdr))
                 return;
         }
 

@@ -268,11 +268,17 @@ HDR-Referenzweiß
 [HDRPeak]
 HDR-Spitzenhelligkeit
 
+[HDRUIBright]
+HDR-UI-Helligkeit
+
 [HDRWarnTM]
 ~y~Tone Mapping übernimmt HDR, solange es aktiviert ist.
 
 [HDRWarnCG]
 ~y~Konsolen-Gamma wird von der HDR-Ausgabe ersetzt - unabhängig davon, ob HDR an oder aus ist.
+
+[HDRWarnNA]
+~y~HDR nicht verfügbar: Diese Anzeigesitzung hat keine HDR-Ausgabe.
 
 [DUMMY_l11]
 Dummy label.

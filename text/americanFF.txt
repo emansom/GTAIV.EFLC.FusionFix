@@ -268,11 +268,17 @@ HDR Paper White
 [HDRPeak]
 HDR Peak Brightness
 
+[HDRUIBright]
+HDR UI Brightness
+
 [HDRWarnTM]
 ~y~Tone Mapping is managed by HDR while it is enabled.
 
 [HDRWarnCG]
 ~y~Console Gamma is superseded by the HDR output, whether HDR is on or off.
+
+[HDRWarnNA]
+~y~HDR is unavailable: this display session has no HDR output.
 
 [DUMMY_l11]
 Dummy label.

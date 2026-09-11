@@ -268,11 +268,17 @@ Bianco di riferimento HDR
 [HDRPeak]
 Luminosità di picco HDR
 
+[HDRUIBright]
+Luminosità interfaccia HDR
+
 [HDRWarnTM]
 ~y~Il tone mapping è gestito dall'HDR quando è attivo.
 
 [HDRWarnCG]
 ~y~La gamma console è sostituita dall'uscita HDR, con HDR attivo o meno.
+
+[HDRWarnNA]
+~y~HDR non disponibile: questa sessione di visualizzazione non ha uscita HDR.
 
 [DUMMY_l11]
 Dummy label.

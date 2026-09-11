@@ -180,16 +180,16 @@ public:
                                 auto FF_WARN7 = CText::getText("FF_WARN7");
                                 extra += FF_WARN7[0] ? FF_WARN7 : L"~r~WARNING: Set Cutscene Audio Sync ON if you have audio desynchronization, OFF for animation smoothness. It can be toggled in a cutscene via ~PAD_UP~";
                             }
-                            else if (*pMenuTab == 8) // Display: Console Gamma lives here
+                            else if (*pMenuTab == 8) // Display: the HDR toggle lives here
                             {
-                                // Explains the greyed-out Console Gamma row while it is the
-                                // selected one - index 13 in the Display list. Gated on its own
-                                // lock, which also holds in SDR-in-PQ: a gamma ramp on a PQ
-                                // frame is wrong in both modes.
-                                if (bHdrLockConsoleGamma && CMenu::getSelectedItem() == 13)
+                                // Console Gamma is no longer explained here - it is
+                                // fused into the HDR blit and fully usable, so it is
+                                // not greyed. The HDR row itself is greyed on outputs
+                                // with no ST2084 support - index 22 in the Display list.
+                                if (bHdrLockHdrToggle && CMenu::getSelectedItem() == 22)
                                 {
-                                    auto HDRWarnCG = CText::getText("HDRWarnCG");
-                                    extra += HDRWarnCG[0] ? HDRWarnCG : L"~y~Console Gamma is superseded by the HDR output, whether HDR is on or off.";
+                                    auto HDRWarnNA = CText::getText("HDRWarnNA");
+                                    extra += HDRWarnNA[0] ? HDRWarnNA : L"~y~HDR is unavailable: this display session has no HDR output.";
                                 }
                             }
 

@@ -97,6 +97,8 @@ public:
     static inline bool  bEnabled = false;
     static inline float fPaperWhiteNits = 203.0f;   // ITU reference white
     static inline float fSdrPaperWhiteNits = 100.0f; // BT.1886 SDR reference, used when HDR is off
+    static inline float fUiPaperWhiteNits = 0.0f;    // 0 = match scene paper white; else absolute nits for the HUD/menu/map
+    static inline int32_t iConsoleGamma = 0;         // 0 = off, 1 = Xenon (360), 2 = Cell (PS3); fused into the blit
     static inline float fPeakNits = 0.0f;           // 0 = probe the display
     static inline float fShoulderFraction = 0.5f;   // roll-off starts at 50% of peak
 
@@ -111,6 +113,7 @@ public:
 private:
     static inline bool bContainerHdr = false;
     static inline bool bProbed = false;
+    static inline const void* pLastSwapchain = nullptr; // identity of the swapchain we last negotiated
 
     // Reported to the compositor as the mastering display. Overwritten by the
     // real panel's EDID when GetCurrentOutputDesc() succeeds.
@@ -201,55 +204,39 @@ public:
             effShoulder / 10000.0f,
         };
         pDevice->SetPixelShaderConstantF(kParamRegister, params, 1);
+
+        // Console gamma fused into the blit (c51.x): the Xenon/Cell curve runs
+        // before the decode inside the shader, so the console look is applied
+        // correctly in PQ instead of the standalone ramp fighting the encode.
+        // Applies in both HDR and SDR-in-PQ, since the blit owns the final image
+        // in both. See HDR_PQ.hlsl for why the decode stays 2.2.
+        const float consoleGamma[4] = { float(iConsoleGamma), 0.0f, 0.0f, 0.0f };
+        pDevice->SetPixelShaderConstantF(kParamRegister + 1, consoleGamma, 1);
     }
 
-    // The pause menu (labels, settings, map) and the splash / loading screens
-    // run at the panel's peak instead of paper white - a deliberate "HDR is on"
-    // signature, chosen over BT.2408's reference level for those surfaces. This
-    // is applied per DRAW, not per frame: the gta_im / rage_im pixel shaders
-    // scale their colour output by (1 + c207.y), so UI elements self-emit above
-    // 1.0 into the fp16 back buffer and the final blit lands them at peak,
-    // while the world seen through the menu's translucent backdrop - and
-    // everything a local-dimming panel keeps dark around splash artwork -
-    // stays at the calibrated paper white. The mad form is deliberate: an
-    // unset constant reads 0.0, which makes the scale an exact identity, so
-    // stock behaviour needs no upload, no flow control, and no flag - frames
-    // before the first upload and non-HDR sessions are untouched by
-    // construction. The ramp is smoothed (~120 ms) so opening the menu
-    // brightens rather than strobes.
-    static void UploadUiBoost(IDirect3DDevice9* pDevice)
+    // UI paper white: the HUD, pause menu, map and 2D overlays sit at their own
+    // luminance, independent of the scene's paper white, so the interface can be
+    // pushed brighter for legibility without dragging scene exposure with it -
+    // the standard modern-HDR UI-brightness control. Applied per DRAW: the
+    // gta_im / rage_im pixel shaders multiply their colour output by (1 + c207.y),
+    // so UI draws land at the UI level while the world (which never passes through
+    // those shaders) keeps the calibrated paper white. Only in HDR mode -
+    // SDR-in-PQ has no headroom above its white point, so the UI rides the scene
+    // there (factor 1). An unset or zero c207 is an exact identity, so stock
+    // shaders, non-HDR sessions and "match scene" are untouched by construction.
+    static void UploadUiPaperWhite(IDirect3DDevice9* pDevice)
     {
-        const bool menu = CMenuManager::m_MenuActive && *CMenuManager::m_MenuActive;
-        const bool loading = CMenuManager::bLoadscreenShown && *CMenuManager::bLoadscreenShown;
-        const bool active = bEnabled && bContainerHdr && (menu || loading);
+        const float scenePw = (std::max)(bEnabled ? fPaperWhiteNits : fSdrPaperWhiteNits, 50.0f);
+        const float uiPw = (fUiPaperWhiteNits > 0.0f) ? fUiPaperWhiteNits : scenePw; // 0 = match scene
+        const float factor = (bEnabled && bContainerHdr) ? (uiPw / scenePw) : 1.0f;
 
-        // The uploaded gain is factor^(1/2.2) - 1: the im shaders run in gamma
-        // space and the final blit decodes with pow(2.2), so this makes the
-        // boost an exact UNIFORM luminance multiply in linear light. Uniformity
-        // matters: a per-pixel-level weight warps midtones and blended layers,
-        // which read as the menu changing colour whenever paper white changes.
-        const float paperWhite = (std::max)(fPaperWhiteNits, 50.0f);
-        const float target = active ? (std::max)(fPeakNits, paperWhite) / paperWhite : 1.0f;
+        // gain = factor^(1/2.2) - 1: the im shaders multiply in gamma space and
+        // the final blit decodes with pow(2.2), so this lands as an exact uniform
+        // luminance multiply and the UI ends at uiPw nits. z/w (floor/clamp) stay
+        // zero - the old menu/splash boost used them; a plain UI level does not.
+        const float gain = std::pow((std::max)(factor, 1e-4f), 1.0f / 2.2f) - 1.0f;
 
-        static float fSmoothed = 1.0f;
-        static ULONGLONG lastTick = 0;
-        const ULONGLONG now = GetTickCount64();
-        if (lastTick == 0 || now - lastTick > 1000)
-            fSmoothed = target;                     // first frame or long stall: snap
-        else
-            fSmoothed += (target - fSmoothed) * (1.0f - std::exp(-float(now - lastTick) / 120.0f));
-        lastTick = now;
-
-        // z: a small black floor, load screens only. Their dark artwork carries
-        // block-compression residue (a few code values of single-channel tint)
-        // that any gain would lift into visibility; flooring crushes it to true
-        // black before the gain, and 0 stays 0. The pause menu gets no floor -
-        // there the world shows through the translucent backdrop and must not
-        // be crushed.
-        const float gain = std::pow((std::max)(fSmoothed, 1.0f), 1.0f / 2.2f) - 1.0f;
-        const float floor = (loading && !menu && gain > 0.0f) ? 0.02f : 0.0f;
-
-        const float params[4] = { 0.0f, gain, floor, 0.0f };
+        const float params[4] = { 0.0f, gain, 0.0f, 0.0f };
         pDevice->SetPixelShaderConstantF(207, params, 1);
     }
 
@@ -260,18 +247,49 @@ public:
     // that value back over m_colorspace on every swapchain recreation. Calling
     // SetColorSpace here is belt and braces for builds where the config route is
     // absent; the useful work is the EDID probe and the metadata.
+    // Re-negotiate whenever the swapchain object changes, not just once. A device
+    // reset (alt-tab, exclusive-fullscreen mode switch, resolution change) makes
+    // DXVK build a fresh swapchain that reverts to the default SDR colour space;
+    // our SetColorSpace / metadata / format-unlock live on the old one and would
+    // otherwise never be re-applied, leaving the shaders PQ-encoding into an SDR
+    // container. Keyed on the swapchain's identity so it also catches recreations
+    // that do not surface as a RAGE device-reset callback; OnDeviceReset() below
+    // is the belt-and-suspenders trigger for the reset that does.
     static void EnsureContainer(IDirect3DDevice9* pDevice)
     {
-        if (bContainerHdr) return;
+        if (!pDevice) return;
+
+        IDirect3DSwapChain9* pSwapchain = nullptr;
+        if (FAILED(pDevice->GetSwapChain(0, &pSwapchain)) || !pSwapchain) return;
+        const void* scId = static_cast<void*>(pSwapchain);
+        pSwapchain->Release(); // identity compare only; never dereferenced after this
+
+        // Already HDR on this exact swapchain: nothing to do. (When NOT HDR we
+        // still fall through every frame, so an OS-side HDR flip that recreates
+        // the swapchain with ST2084 support flips us on and un-greys the row.)
+        if (bContainerHdr && scId == pLastSwapchain) return;
+        if (scId != pLastSwapchain) { pLastSwapchain = scId; bContainerHdr = false; bProbed = false; }
 
         auto* pExt = GetExtSwapchain(pDevice);
-        if (!pExt) return;   // not DXVK: no HDR container, shaders stay in passthrough
+        if (!pExt)
+        {
+            // Not DXVK: no HDR container is possible. Grey the HDR row itself -
+            // the toggle could not do anything on this output.
+            bHdrLockHdrToggle = true;
+            return;
+        }
 
         if (!pExt->CheckColorSpaceSupport(VK_COLOR_SPACE_HDR10_ST2084_EXT))
         {
+            // The surface offers no ST2084: an SDR display session. Same
+            // treatment; re-checked every frame, so an OS-side HDR flip that
+            // recreates the swapchain with support un-greys the row again.
+            bHdrLockHdrToggle = true;
             pExt->Release();
             return;
         }
+
+        bHdrLockHdrToggle = false;
 
         if (!bProbed) { ProbeDisplay(pExt); bProbed = true; }
         if (fPeakNits <= 0.0f) fPeakNits = 400.0f;   // last-resort default
@@ -312,6 +330,14 @@ public:
         return kNits[std::clamp(i, 0, 2)];
     }
 
+    static float UiPaperWhiteFromIndex(int32_t i)
+    {
+        // 0 means "match the scene paper white" (identity); the rest are absolute
+        // UI nits, brighter than the 203 scene default for HUD legibility.
+        static constexpr float kNits[] = { 0.0f, 300.0f, 400.0f };
+        return kNits[std::clamp(i, 0, 2)];
+    }
+
     // Re-read the live menu values every frame so the sliders and the toggle take
     // effect immediately, without a restart.
     static void SyncFromSettings()
@@ -321,17 +347,21 @@ public:
         // of the first call in a plain `static auto` latches nullopt forever - the
         // menu values are then never read, bEnabled stays false, and the mod runs in
         // SDR mode at the hardcoded default paper white no matter what the UI says.
-        static std::optional<std::reference_wrapper<int32_t>> pHdr, pPaperWhite, pPeak;
-        if (!pHdr)        pHdr        = FusionFixSettings.GetRef("PREF_HDR");
-        if (!pPaperWhite) pPaperWhite = FusionFixSettings.GetRef("PREF_HDR_PAPERWHITE");
-        if (!pPeak)       pPeak       = FusionFixSettings.GetRef("PREF_HDR_PEAK");
+        static std::optional<std::reference_wrapper<int32_t>> pHdr, pPaperWhite, pPeak, pUiPaperWhite, pConsoleGamma;
+        if (!pHdr)          pHdr          = FusionFixSettings.GetRef("PREF_HDR");
+        if (!pPaperWhite)   pPaperWhite   = FusionFixSettings.GetRef("PREF_HDR_PAPERWHITE");
+        if (!pPeak)         pPeak         = FusionFixSettings.GetRef("PREF_HDR_PEAK");
+        if (!pUiPaperWhite) pUiPaperWhite = FusionFixSettings.GetRef("PREF_HDR_UIPAPERWHITE");
+        if (!pConsoleGamma) pConsoleGamma = FusionFixSettings.GetRef("PREF_CONSOLE_GAMMA");
 
-        int32_t hdr, paperWhite, peak;
-        if (pHdr && pPaperWhite && pPeak)
+        int32_t hdr, paperWhite, peak, uiPaperWhite;
+        if (pHdr && pPaperWhite && pPeak && pUiPaperWhite && pConsoleGamma)
         {
-            hdr        = pHdr->get();
-            paperWhite = pPaperWhite->get();
-            peak       = pPeak->get();
+            hdr          = pHdr->get();
+            paperWhite   = pPaperWhite->get();
+            peak         = pPeak->get();
+            uiPaperWhite = pUiPaperWhite->get();
+            iConsoleGamma = pConsoleGamma->get();
         }
         else
         {
@@ -341,21 +371,26 @@ public:
             // hit the PQ container raw and present at its 10000 nit peak. Bridge
             // the gap straight from the ini; the menu-backed references above
             // take over the moment they resolve.
-            static int32_t iniHdr = -1, iniPaperWhite = 1, iniPeak = 0;
+            static int32_t iniHdr = -1, iniPaperWhite = 1, iniPeak = 0, iniUiPaperWhite = 0, iniConsoleGamma = 0;
             if (iniHdr < 0)
             {
                 CIniReader ini("");
-                iniHdr        = ini.ReadInteger("HDR", "HDR", 0);
-                iniPaperWhite = ini.ReadInteger("HDR", "PaperWhiteLevel", 1);
-                iniPeak       = ini.ReadInteger("HDR", "PeakLevel", 0);
+                iniHdr          = ini.ReadInteger("HDR", "HDR", 0);
+                iniPaperWhite   = ini.ReadInteger("HDR", "PaperWhiteLevel", 1);
+                iniPeak         = ini.ReadInteger("HDR", "PeakLevel", 0);
+                iniUiPaperWhite = ini.ReadInteger("HDR", "UIPaperWhiteLevel", 0);
+                iniConsoleGamma = ini.ReadInteger("MISC", "ConsoleGamma", 0);
             }
-            hdr        = iniHdr;
-            paperWhite = iniPaperWhite;
-            peak       = iniPeak;
+            hdr          = iniHdr;
+            paperWhite   = iniPaperWhite;
+            peak         = iniPeak;
+            uiPaperWhite = iniUiPaperWhite;
+            iConsoleGamma = iniConsoleGamma;
         }
 
         bEnabled = hdr != 0;
         fPaperWhiteNits = PaperWhiteFromIndex(paperWhite);
+        fUiPaperWhiteNits = UiPaperWhiteFromIndex(uiPaperWhite);
 
         // Auto (index 0) resolves to the panel's reported peak, but the display is
         // not probed until the colour space is first negotiated. Fall back to a sane
@@ -383,23 +418,18 @@ public:
     static void EnforceConflictingSettings()
     {
         if (!IsContainerHdr()) return;
-        // Same retry pattern as SyncFromSettings - these are looked up before the
-        // settings table exists, and a latched nullopt would silently do nothing.
-        static std::optional<std::reference_wrapper<int32_t>> pToneMapping, pConsoleGamma;
+        // Same retry pattern as SyncFromSettings - looked up before the settings
+        // table exists, and a latched nullopt would silently do nothing.
+        static std::optional<std::reference_wrapper<int32_t>> pToneMapping;
         if (!pToneMapping)  pToneMapping  = FusionFixSettings.GetRef("PREF_TONEMAPPING");
-        if (!pConsoleGamma) pConsoleGamma = FusionFixSettings.GetRef("PREF_CONSOLE_GAMMA");
 
-        // Locks the rows the PQ output owns: CSettings::Set drops their menu
-        // input and CText greys their labels, so they are visibly disabled
-        // rather than merely snapping back. Console Gamma locks in both modes,
-        // Tone Mapping only while HDR is on (in SDR-in-PQ the game's tone map
-        // is legitimate and stays user-controlled).
+        // Locks the rows the PQ output owns. Console gamma is now FUSED into the
+        // blit (c51, applied before the encode), so it works correctly with PQ
+        // and stays fully user-controllable - no lock, no forcing off. Only Tone
+        // Mapping is locked, and only while HDR is on: its LUT+shoulder clamp the
+        // scene to SDR, which cannot coexist with real HDR. In SDR-in-PQ the
+        // game's tone map is legitimate and stays user-controlled.
         bHdrLockToneMapping = bEnabled;
-        bHdrLockConsoleGamma = true;    // only reached while IsContainerHdr()
-
-        // Console gamma is wrong in BOTH modes: it is a ramp applied after the
-        // scene, and anything layered onto a PQ-encoded frame corrupts it.
-        if (pConsoleGamma) pConsoleGamma->get() = 0;
 
         // Tone mapping is mode-dependent. In HDR the final blit's roll-off
         // replaces it, so it must be off. In SDR-in-PQ the game's own tone map
@@ -428,7 +458,7 @@ public:
         if (!pDevice) return;
         SyncFromSettings();
         EnsureContainer(pDevice);
-        UploadUiBoost(pDevice);
+        UploadUiPaperWhite(pDevice);
     }
 };
 

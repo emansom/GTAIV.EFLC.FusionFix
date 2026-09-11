@@ -247,11 +247,17 @@ HDRペーパーホワイト
 [HDRPeak]
 HDRピーク輝度
 
+[HDRUIBright]
+HDR UI 輝度
+
 [HDRWarnTM]
 ~y~HDRが有効な間、トーンマッピングはHDR側で管理されます。
 
 [HDRWarnCG]
 ~y~コンソールガンマはHDR出力に置き換えられます（HDRのオン・オフに関わらず）。
+
+[HDRWarnNA]
+~y~HDRは利用できません。このディスプレイ出力はHDRに対応していません。
 
 [DUMMY_l11]
 Dummy label.

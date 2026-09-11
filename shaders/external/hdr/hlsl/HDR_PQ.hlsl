@@ -20,9 +20,28 @@
 //   y  paper white nits / 10000
 //   z  peak nits        / 10000
 //   w  roll-off shoulder nits / 10000
+//
+// consoleGamma (register c51):
+//   x  0 = none, 1 = Xenon (360) gamma, 2 = Cell (PS3) gamma - fused here so the
+//      console look survives into HDR. See the note in PSMain for the 2.2 decode.
 
 float4 globalScreenSize : register(c44);
 float4 hdrParams        : register(c50);
+float4 consoleGamma     : register(c51);
+
+float3 SRGBDecode(float3 color)
+{
+    float3 linearSection = color / 12.92f;
+    float3 powerSection = pow((max(color, 0.0f) + 0.055f) / 1.055f, 2.4f);
+    return (color >= 0.04045f) ? powerSection : linearSection;
+}
+
+float3 Rec709Encode(float3 color)
+{
+    float3 linearSection = color * 4.5f;
+    float3 powerSection = 1.099f * pow(max(color, 0.0f), 0.45f) - 0.099f;
+    return (color >= 0.018f) ? powerSection : linearSection;
+}
 
 sampler2D FrameBufferSampler : register(s0);
 
@@ -96,6 +115,18 @@ float R2LDG(float2 pos)
 float4 PSMain(VS_OUTPUT In) : COLOR0
 {
     float4 color = tex2D(FrameBufferSampler, In.TexCoord);
+
+    // Console gamma fusion: apply FusionFix's Xenon/Cell curve here, then the
+    // pow(2.2) decode below - matching the "input is gamma 2.2" the stock
+    // console-gamma shaders assume, so HDR reproduces exactly what the SDR path
+    // shows. NOT 2.4: the authentic 360 look is a 4-segment PWL sRGB approximation
+    // (Xenos HW) that this curve already approximates; a 2.4 TV-reference exponent
+    // would be a third, invented look. Refs: MJP "Correcting XNA's Gamma
+    // Correction"; FusionFix #1433. Zero = untouched.
+    if (consoleGamma.x > 1.5f)          // Cell (PS3)
+        color.rgb = pow(max(color.rgb, 0.0f), 1.2f);
+    else if (consoleGamma.x > 0.5f)     // Xenon (360)
+        color.rgb = Rec709Encode(SRGBDecode(color.rgb));
 
     // The frame is display-referred gamma 2.2. Decode to scene-linear; overbright
     // above 1.0 expands rather than clipping.

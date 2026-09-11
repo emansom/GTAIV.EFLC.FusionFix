@@ -515,6 +515,12 @@
       <options text="400 nits" action="ACTION_NONE" value="2" />
       <options text="1000 nits" action="ACTION_NONE" value="3" />
     </menupc>
+
+    <menupc enum="MENU_DISPLAY_EXTRA_3">
+      <options text="Match Scene" action="ACTION_NONE" value="1" />
+      <options text="300 nits" action="ACTION_NONE" value="2" />
+      <options text="400 nits" action="ACTION_NONE" value="3" />
+    </menupc>
   </sMenuDisplayValue>
   <sMenuScreen>
     <menu HeaderText="MH_GAM" enum="SCR_GAME">
@@ -690,7 +696,6 @@
       <options action="MENUOPT_ADJUST" label="MO_LAN" value="PREF_CURRENT_LANGUAGE" scaler="7" displayValue="MENU_DISPLAY_LANGUAGE" />
       <optionsps3 action="MENUOPT_ADJUST" label="MO_FLIC" value="PREF_FLICKER_FILTER" scaler="2" displayValue="MENU_DISPLAY_ON_OFF" />
       
-            <options action="MENUOPT_NONE" label="" value="PREF_NULL" scaler="0" displayValue="MENU_DISPLAY_NONE" />
             <optionspc action="MENUOPT_ADJUST" label="MO_DOF" value="PREF_DEFINITION" scaler="2" displayValue="MENU_DISPLAY_ON_OFF" />
             <optionspc action="MENUOPT_ADJUST" label="Console Gamma" value="PREF_CONSOLE_GAMMA" scaler="3" displayValue="MENU_DISPLAY_NETSTATS_GAMEMODE" />
             <optionspc action="MENUOPT_ADJUST" label="Auto Exposure" value="PREF_AUTOEXPOSURE" scaler="2" displayValue="MENU_DISPLAY_ON_OFF" />
@@ -704,6 +709,7 @@
             <optionspc action="MENUOPT_ADJUST" label="HDR" value="PREF_HDR" scaler="2" displayValue="MENU_DISPLAY_ON_OFF" />
             <optionspc action="MENUOPT_ADJUST" label="HDRPaperWhite" value="PREF_HDR_PAPERWHITE" scaler="3" displayValue="MENU_DISPLAY_EXTRA_1" />
             <optionspc action="MENUOPT_ADJUST" label="HDRPeak" value="PREF_HDR_PEAK" scaler="3" displayValue="MENU_DISPLAY_EXTRA_2" />
+            <optionspc action="MENUOPT_ADJUST" label="HDRUIBright" value="PREF_HDR_UIPAPERWHITE" scaler="3" displayValue="MENU_DISPLAY_EXTRA_3" />
       
       <options action="MENUOPT_SET" label="MO_DEF" value="SET_DEFAULT_DISPLAY" scaler="0" displayValue="MENU_DISPLAY_NONE" />
       <options action="END_OF_MENU_OPTIONS" label="" value="0" scaler="0" displayValue="0" />
@@ -1372,7 +1378,6 @@
       <options action="MENUOPT_ADJUST" label="MO_LAN" value="PREF_CURRENT_LANGUAGE" scaler="7" displayValue="MENU_DISPLAY_LANGUAGE" />
       <optionsps3 action="MENUOPT_ADJUST" label="MO_FLIC" value="PREF_FLICKER_FILTER" scaler="2" displayValue="MENU_DISPLAY_ON_OFF" />
       
-            <options action="MENUOPT_NONE" label="" value="PREF_NULL" scaler="0" displayValue="MENU_DISPLAY_NONE" />
             <optionspc action="MENUOPT_ADJUST" label="MO_DOF" value="PREF_DEFINITION" scaler="2" displayValue="MENU_DISPLAY_ON_OFF" />
             <optionspc action="MENUOPT_ADJUST" label="Console Gamma" value="PREF_CONSOLE_GAMMA" scaler="3" displayValue="MENU_DISPLAY_NETSTATS_GAMEMODE" />
             <optionspc action="MENUOPT_ADJUST" label="Auto Exposure" value="PREF_AUTOEXPOSURE" scaler="2" displayValue="MENU_DISPLAY_ON_OFF" />
@@ -1386,6 +1391,7 @@
             <optionspc action="MENUOPT_ADJUST" label="HDR" value="PREF_HDR" scaler="2" displayValue="MENU_DISPLAY_ON_OFF" />
             <optionspc action="MENUOPT_ADJUST" label="HDRPaperWhite" value="PREF_HDR_PAPERWHITE" scaler="3" displayValue="MENU_DISPLAY_EXTRA_1" />
             <optionspc action="MENUOPT_ADJUST" label="HDRPeak" value="PREF_HDR_PEAK" scaler="3" displayValue="MENU_DISPLAY_EXTRA_2" />
+            <optionspc action="MENUOPT_ADJUST" label="HDRUIBright" value="PREF_HDR_UIPAPERWHITE" scaler="3" displayValue="MENU_DISPLAY_EXTRA_3" />
       
       <options action="MENUOPT_SET" label="MO_DEF" value="SET_DEFAULT_DISPLAY" scaler="0" displayValue="MENU_DISPLAY_NONE" />
       <options action="END_OF_MENU_OPTIONS" label="" value="0" scaler="0" displayValue="MENU_DISPLAY_NONE" />

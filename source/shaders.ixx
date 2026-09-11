@@ -355,12 +355,12 @@ public:
                             pDevice->SetVertexShaderConstantF(227, &arr[0], 1);
                             pDevice->SetPixelShaderConstantF(209, &arr[0], 1);
 
-                            // Re-assert the HDR UI boost constant alongside the
-                            // LogDepth constants: this hook runs per viewport
+                            // Re-assert the HDR UI paper-white constant alongside
+                            // the LogDepth constants: this hook runs per viewport
                             // update, so the value provably survives to the im
                             // draws - the pause menu's render path restores a
                             // state block that wipes a frame-start upload.
-                            HDR::UploadUiBoost(pDevice);
+                            HDR::UploadUiPaperWhite(pDevice);
                         }
                     }
                 });
