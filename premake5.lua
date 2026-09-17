@@ -72,6 +72,7 @@ workspace "GTAIV.EFLC.FusionFix"
    libdirs { "source/ledsdk" }
    libdirs { "source/dxsdk" }
    files { "source/**.h", "source/*.hpp", "source/*.cpp", "source/*.hxx", "source/**.ixx" }
+   files { "source/**.c" }  -- vendored W1 fxc_parse.c (RAGE .fxc parser, built as C)
    files { "source/resources/Versioninfo.rc" }
    files { "source/resources/Shaders.rc" }
    files { "source/resources/LODLights.rc" }
