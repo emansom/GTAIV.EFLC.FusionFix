@@ -311,9 +311,20 @@ class ShaderPrecompiler
 {
     // ---- config / state -------------------------------------------------
     static inline PrecompileConfig cfg;
-    static inline std::atomic<bool> ranOnce{ false };
+    static inline std::atomic<bool> started{ false };   // precompile pass has begun
+    static inline std::atomic<bool> finished{ false };  // precompile pass is done
     static inline SafetyHookInline shLoadscreenRender{};
     static inline HMODULE hSelf = nullptr;
+
+    // Readiness gate: don't run until the swapchain is at its FINAL, stable size
+    // (so FusionFix's windowed-borderless setup + any device reset have settled)
+    // and a loading screen is genuinely up. This holds off the early-legal-screen
+    // prologue that fired before borderless in the first crowd-test.
+    static inline UINT  gateW = 0, gateH = 0;
+    static inline int   stableFrames = 0;
+    static inline int   loadscreenFramesSeen = 0;
+    static constexpr int kStableFramesNeeded = 24;   // ~0.4s at the 64fps loadscreen cap
+    static inline HWND  gameWnd = nullptr;
 
     enum class Backend { Unknown, Native, DXVK };
     static inline Backend backend = Backend::Unknown;
@@ -363,6 +374,22 @@ class ShaderPrecompiler
         OutputDebugStringA("[ShaderPrecompile] ");
         OutputDebugStringA(buf);
         OutputDebugStringA("\n");
+    }
+
+    // Drain the message queue so Windows keeps the window "responsive" while the
+    // precompile blocks the render thread. GTA IV pumps its window on the thread
+    // that runs the loadscreen render (our hook thread), so a long blocking loop
+    // here without this makes the window go "not responding" and starves the
+    // borderless/window setup that FusionFix drives through window messages.
+    // Bounded per call so a message flood can't stall the loop.
+    static void PumpMessages()
+    {
+        MSG msg;
+        for (int i = 0; i < 128 && PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE); i++)
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
 
     // ---- device acquisition (robust across the 1.2.0.59 device globals) --
@@ -668,8 +695,11 @@ class ShaderPrecompiler
     // Present a progress frame (throttled). frac in [0,1].
     static void PresentOverlay(bool force)
     {
+        // Always pump — keeps the window alive even on throttled (skipped) frames.
+        PumpMessages();
+
         auto now = std::chrono::steady_clock::now();
-        if (!force && std::chrono::duration_cast<std::chrono::milliseconds>(now - tLastPresent).count() < 40)
+        if (!force && std::chrono::duration_cast<std::chrono::milliseconds>(now - tLastPresent).count() < 33)
             return;
         tLastPresent = now;
 
@@ -749,7 +779,8 @@ class ShaderPrecompiler
                 dev->CreatePixelShader(reinterpret_cast<const DWORD*>(s->bytecode), &psHandles[i]);
 
             workDone++;
-            if ((i & 31) == 0) { curLabel = "shader " + std::to_string(i + 1) + " / " + std::to_string(n); PresentOverlay(false); }
+            if ((i & 15) == 0) curLabel = "shader " + std::to_string(i + 1) + " / " + std::to_string(n);
+            PresentOverlay(false); // pumps every iter; presents on the ~33ms throttle
         }
         Log("created %u shaders", n);
     }
@@ -821,7 +852,11 @@ class ShaderPrecompiler
                     }
                     SAFE_RELEASE(decl);
                     workDone++;
-                    if (((e << 8) ^ p) % 64 == 0) { curLabel = ef->name ? ef->name : ""; PresentOverlay(false); }
+                    if (ef->name) curLabel = ef->name;
+                    // Present every pass: pumps messages, advances the bar smoothly,
+                    // and (on native D3D9) periodically flushes so the driver actually
+                    // compiles the batched draws' ISA instead of deferring it all.
+                    PresentOverlay(false);
                 }
             }
         }
@@ -850,6 +885,8 @@ class ShaderPrecompiler
                 const BlendConfig* b = FindBlend(tp.blend);
                 if (BindFormatSet(f)) { ApplyBlend(b); IssueDraw(tp.topo, stride); }
                 workDone++;
+                curLabel = "state coverage";
+                PresentOverlay(false);
             }
             // Present-format coverage (scope decision 3): both HDR output modes.
             if (cfg.coverPresent)
@@ -964,9 +1001,13 @@ class ShaderPrecompiler
             Log("parsed %u effects, %u unique shaders, %u passes (errors %u)",
                 st.effect_count, st.unique_total, st.pass_count, st.parse_errors);
 
-            // work units: creates + (per-pass draws) + tuple warm
-            uint32_t passUnits = st.pass_count;
-            workTotal = st.unique_total + passUnits + (uint32_t)kTupleCount + 4;
+            // Exact work units so the bar tracks real progress and reaches 100%:
+            //   creates (unique shaders) + one unit per pass + tuple warms
+            //   + present-format warms. Must match every workDone++ site below.
+            uint32_t passUnits = (cfg.breadth > 0) ? st.pass_count : 0;
+            uint32_t tupleUnits = (cfg.breadth > 0) ? (uint32_t)kTupleCount + (cfg.coverPresent ? 2u : 0u) : 0;
+            workTotal = st.unique_total + passUnits + tupleUnits;
+            if (workTotal == 0) workTotal = 1;
             workDone = 0;
 
             CreateResources();
@@ -995,18 +1036,55 @@ class ShaderPrecompiler
         dev = nullptr;
     }
 
+    // Readiness gate (fixes the "ran before windowed-borderless / half-ready" bug).
+    // Run only once the swapchain has held a FINAL, stable size for N frames — by
+    // which point FusionFix's windowed-borderless window setup and any resolution
+    // device-reset have completed — and a loading screen is genuinely up (still
+    // before gameplay). Returns true when it is time to run.
+    static bool GateReady()
+    {
+        IDirect3DDevice9* d = AcquireDevice();
+        if (!d) { stableFrames = 0; return false; }
+
+        // Must be on a loading screen (pre-gameplay).
+        if (!(CMenuManager::bLoadscreenShown && *CMenuManager::bLoadscreenShown))
+            return false;
+
+        // Live swapchain size; must hold steady, meaning the borderless restyle /
+        // resolution reset is done and the back buffer is final.
+        UINT w = 0, h = 0;
+        IDirect3DSwapChain9* sc = nullptr;
+        if (SUCCEEDED(d->GetSwapChain(0, &sc)) && sc)
+        {
+            D3DPRESENT_PARAMETERS pp{};
+            if (SUCCEEDED(sc->GetPresentParameters(&pp)))
+            {
+                w = pp.BackBufferWidth; h = pp.BackBufferHeight;
+                if (pp.hDeviceWindow) gameWnd = pp.hDeviceWindow;
+            }
+            sc->Release();
+        }
+        if (w == 0 || h == 0) { stableFrames = 0; return false; }
+
+        if (w == gateW && h == gateH) stableFrames++;
+        else { gateW = w; gateH = h; stableFrames = 0; }
+
+        return stableFrames >= kStableFramesNeeded;
+    }
+
     // ---- injection anchor: FUN_005cc760 (render-thread loadscreen render) -----
     static void __cdecl LoadscreenRenderDetour()
     {
-        bool expected = false;
-        if (ranOnce.compare_exchange_strong(expected, true))
+        if (!finished.load() && !started.load())
         {
-            // only while a loading screen is genuinely up (device+swapchain ready).
-            bool shown = CMenuManager::bLoadscreenShown && *CMenuManager::bLoadscreenShown;
-            if (shown || AcquireDevice())
+            loadscreenFramesSeen++;
+            if (GateReady())
             {
+                started = true;   // guard against any re-entry
                 __try { RunBlocking(); }
-                __except (EXCEPTION_EXECUTE_HANDLER) { Log("precompile faulted — continuing to game"); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { Log("precompile faulted - continuing to game"); }
+                finished = true;
+                Log("gate: ran after %d loadscreen frames at %ux%u", loadscreenFramesSeen, gateW, gateH);
             }
         }
         shLoadscreenRender.call<void>();
@@ -1033,13 +1111,16 @@ public:
             GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                (LPCWSTR)&RebaseVA, &hSelf);
 
-            // Install the one-shot code hook on the render-thread loadscreen render
-            // (FUN_005cc760 @ 0x005cc760, 1.2.0.59). It fires only while the loading
-            // screen is up, after device+swapchain creation and before gameplay.
+            // Install the code hook on the render-thread loadscreen render
+            // (FUN_005cc760 @ 0x005cc760, 1.2.0.59). It does NOT run on first call:
+            // the GateReady() check holds off until the swapchain size is final and
+            // stable (windowed-borderless + any device reset settled) with a loading
+            // screen up — still before gameplay. The blocking pass pumps window
+            // messages so the window never goes "not responding".
             void* target = reinterpret_cast<void*>(RebaseVA(0x005cc760));
             shLoadscreenRender = safetyhook::create_inline(target, reinterpret_cast<void*>(&LoadscreenRenderDetour));
             if (shLoadscreenRender)
-                Log("armed at loadscreen render %p (breadth=%d, overlay=%d)", target, cfg.breadth, cfg.overlay);
+                Log("armed at loadscreen render %p (breadth=%d, overlay=%d, gate=%d frames)", target, cfg.breadth, cfg.overlay, kStableFramesNeeded);
             else
                 Log("FAILED to hook loadscreen render at %p", target);
         };
