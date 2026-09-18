@@ -110,6 +110,10 @@ struct PrecompileConfig
     // Set a positive value only if you specifically want loading bounded.
     int     budgetSeconds = 0;      // PrecompileBudgetSeconds: 0 = run until everything is warm
     int     fenceChunk    = 1;      // PrecompileFenceChunk: pipelines per fence; 1 = smoothest bar
+    // Authoring-only: dump the deduplicated pipeline set so it can be SHIPPED as a
+    // baseline. Off for players -- it costs a file write and they have nothing to
+    // contribute that their own capture does not already hold.
+    bool    exportBaseline = false; // PrecompileExportBaseline
 };
 
 // ===========================================================================
@@ -1355,17 +1359,51 @@ class ShaderPrecompiler
         return dir + pipelinekeys::LegacyBundleName("bin");
     }
 
+    // A shipped baseline, so the very first launch on a machine that has never
+    // captured anything still warms something. Without it this feature does nothing
+    // until the user has already played through the stutter it exists to remove,
+    // which makes it a personal tool rather than a shipped one.
+    //
+    // Kept under its own name so the capture, which writes the per-configuration
+    // bundle, can never overwrite it, and so it is always merged IN ADDITION to
+    // whatever the user has recorded rather than being an either/or.
+    static std::string BaselinePath() { return ModuleDir() + "FusionFix.pipelinekeys.baseline.bin"; }
+
+    // Dedup state shared by every file merged into the replay set.
+    static inline std::unordered_map<uint64_t, uint32_t> replayDeclByHash;
+    static inline std::unordered_map<uint64_t, uint32_t> replayKeyIndex;
+
     // Returns false (and leaves replayRecs empty) for any malformed or absent file,
     // so the caller can fall back to the synthetic pass rather than doing nothing.
     static bool LoadKeyFile()
     {
-        using namespace pipelinekeys;
-
         replayRecs.clear();
         replayDecls.clear();
+        replayDeclByHash.clear();
+        replayKeyIndex.clear();
 
-        FILE* f = fopen(KeyFilePath().c_str(), "rb");
-        if (!f) { Log("replay: no key file at %s", KeyFilePath().c_str()); return false; }
+        // The user's own capture first: it is the one recorded at THIS graphics
+        // configuration, and merging it first means its draw counts drive the
+        // most-used-first ordering rather than a stranger's.
+        bool any = MergeKeyFile(KeyFilePath(), "capture");
+        any |= MergeKeyFile(BaselinePath(), "baseline");
+
+        Log("replay: loaded %zu keys, %zu declarations", replayRecs.size(), replayDecls.size());
+        return any && !replayRecs.empty();
+    }
+
+    // Merge one key file into the replay set. Declaration indices are file-local so
+    // they are remapped; a key present in both files is folded into one record with
+    // the draw counts summed, which keeps "warm the most-used first" meaningful
+    // across a shipped baseline and a local capture.
+    static bool MergeKeyFile(const std::string& path, const char* what)
+    {
+        using namespace pipelinekeys;
+
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) { Log("replay: no %s key file at %s", what, path.c_str()); return false; }
+
+        const size_t recsBefore = replayRecs.size();
 
         FileHeader h{};
         if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); return false; }
@@ -1399,43 +1437,126 @@ class ShaderPrecompiler
                 return false;
             }
 
-        replayDecls.resize(h.declCount);
+        // File-local declaration index -> our index.
+        std::vector<uint32_t> remap(h.declCount, 0);
         for (uint32_t i = 0; i < h.declCount; i++)
         {
             uint32_t n = 0;
             if (fread(&n, sizeof(n), 1, f) != 1 || n == 0 || n > MAXD3DDECLLENGTH + 1) { fclose(f); return false; }
-            replayDecls[i].resize(n);
-            if (fread(replayDecls[i].data(), sizeof(D3DVERTEXELEMENT9), n, f) != n) { fclose(f); return false; }
+            std::vector<D3DVERTEXELEMENT9> elems(n);
+            if (fread(elems.data(), sizeof(D3DVERTEXELEMENT9), n, f) != n) { fclose(f); return false; }
+
+            uint64_t dh = Fnv1a(elems.data(), elems.size() * sizeof(D3DVERTEXELEMENT9));
+            if (auto it = replayDeclByHash.find(dh); it != replayDeclByHash.end())
+            {
+                remap[i] = it->second;
+            }
+            else
+            {
+                remap[i] = (uint32_t)replayDecls.size();
+                replayDeclByHash.emplace(dh, remap[i]);
+                replayDecls.push_back(std::move(elems));
+            }
         }
 
-        replayRecs.resize(h.recCount);
-        size_t got = 0;
-        if (isV1)
+        size_t got = 0, merged = 0;
+        for (uint32_t i = 0; i < h.recCount; i++)
         {
-            for (uint32_t i = 0; i < h.recCount; i++)
+            KeyRecord k{};
+            if (isV1)
             {
                 KeyRecordV1 v1{};
                 if (fread(&v1, sizeof(v1), 1, f) != 1) break;
-                MigrateV1(v1, replayRecs[i]);
-                got++;
+                MigrateV1(v1, k);
             }
-        }
-        else if (h.recCount)
-        {
-            got = fread(replayRecs.data(), sizeof(KeyRecord), h.recCount, f);
+            else if (fread(&k, sizeof(k), 1, f) != 1)
+            {
+                break;
+            }
+            got++;
+
+            if (k.declIndex != kDeclNone)
+            {
+                if (k.declIndex >= h.declCount) continue;   // corrupt index: drop the key, keep the file
+                k.declIndex = remap[k.declIndex];
+            }
+
+            uint64_t kh = Fnv1a(&k, kKeyHashBytes);
+            if (auto it = replayKeyIndex.find(kh); it != replayKeyIndex.end())
+            {
+                replayRecs[it->second].count += k.count;
+                merged++;
+            }
+            else
+            {
+                replayKeyIndex.emplace(kh, (uint32_t)replayRecs.size());
+                replayRecs.push_back(k);
+            }
         }
         fclose(f);
 
         // A capture flushed while the game was killed can be short; keep what is
         // whole rather than discarding a useful file over its last record.
         if (got != h.recCount)
+            Log("replay: %s file claims %u records, read %zu - using the complete ones", what, h.recCount, got);
+
+        Log("replay: %s contributed %zu new keys (%zu already known) from %zu records",
+            what, replayRecs.size() - recsBefore, merged, got);
+        return got != 0;
+    }
+
+    // Write the deduplicated, use-ordered pipeline set as a baseline others can ship.
+    //
+    // Exported from the REPLAY's own reduction rather than recomputed offline: the
+    // reduction depends on each pixel shader's declared sampler mask, and a second
+    // implementation of that would be free to drift from this one in exactly the way
+    // pipelinekeys.h exists to prevent. It also shrinks enormously -- 13621 strict
+    // keys collapse to ~1968 pipelines, so the shipped artifact is a fraction of a
+    // raw capture.
+    static void ExportBaseline(const std::vector<uint32_t>& drawList)
+    {
+        using namespace pipelinekeys;
+
+        std::string path = ModuleDir() + "FusionFix.pipelinekeys.baseline.export.bin";
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) { Log("baseline: cannot write %s", path.c_str()); return; }
+
+        // Only the declarations these records actually reference.
+        std::unordered_map<uint32_t, uint32_t> declRemap;
+        std::vector<uint32_t> declOrder;
+        for (uint32_t r : drawList)
         {
-            Log("replay: file claims %u records, read %zu - using the complete ones", h.recCount, got);
-            replayRecs.resize(got);
+            uint32_t d = replayRecs[r].declIndex;
+            if (d == kDeclNone || d >= replayDecls.size()) continue;
+            if (declRemap.emplace(d, (uint32_t)declOrder.size()).second) declOrder.push_back(d);
         }
 
-        Log("replay: loaded %zu keys, %zu declarations", replayRecs.size(), replayDecls.size());
-        return !replayRecs.empty();
+        FileHeader h{ kMagic, kVersion, kNumRS, kNumSamplers,
+                      (uint32_t)declOrder.size(), (uint32_t)drawList.size() };
+        fwrite(&h, sizeof(h), 1, f);
+
+        for (uint32_t i = 0; i < kNumRS; i++)
+        {
+            uint32_t rs = (uint32_t)kTrackedRS[i].rs;
+            fwrite(&rs, 4, 1, f);
+        }
+        for (uint32_t d : declOrder)
+        {
+            uint32_t n = (uint32_t)replayDecls[d].size();
+            fwrite(&n, 4, 1, f);
+            fwrite(replayDecls[d].data(), sizeof(D3DVERTEXELEMENT9), n, f);
+        }
+        for (uint32_t r : drawList)
+        {
+            KeyRecord k = replayRecs[r];
+            if (k.declIndex != kDeclNone)
+                k.declIndex = declRemap.count(k.declIndex) ? declRemap[k.declIndex] : kDeclNone;
+            fwrite(&k, sizeof(k), 1, f);
+        }
+        fclose(f);
+
+        Log("baseline: wrote %zu pipelines and %zu declarations to %s",
+            drawList.size(), declOrder.size(), path.c_str());
     }
 
     // Index the shaders we just created by the same bytecode hash the capture used,
@@ -1712,6 +1833,8 @@ class ShaderPrecompiler
         if (workTotal == 0) workTotal = 1;
         Log("replay: %zu unique pipelines to build from %zu keys (ordered by use)",
             drawList.size(), replayRecs.size());
+
+        if (cfg.exportBaseline) ExportBaseline(drawList);
 
         // Adaptive exit: if pipelines are not actually being COMPILED, there is
         // nothing to win and the whole pass is a pure loading-time regression.
@@ -2374,6 +2497,7 @@ class ShaderPrecompiler
         cfg.adaptiveExit = ini.ReadInteger("SHADERS", "PrecompileAdaptiveExit", 0) != 0;
         cfg.budgetSeconds = ini.ReadInteger("SHADERS", "PrecompileBudgetSeconds", 0);
         cfg.fenceChunk    = ini.ReadInteger("SHADERS", "PrecompileFenceChunk", 1);
+        cfg.exportBaseline = ini.ReadInteger("SHADERS", "PrecompileExportBaseline", 0) != 0;
     }
 
 public:
