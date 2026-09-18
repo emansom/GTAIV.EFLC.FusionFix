@@ -1436,6 +1436,19 @@ class ShaderPrecompiler
         return scratchDepthMS;
     }
 
+    // Wait for everything submitted so far to complete, presenting the overlay while
+    // we wait so the progress frame keeps updating instead of the window going dead.
+    static void FenceChunk(IDirect3DQuery9* q)
+    {
+        if (!q) return;
+        q->Issue(D3DISSUE_END);
+        for (int spin = 0; spin < 200000; spin++)
+        {
+            if (q->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_OK) break;
+            PresentOverlay(false);
+        }
+    }
+
     static void ReplayPass()
     {
         using namespace pipelinekeys;
@@ -1495,6 +1508,13 @@ class ShaderPrecompiler
         const int kProbeDraws = 128;     // enough to average out one-off costs
         const double kFastLinkMs = 1.0;  // below this, nothing is being compiled
         bool exitedEarly = false;
+
+        // Chunked fencing: small enough that the bar moves often, large enough that
+        // the GPU is not serialised on a round trip per pipeline.
+        const uint32_t kFenceChunk = 32;
+        uint32_t sinceFence = 0;
+        IDirect3DQuery9* fence = nullptr;
+        dev->CreateQuery(D3DQUERYTYPE_EVENT, &fence);
 
         for (uint32_t r : drawList)
         {
@@ -1609,11 +1629,32 @@ class ShaderPrecompiler
                 break;
             }
 
-            workDone += kPassW;
-            if ((r & 15) == 0)
-                curLabel = "pipeline " + std::to_string(r + 1) + " / " + std::to_string(replayRecs.size());
+            // Fence every chunk, and only THEN credit the work.
+            //
+            // Issuing a draw does not compile anything -- DXVK enqueues it, which is
+            // why 1863 draws take ~0.13 s while the pass takes ~16 s. Crediting
+            // progress per draw therefore filled the bar almost instantly and left
+            // the remaining fifteen seconds looking like a freeze at 100%. Waiting
+            // on an event query per chunk makes each step mean "these pipelines are
+            // actually built", so the bar tracks compilation, and the overlay gets
+            // presented throughout the wait instead of only at the end.
+            if (++sinceFence >= kFenceChunk)
+            {
+                FenceChunk(fence);
+                workDone += kPassW * sinceFence;
+                sinceFence = 0;
+                curLabel = "pipeline " + std::to_string(drawn) + " / " + std::to_string(drawList.size());
+            }
             PresentOverlay(false);
         }
+
+        // Credit and drain whatever is left in the final partial chunk.
+        if (sinceFence)
+        {
+            FenceChunk(fence);
+            workDone += kPassW * sinceFence;
+        }
+        SAFE_RELEASE(fence);
 
         // Unbind, so nothing below inherits a scratch target or dummy stream.
         for (uint32_t i = 1; i < kMaxRT; i++) dev->SetRenderTarget(i, nullptr);
