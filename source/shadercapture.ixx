@@ -487,7 +487,10 @@ class ShaderCapture
     // Cache file for THIS graphics configuration. Recorded keys carry render-target
     // formats, so one captured at another resolution or MSAA level is both useless
     // (nothing matches) and harmful (warms pipelines this setup never uses).
-    static inline std::string bundleBin, bundleTxt, bundleLegacyRes;
+    static inline std::string bundleBin, bundleTxt;
+    // Kept so LoadExisting can build every predecessor name for this configuration.
+    static inline uint32_t bundleFmt = 0;
+    static inline int      bundleMsaa = 0;
 
     static void ResolveBundle(IDirect3DDevice9* d)
     {
@@ -508,8 +511,14 @@ class ShaderCapture
 
         bundleBin = pipelinekeys::BundleName(w, h, fmt, msaa, "bin");
         bundleTxt = pipelinekeys::BundleName(w, h, fmt, msaa, "txt");
-        bundleLegacyRes = pipelinekeys::ResolutionBundleName(w, h, fmt, msaa, "bin");
-        Log("cache bundle for this configuration: %s", bundleBin.c_str());
+        bundleFmt  = fmt;
+        bundleMsaa = msaa;
+        // Log the back buffer this was derived from. It is NOT reliably the resolution
+        // the session runs at -- a window left at 720p by a previous run made the game
+        // start 720p and only later reset to 1080p -- which is exactly why the bundle
+        // name no longer depends on it.
+        Log("cache bundle for this configuration: %s (back buffer %ux%u fmt %u msaa %d)",
+            bundleBin.c_str(), w, h, fmt, msaa);
     }
 
     static void WriteBinary()
@@ -707,31 +716,60 @@ class ShaderCapture
     // and GTA IV is far too large for that to be most of the pipeline space. With
     // it, the file grows monotonically across sessions (and, later, across
     // contributors: merging two players' caches is the same operation).
+    // Load this configuration's bundle AND every predecessor of it, merging them all.
+    //
+    // This used to pick one predecessor by name, computed from the back-buffer size at
+    // the first EndScene -- and that size is not reliably the resolution the session
+    // runs at. Observed live: the window persisted at 1280x720 from a previous run, so
+    // the game came up 720p and only later reset to 1080p; adoption looked for
+    // "720p-f21-ms0.bin", missed the real 13647-key "1080p-..." capture entirely, and
+    // silently fell through to a smaller pre-bundle file. Nothing announced the loss.
+    //
+    // Since resolution provably does not affect the keys (see BundleName), there is no
+    // reason to choose at all: merge every per-resolution predecessor for this format
+    // and MSAA level. More coverage, and no dependence on a transient size.
     static void LoadExisting()
     {
-        // Prefer this configuration's bundle; fall back to the pre-bundle file once,
-        // so an existing cache is adopted rather than orphaned. It is then written
-        // back under the bundle name.
-        FILE* f = fopen((OutDir() + bundleBin).c_str(), "rb");
-        if (!f && !bundleLegacyRes.empty())
+        const char* kResClasses[] = { "4k", "1440p", "1080p", "720p", "low" };
+
+        std::vector<std::string> candidates;
+        candidates.push_back(bundleBin);
+        for (const char* cls : kResClasses)
         {
-            // The per-resolution name this cache used before resolution was shown not
-            // to affect render-target formats. Adopt it rather than orphan it.
-            f = fopen((OutDir() + bundleLegacyRes).c_str(), "rb");
-            if (f) Log("adopting the per-resolution cache %s into %s", bundleLegacyRes.c_str(), bundleBin.c_str());
+            char buf[128];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "FusionFix.pipelinekeys.%s-f%u-ms%d.bin",
+                        cls, bundleFmt, bundleMsaa);
+            candidates.push_back(buf);
         }
-        if (!f)
-        {
-            f = fopen(OutPath(pipelinekeys::LegacyBundleName("bin")).c_str(), "rb");
-            if (f) Log("adopting the pre-bundle cache into %s", bundleBin.c_str());
-        }
-        if (!f) { Log("no existing cache for this configuration - starting a new one"); return; }
+        candidates.push_back(pipelinekeys::LegacyBundleName("bin"));
+
+        uint32_t loadedFiles = 0;
+        for (auto& leaf : candidates)
+            if (MergeBundleFile(OutDir() + leaf, leaf.c_str())) loadedFiles++;
+
+        if (loadedFiles == 0)
+            Log("no existing cache for this configuration - starting a new one");
+        else
+            Log("merged %u keys from %u cache file(s) (%zu unique, %zu declarations)",
+                mergedIn, loadedFiles, records.size(), declTable.size());
+    }
+
+    // Merge one bundle file. Returns false if it is absent or unusable, so the caller
+    // can simply try every candidate.
+    static bool MergeBundleFile(const std::string& path, const char* label)
+    {
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) return false;
+        // Records READ and keys the file actually ADDED are different numbers, and
+        // only the second says whether a file was worth merging: the pre-bundle
+        // contributed 11234 records and zero new keys, being a strict subset.
+        const size_t uniqueBefore = records.size();
 
         uint32_t magic = 0, version = 0, numRS = 0, numSamplers = 0, declCount = 0, recCount = 0;
-        if (fread(&magic, 4, 1, f) != 1 || magic != 0x4B504646u) { fclose(f); return; }
+        if (fread(&magic, 4, 1, f) != 1 || magic != 0x4B504646u) { fclose(f); return false; }
         if (fread(&version, 4, 1, f) != 1 || fread(&numRS, 4, 1, f) != 1 ||
             fread(&numSamplers, 4, 1, f) != 1 || fread(&declCount, 4, 1, f) != 1 ||
-            fread(&recCount, 4, 1, f) != 1) { fclose(f); return; }
+            fread(&recCount, 4, 1, f) != 1) { fclose(f); return false; }
 
         // A cache recorded against a different state set cannot be merged field for
         // field. Keep it rather than silently corrupting it: bail and start fresh.
@@ -740,17 +778,17 @@ class ShaderCapture
         if ((version != pipelinekeys::kVersion && version != pipelinekeys::kVersionV1) ||
             numRS != kNumRS || numSamplers != kNumSamplers)
         {
-            Log("existing cache is v%u tracking %u states / %u samplers (this build: v%u, %u / %u) - not merging",
-                version, numRS, numSamplers, pipelinekeys::kVersion, kNumRS, kNumSamplers);
+            Log("%s is v%u tracking %u states / %u samplers (this build: v%u, %u / %u) - not merging",
+                label, version, numRS, numSamplers, pipelinekeys::kVersion, kNumRS, kNumSamplers);
             fclose(f);
-            return;
+            return false;
         }
         const bool isV1 = (version == pipelinekeys::kVersionV1);
 
         std::vector<uint32_t> rsTypes(numRS);
-        if (fread(rsTypes.data(), 4, numRS, f) != numRS) { fclose(f); return; }
+        if (fread(rsTypes.data(), 4, numRS, f) != numRS) { fclose(f); return false; }
         for (uint32_t i = 0; i < numRS; i++)
-            if (rsTypes[i] != (uint32_t)kTrackedRS[i].rs) { fclose(f); return; }
+            if (rsTypes[i] != (uint32_t)kTrackedRS[i].rs) { fclose(f); return false; }
 
         // Declaration indices are file-local, so they must be remapped into our
         // table before a record's key is hashed -- declIndex is part of the key.
@@ -758,9 +796,9 @@ class ShaderCapture
         for (uint32_t i = 0; i < declCount; i++)
         {
             uint32_t n = 0;
-            if (fread(&n, 4, 1, f) != 1 || n == 0 || n > MAXD3DDECLLENGTH + 1) { fclose(f); return; }
+            if (fread(&n, 4, 1, f) != 1 || n == 0 || n > MAXD3DDECLLENGTH + 1) { fclose(f); return false; }
             std::vector<D3DVERTEXELEMENT9> elems(n);
-            if (fread(elems.data(), sizeof(D3DVERTEXELEMENT9), n, f) != n) { fclose(f); return; }
+            if (fread(elems.data(), sizeof(D3DVERTEXELEMENT9), n, f) != n) { fclose(f); return false; }
 
             uint64_t h = fnv1a(elems.data(), elems.size() * sizeof(D3DVERTEXELEMENT9));
             auto it = declIndexByHash.find(h);
@@ -808,8 +846,8 @@ class ShaderCapture
         }
         fclose(f);
 
-        Log("merged %u keys from the existing cache (%zu unique, %zu declarations)",
-            mergedIn, records.size(), declTable.size());
+        Log("  %s: %u records read, %zu keys new", label, recCount, records.size() - uniqueBefore);
+        return true;
     }
 
     static void Flush(bool force)
