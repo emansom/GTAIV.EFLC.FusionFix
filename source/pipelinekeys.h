@@ -192,14 +192,38 @@ namespace pipelinekeys
     // one bundle per setup, and makes a shipped set of bundles selectable rather
     // than a single file that is wrong for most people.
     //
-    // Back-buffer size and format plus the MSAA level are what actually move the
-    // formats in the key; they are cheap to read and stable across a session.
+    // Back-buffer FORMAT and the MSAA level are what actually move the formats in a
+    // key. Resolution does NOT, and used to be in this name.
+    //
+    // Measured 2026-09-18 by capturing the same autoload scene at 1920x1080 and at
+    // 1280x720 (driven at runtime through the game's own mode table + device reset):
+    // both produced the SAME 14 render-target/depth/multisample combinations, down to
+    // the rare tails matching on the exact draw count (191, 114, 3). A repeatability
+    // control -- two captures at identical settings -- showed the combo set has no
+    // run-to-run noise, so that null result is real rather than an insensitive test.
+    //
+    // It makes sense: a Vulkan pipeline bakes attachment formats and sample counts,
+    // not framebuffer dimensions, and GTA IV's targets are fixed engine formats
+    // (R32F shadows, the A8R8G8B8 x3 + R16F G-buffer, the fp16 scene). Bucketing by
+    // resolution therefore fragmented the cache for nothing: it split one cache into
+    // near-identical copies, reset a user's coverage whenever they changed
+    // resolution, and would have forced us to ship a separate baseline per bucket.
     inline std::string BundleName(uint32_t width, uint32_t height, uint32_t bbFormat,
                                   int msaa, const char* ext)
     {
         char buf[128];
-        // Bucket the resolution: an off-by-a-few-pixels borderless size must not
-        // fragment the cache, but 1080p and 4K must not share one.
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "FusionFix.pipelinekeys.f%u-ms%d.%s",
+                    bbFormat, msaa, ext);
+        (void)width; (void)height;
+        return std::string(buf);
+    }
+
+    // The previous per-resolution name. Still read, so nobody's accumulated capture
+    // is orphaned by the rename; the merged result is written under the new name.
+    inline std::string ResolutionBundleName(uint32_t width, uint32_t height, uint32_t bbFormat,
+                                            int msaa, const char* ext)
+    {
+        char buf[128];
         const char* cls = (height >= 2000) ? "4k" : (height >= 1300) ? "1440p"
                         : (height >= 1000) ? "1080p" : (height >= 700) ? "720p" : "low";
         _snprintf_s(buf, sizeof(buf), _TRUNCATE, "FusionFix.pipelinekeys.%s-f%u-ms%d.%s",

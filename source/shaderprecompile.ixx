@@ -1355,6 +1355,11 @@ class ShaderPrecompiler
         std::string bundle = dir + pipelinekeys::BundleName(w, h, fmt, msaa, "bin");
         if (FILE* f = fopen(bundle.c_str(), "rb")) { fclose(f); return bundle; }
 
+        // The per-resolution name, from before resolution was measured not to affect
+        // render-target formats. Still read so an existing cache keeps working.
+        std::string byRes = dir + pipelinekeys::ResolutionBundleName(w, h, fmt, msaa, "bin");
+        if (FILE* f = fopen(byRes.c_str(), "rb")) { fclose(f); return byRes; }
+
         // Fall back to the pre-bundle name so an existing cache still works.
         return dir + pipelinekeys::LegacyBundleName("bin");
     }

@@ -487,7 +487,7 @@ class ShaderCapture
     // Cache file for THIS graphics configuration. Recorded keys carry render-target
     // formats, so one captured at another resolution or MSAA level is both useless
     // (nothing matches) and harmful (warms pipelines this setup never uses).
-    static inline std::string bundleBin, bundleTxt;
+    static inline std::string bundleBin, bundleTxt, bundleLegacyRes;
 
     static void ResolveBundle(IDirect3DDevice9* d)
     {
@@ -508,6 +508,7 @@ class ShaderCapture
 
         bundleBin = pipelinekeys::BundleName(w, h, fmt, msaa, "bin");
         bundleTxt = pipelinekeys::BundleName(w, h, fmt, msaa, "txt");
+        bundleLegacyRes = pipelinekeys::ResolutionBundleName(w, h, fmt, msaa, "bin");
         Log("cache bundle for this configuration: %s", bundleBin.c_str());
     }
 
@@ -712,6 +713,13 @@ class ShaderCapture
         // so an existing cache is adopted rather than orphaned. It is then written
         // back under the bundle name.
         FILE* f = fopen((OutDir() + bundleBin).c_str(), "rb");
+        if (!f && !bundleLegacyRes.empty())
+        {
+            // The per-resolution name this cache used before resolution was shown not
+            // to affect render-target formats. Adopt it rather than orphan it.
+            f = fopen((OutDir() + bundleLegacyRes).c_str(), "rb");
+            if (f) Log("adopting the per-resolution cache %s into %s", bundleLegacyRes.c_str(), bundleBin.c_str());
+        }
         if (!f)
         {
             f = fopen(OutPath(pipelinekeys::LegacyBundleName("bin")).c_str(), "rb");
