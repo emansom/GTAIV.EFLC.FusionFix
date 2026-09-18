@@ -65,134 +65,14 @@ import common;
 import comvars;
 
 // ---------------------------------------------------------------------------
-// Key layout
+// Key layout — ONE definition, in pipelinekeys.h, shared with the replay reader.
+//
+// This used to be duplicated here with static_asserts pinning the two together.
+// That was a stopgap taken to avoid rewriting a file while it was in use; keeping
+// two copies in step through a format change is exactly the drift the asserts were
+// guarding against, so the copy is gone.
 // ---------------------------------------------------------------------------
-static constexpr uint32_t kMaxRT       = 4;
-static constexpr uint32_t kPSSamplers  = 16;   // s0..s15
-static constexpr uint32_t kVSSamplers  = 4;    // D3DVERTEXTEXTURESAMPLER0..3
-static constexpr uint32_t kNumSamplers = kPSSamplers + kVSSamplers;
-
-// The render states we record. `pipeline` marks the ones that (as far as we can
-// tell from DXVK's d3d9 backend) are baked into the Vulkan pipeline rather than
-// set dynamically. Everything is recorded either way — the flag only splits the
-// two histograms in the summary, so we can see how much of the key-space is real
-// pipeline variation and how much is dynamic state we could ignore.
-struct RSDef { D3DRENDERSTATETYPE rs; const char* name; bool pipeline; };
-
-static constexpr RSDef kTrackedRS[] = {
-    { D3DRS_ZENABLE,                  "ZENABLE",                  true  },
-    { D3DRS_ZWRITEENABLE,             "ZWRITEENABLE",             true  },
-    { D3DRS_ZFUNC,                    "ZFUNC",                    true  },
-    { D3DRS_ALPHATESTENABLE,          "ALPHATESTENABLE",          true  },
-    { D3DRS_ALPHAFUNC,                "ALPHAFUNC",                true  },
-    { D3DRS_ALPHAREF,                 "ALPHAREF",                 false },  // dynamic
-    { D3DRS_ALPHABLENDENABLE,         "ALPHABLENDENABLE",         true  },
-    { D3DRS_SRCBLEND,                 "SRCBLEND",                 true  },
-    { D3DRS_DESTBLEND,                "DESTBLEND",                true  },
-    { D3DRS_BLENDOP,                  "BLENDOP",                  true  },
-    { D3DRS_SEPARATEALPHABLENDENABLE, "SEPARATEALPHABLENDENABLE", true  },
-    { D3DRS_SRCBLENDALPHA,            "SRCBLENDALPHA",            true  },
-    { D3DRS_DESTBLENDALPHA,           "DESTBLENDALPHA",           true  },
-    { D3DRS_BLENDOPALPHA,             "BLENDOPALPHA",             true  },
-    { D3DRS_COLORWRITEENABLE,         "COLORWRITEENABLE",         true  },
-    { D3DRS_COLORWRITEENABLE1,        "COLORWRITEENABLE1",        true  },
-    { D3DRS_COLORWRITEENABLE2,        "COLORWRITEENABLE2",        true  },
-    { D3DRS_COLORWRITEENABLE3,        "COLORWRITEENABLE3",        true  },
-    { D3DRS_CULLMODE,                 "CULLMODE",                 true  },
-    { D3DRS_FILLMODE,                 "FILLMODE",                 true  },
-    { D3DRS_SHADEMODE,                "SHADEMODE",                true  },
-    { D3DRS_STENCILENABLE,            "STENCILENABLE",            true  },
-    { D3DRS_TWOSIDEDSTENCILMODE,      "TWOSIDEDSTENCILMODE",      true  },
-    { D3DRS_STENCILFUNC,              "STENCILFUNC",              true  },
-    { D3DRS_STENCILFAIL,              "STENCILFAIL",              true  },
-    { D3DRS_STENCILZFAIL,             "STENCILZFAIL",             true  },
-    { D3DRS_STENCILPASS,              "STENCILPASS",              true  },
-    { D3DRS_STENCILREF,               "STENCILREF",               false },  // dynamic
-    { D3DRS_STENCILMASK,              "STENCILMASK",              false },  // dynamic
-    { D3DRS_STENCILWRITEMASK,         "STENCILWRITEMASK",         false },  // dynamic
-    { D3DRS_CCW_STENCILFUNC,          "CCW_STENCILFUNC",          true  },
-    { D3DRS_CCW_STENCILFAIL,          "CCW_STENCILFAIL",          true  },
-    { D3DRS_CCW_STENCILZFAIL,         "CCW_STENCILZFAIL",         true  },
-    { D3DRS_CCW_STENCILPASS,          "CCW_STENCILPASS",          true  },
-    { D3DRS_FOGENABLE,                "FOGENABLE",                true  },
-    { D3DRS_FOGTABLEMODE,             "FOGTABLEMODE",             true  },
-    { D3DRS_FOGVERTEXMODE,            "FOGVERTEXMODE",            true  },
-    { D3DRS_RANGEFOGENABLE,           "RANGEFOGENABLE",           true  },
-    { D3DRS_CLIPPLANEENABLE,          "CLIPPLANEENABLE",          true  },
-    { D3DRS_CLIPPING,                 "CLIPPING",                 true  },
-    { D3DRS_MULTISAMPLEANTIALIAS,     "MULTISAMPLEANTIALIAS",     true  },
-    { D3DRS_MULTISAMPLEMASK,          "MULTISAMPLEMASK",          true  },
-    { D3DRS_POINTSPRITEENABLE,        "POINTSPRITEENABLE",        true  },
-    { D3DRS_POINTSCALEENABLE,         "POINTSCALEENABLE",         true  },
-    { D3DRS_LIGHTING,                 "LIGHTING",                 true  },
-    { D3DRS_COLORVERTEX,              "COLORVERTEX",              true  },
-    { D3DRS_SPECULARENABLE,           "SPECULARENABLE",           true  },
-    { D3DRS_NORMALIZENORMALS,         "NORMALIZENORMALS",         true  },
-    { D3DRS_DIFFUSEMATERIALSOURCE,    "DIFFUSEMATERIALSOURCE",    true  },
-    { D3DRS_SPECULARMATERIALSOURCE,   "SPECULARMATERIALSOURCE",   true  },
-    { D3DRS_AMBIENTMATERIALSOURCE,    "AMBIENTMATERIALSOURCE",    true  },
-    { D3DRS_EMISSIVEMATERIALSOURCE,   "EMISSIVEMATERIALSOURCE",   true  },
-    { D3DRS_VERTEXBLEND,              "VERTEXBLEND",              true  },
-    { D3DRS_INDEXEDVERTEXBLENDENABLE, "INDEXEDVERTEXBLENDENABLE", true  },
-    { D3DRS_SRGBWRITEENABLE,          "SRGBWRITEENABLE",          true  },
-    { D3DRS_DEPTHBIAS,                "DEPTHBIAS",                false },  // dynamic
-    { D3DRS_SLOPESCALEDEPTHBIAS,      "SLOPESCALEDEPTHBIAS",      false },  // dynamic
-    { D3DRS_SCISSORTESTENABLE,        "SCISSORTESTENABLE",        false },  // dynamic
-};
-static constexpr uint32_t kNumRS = (uint32_t)(sizeof(kTrackedRS) / sizeof(kTrackedRS[0]));
-
-// One recorded draw state. Fully self-describing: replay must be able to rebuild
-// the state from this alone, so nothing here is a hash except the shaders (which
-// are matched back to the .fxc database by bytecode hash) and the declaration
-// (which is stored out-of-line in a table, indexed from here).
-#pragma pack(push, 1)
-struct KeyRecord
-{
-    uint64_t vsHash;                 // FNV-1a of VS bytecode, 0 = no VS bound
-    uint64_t psHash;                 // FNV-1a of PS bytecode, 0 = no PS bound
-    uint32_t declIndex;              // index into the declaration table, 0xFFFFFFFF = FVF path
-    uint32_t fvf;                    // only meaningful when declIndex == 0xFFFFFFFF
-    uint32_t primType;               // D3DPRIMITIVETYPE
-    uint32_t upDraw;                 // 1 if this came from a Draw*PrimitiveUP
-    uint32_t rtFmt[kMaxRT];          // D3DFORMAT per bound RT, 0 = unbound
-    uint32_t dsFmt;                  // D3DFORMAT of the depth/stencil surface, 0 = none
-    uint32_t rs[kNumRS];             // values of kTrackedRS, in order
-    uint8_t  samplerType[kNumSamplers]; // 0 none, 1 = 2D, 2 = CUBE, 3 = VOLUME
-    uint32_t count;                  // how many draws hit this key
-    uint32_t firstFrame;             // frame ordinal of first sighting
-};
-#pragma pack(pop)
-
-// The replay pass reads this file back through pipelinekeys.h. If the two
-// definitions ever drift, the file would still PARSE and replay the wrong state
-// -- indistinguishable from the synthetic pass's failure mode, and just as
-// expensive to diagnose. Make that a build error instead of a mystery.
-static_assert(sizeof(KeyRecord) == sizeof(pipelinekeys::KeyRecord),
-              "KeyRecord layout drifted from pipelinekeys.h");
-static_assert(kNumRS == pipelinekeys::kNumRS,
-              "tracked render-state count drifted from pipelinekeys.h");
-static_assert(kNumSamplers == pipelinekeys::kNumSamplers,
-              "sampler count drifted from pipelinekeys.h");
-static_assert(offsetof(KeyRecord, count) == pipelinekeys::kKeyHashBytes,
-              "key-hash extent drifted from pipelinekeys.h");
-static_assert(offsetof(KeyRecord, rs) == offsetof(pipelinekeys::KeyRecord, rs),
-              "render-state block moved relative to pipelinekeys.h");
-static_assert(offsetof(KeyRecord, samplerType) == offsetof(pipelinekeys::KeyRecord, samplerType),
-              "sampler block moved relative to pipelinekeys.h");
-
-// Sizes matching is not enough: REORDERING the render states keeps every size and
-// offset identical while silently changing what each rs[] slot means. That is the
-// drift most likely to happen and least likely to be noticed, so check the values.
-static constexpr bool TrackedRSMatchesHeader()
-{
-    for (uint32_t i = 0; i < kNumRS; i++)
-        if (kTrackedRS[i].rs != pipelinekeys::kTrackedRS[i].rs ||
-            kTrackedRS[i].pipeline != pipelinekeys::kTrackedRS[i].pipeline)
-            return false;
-    return true;
-}
-static_assert(TrackedRSMatchesHeader(),
-              "the tracked render-state list drifted from pipelinekeys.h (order or pipeline flags)");
+using namespace pipelinekeys;
 
 // ---------------------------------------------------------------------------
 class ShaderCapture
@@ -329,6 +209,19 @@ class ShaderCapture
         return (uint32_t)d.Format;
     }
 
+    // Sample count is baked into the Vulkan pipeline, so it belongs in the key.
+    // D3D9 requires every bound target to share a multisample type, so RT0's is
+    // representative.
+    static void SurfaceMultisample(IDirect3DSurface9* surf, uint32_t& type, uint32_t& quality)
+    {
+        type = 0; quality = 0;
+        if (!surf) return;
+        D3DSURFACE_DESC d{};
+        if (FAILED(surf->GetDesc(&d))) return;
+        type = (uint32_t)d.MultiSampleType;
+        quality = (uint32_t)d.MultiSampleQuality;
+    }
+
     static uint8_t SamplerKind(DWORD stage)
     {
         IDirect3DBaseTexture9* tex = nullptr;
@@ -379,7 +272,12 @@ class ShaderCapture
         {
             IDirect3DSurface9* rt = nullptr;
             // An unbound RT index legitimately fails; that is what rtFmt == 0 means.
-            if (SUCCEEDED(dev->GetRenderTarget(i, &rt)) && rt) { k.rtFmt[i] = SurfaceFormat(rt); rt->Release(); }
+            if (SUCCEEDED(dev->GetRenderTarget(i, &rt)) && rt)
+            {
+                k.rtFmt[i] = SurfaceFormat(rt);
+                if (i == 0) SurfaceMultisample(rt, k.msType, k.msQuality);
+                rt->Release();
+            }
         }
         {
             IDirect3DSurface9* ds = nullptr;
@@ -448,11 +346,47 @@ class ShaderCapture
         return origDIPUP(self, pt, minVertexIndex, numVertices, primCount, idxData, idxFmt, vtxData, vtxStride);
     }
 
+    // ---- shader registry -----------------------------------------------
+    // These hooks are installed even when capture is OFF: the replay pass needs
+    // them to bind shaders FusionFix compiled itself, which are absent from RAGE's
+    // .fxc database. Hashing from GetFunction (not the caller's pointer) keeps the
+    // hash identical to the one RecordDraw computes.
+    using PFN_CreateVertexShader = HRESULT(WINAPI*)(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**);
+    using PFN_CreatePixelShader  = HRESULT(WINAPI*)(IDirect3DDevice9*, const DWORD*, IDirect3DPixelShader9**);
+
+    static inline PFN_CreateVertexShader origCreateVS = nullptr;
+    static inline PFN_CreatePixelShader  origCreatePS = nullptr;
+    static inline bool shaderHooksInstalled = false;
+
+    static HRESULT WINAPI Hook_CreateVertexShader(IDirect3DDevice9* self, const DWORD* fn, IDirect3DVertexShader9** out)
+    {
+        HRESULT hr = origCreateVS(self, fn, out);
+        if (SUCCEEDED(hr) && out && *out)
+        {
+            uint64_t h = pipelinekeys::HashShaderFunction(*out);
+            if (h) pipelinekeys::Registry().vs[h] = *out;
+        }
+        return hr;
+    }
+
+    static HRESULT WINAPI Hook_CreatePixelShader(IDirect3DDevice9* self, const DWORD* fn, IDirect3DPixelShader9** out)
+    {
+        HRESULT hr = origCreatePS(self, fn, out);
+        if (SUCCEEDED(hr) && out && *out)
+        {
+            uint64_t h = pipelinekeys::HashShaderFunction(*out);
+            if (h) pipelinekeys::Registry().ps[h] = *out;
+        }
+        return hr;
+    }
+
     // IDirect3DDevice9 vtable slots (COM layout, fixed by the interface).
     static constexpr int kVT_DrawPrimitive          = 81;
     static constexpr int kVT_DrawIndexedPrimitive   = 82;
     static constexpr int kVT_DrawPrimitiveUP        = 83;
     static constexpr int kVT_DrawIndexedPrimitiveUP = 84;
+    static constexpr int kVT_CreateVertexShader     = 91;
+    static constexpr int kVT_CreatePixelShader      = 106;
 
     static bool PatchSlot(void** vtbl, int index, void* fn, void** outOrig)
     {
@@ -462,6 +396,18 @@ class ShaderCapture
         vtbl[index] = fn;
         VirtualProtect(&vtbl[index], sizeof(void*), prot, &prot);
         return true;
+    }
+
+    // Installed on the first EndScene whether or not capture is enabled, because
+    // the replay pass depends on the registry it fills.
+    static void InstallShaderHooks(IDirect3DDevice9* d)
+    {
+        if (shaderHooksInstalled) return;
+        auto vtbl = *reinterpret_cast<void***>(d);
+        bool ok = PatchSlot(vtbl, kVT_CreateVertexShader, (void*)&Hook_CreateVertexShader, (void**)&origCreateVS)
+               && PatchSlot(vtbl, kVT_CreatePixelShader,  (void*)&Hook_CreatePixelShader,  (void**)&origCreatePS);
+        shaderHooksInstalled = ok;
+        Log(ok ? "shader registry armed on device %p" : "FAILED to patch the shader-creation slots on %p", d);
     }
 
     static void Install(IDirect3DDevice9* d)
@@ -503,8 +449,8 @@ class ShaderCapture
         FILE* f = fopen(OutPath("FusionFix.pipelinekeys.bin").c_str(), "wb");
         if (!f) return;
 
-        const uint32_t magic = 0x4B504646; // 'FFPK'
-        const uint32_t version = 1;
+        const uint32_t magic = pipelinekeys::kMagic;
+        const uint32_t version = pipelinekeys::kVersion;
         const uint32_t recCount = (uint32_t)records.size();
         const uint32_t declCount = (uint32_t)declTable.size();
         const uint32_t numRS = kNumRS;
@@ -664,13 +610,17 @@ class ShaderCapture
 
         // A cache recorded against a different state set cannot be merged field for
         // field. Keep it rather than silently corrupting it: bail and start fresh.
-        if (version != 1 || numRS != kNumRS || numSamplers != kNumSamplers)
+        // A v1 cache CAN be merged -- it predates the multisample fields, and every
+        // v1 capture was taken with MSAA off, so it migrates by filling in NONE.
+        if ((version != pipelinekeys::kVersion && version != pipelinekeys::kVersionV1) ||
+            numRS != kNumRS || numSamplers != kNumSamplers)
         {
-            Log("existing cache tracks %u states / %u samplers (this build: %u / %u) - not merging",
-                numRS, numSamplers, kNumRS, kNumSamplers);
+            Log("existing cache is v%u tracking %u states / %u samplers (this build: v%u, %u / %u) - not merging",
+                version, numRS, numSamplers, pipelinekeys::kVersion, kNumRS, kNumSamplers);
             fclose(f);
             return;
         }
+        const bool isV1 = (version == pipelinekeys::kVersionV1);
 
         std::vector<uint32_t> rsTypes(numRS);
         if (fread(rsTypes.data(), 4, numRS, f) != numRS) { fclose(f); return; }
@@ -704,7 +654,16 @@ class ShaderCapture
         for (uint32_t i = 0; i < recCount; i++)
         {
             KeyRecord k{};
-            if (fread(&k, sizeof(k), 1, f) != 1) break;   // short file: keep what is whole
+            if (isV1)
+            {
+                pipelinekeys::KeyRecordV1 v1{};
+                if (fread(&v1, sizeof(v1), 1, f) != 1) break;
+                pipelinekeys::MigrateV1(v1, k);
+            }
+            else if (fread(&k, sizeof(k), 1, f) != 1)
+            {
+                break;   // short file: keep what is whole
+            }
             if (k.declIndex != 0xFFFFFFFFu)
             {
                 if (k.declIndex >= declCount) continue;
@@ -781,6 +740,11 @@ public:
         // exists and nothing is mid-draw, so swapping vtable slots is safe.
         FusionFix::onEndScene() += []()
         {
+            // The shader registry is needed by the replay pass even when capture is
+            // disabled, so arm it unconditionally and as early as a device exists.
+            if (!shaderHooksInstalled)
+                if (auto d = AcquireDevice()) InstallShaderHooks(d);
+
             if (!enabled) return;
 
             frameOrdinal++;

@@ -981,8 +981,16 @@ class ShaderPrecompiler
 
         FileHeader h{};
         if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); return false; }
-        if (h.magic != kMagic)     { Log("replay: bad magic 0x%08X", h.magic); fclose(f); return false; }
-        if (h.version != kVersion) { Log("replay: version %u, expected %u", h.version, kVersion); fclose(f); return false; }
+        if (h.magic != kMagic) { Log("replay: bad magic 0x%08X", h.magic); fclose(f); return false; }
+        // v1 predates the multisample fields; every v1 capture was taken with MSAA
+        // off, so it migrates rather than being thrown away.
+        if (h.version != kVersion && h.version != kVersionV1)
+        {
+            Log("replay: file is v%u, this build reads v%u and v%u", h.version, kVersion, kVersionV1);
+            fclose(f);
+            return false;
+        }
+        const bool isV1 = (h.version == kVersionV1);
         // A file written by a build tracking a different state set cannot be
         // replayed field-for-field, and guessing would be worse than not trying.
         if (h.numRS != kNumRS || h.numSamplers != kNumSamplers)
@@ -1013,7 +1021,21 @@ class ShaderPrecompiler
         }
 
         replayRecs.resize(h.recCount);
-        size_t got = h.recCount ? fread(replayRecs.data(), sizeof(KeyRecord), h.recCount, f) : 0;
+        size_t got = 0;
+        if (isV1)
+        {
+            for (uint32_t i = 0; i < h.recCount; i++)
+            {
+                KeyRecordV1 v1{};
+                if (fread(&v1, sizeof(v1), 1, f) != 1) break;
+                MigrateV1(v1, replayRecs[i]);
+                got++;
+            }
+        }
+        else if (h.recCount)
+        {
+            got = fread(replayRecs.data(), sizeof(KeyRecord), h.recCount, f);
+        }
         fclose(f);
 
         // A capture flushed while the game was killed can be short; keep what is
@@ -1043,7 +1065,17 @@ class ShaderPrecompiler
             if (s->stage == FXC_STAGE_VS) { if (vsHandles[i]) vsByHash.emplace(h, vsHandles[i]); }
             else                          { if (psHandles[i]) psByHash.emplace(h, psHandles[i]); }
         }
-        Log("replay: indexed %zu VS + %zu PS by bytecode hash", vsByHash.size(), psByHash.size());
+        size_t fromDb = vsByHash.size() + psByHash.size();
+
+        // Fold in every other shader the process created. FusionFix compiles its own
+        // (SMAA, FXAA, sun shafts, gamma, LOD lights) which are not in RAGE's .fxc
+        // database, and draws using them were previously skipped outright -- 178 of
+        // 5110 pipelines on the first capture.
+        for (auto& [h, obj] : pipelinekeys::Registry().vs) vsByHash.emplace(h, obj);
+        for (auto& [h, obj] : pipelinekeys::Registry().ps) psByHash.emplace(h, obj);
+
+        Log("replay: indexed %zu VS + %zu PS by bytecode hash (%zu from the .fxc db, %zu more from the registry)",
+            vsByHash.size(), psByHash.size(), fromDb, vsByHash.size() + psByHash.size() - fromDb);
     }
 
     static UINT DeclTypeSize(BYTE type)
@@ -1093,6 +1125,46 @@ class ShaderPrecompiler
         if (fmt == 0) return nullptr;
         if (fmt == (uint32_t)FOURCC_INTZ) return scratchDepthINTZ ? scratchDepthINTZ : scratchDepthD24S8;
         return scratchDepthD24S8 ? scratchDepthD24S8 : scratchDepthINTZ;
+    }
+
+    // Multisampled scratch targets, cached per {format, type, quality}. Vulkan bakes
+    // the sample count into the pipeline, so replaying an MSAA key against a
+    // single-sampled target would build a pipeline gameplay never asks for. Only
+    // reached when the user runs with ReflectionMSAAQuality set; the common path
+    // stays on the plain ScratchFor cache.
+    struct ScratchMS { D3DFORMAT fmt; uint32_t type; uint32_t quality; IDirect3DSurface9* surf; };
+    static inline std::vector<ScratchMS> scratchMS;
+    static inline IDirect3DSurface9* scratchDepthMS = nullptr;
+    static inline uint32_t scratchDepthMSType = 0;
+
+    static IDirect3DSurface9* ScratchForMS(D3DFORMAT fmt, uint32_t type, uint32_t quality)
+    {
+        if (type == 0) return ScratchFor(fmt);
+        for (auto& s : scratchMS)
+            if (s.fmt == fmt && s.type == type && s.quality == quality) return s.surf;
+
+        IDirect3DSurface9* surf = nullptr;
+        if (FAILED(dev->CreateRenderTarget(kRTdim, kRTdim, fmt, (D3DMULTISAMPLE_TYPE)type,
+                                           quality, FALSE, &surf, nullptr)))
+            surf = nullptr;
+        scratchMS.push_back({ fmt, type, quality, surf });
+        return surf;
+    }
+
+    // A multisampled colour target needs a depth surface with the SAME sample count.
+    static IDirect3DSurface9* ReplayDepthForMS(uint32_t fmt, uint32_t type, uint32_t quality)
+    {
+        if (fmt == 0) return nullptr;
+        if (type == 0) return ReplayDepthFor(fmt);
+        if (scratchDepthMS && scratchDepthMSType == type) return scratchDepthMS;
+        SAFE_RELEASE(scratchDepthMS);
+        if (SUCCEEDED(dev->CreateDepthStencilSurface(kRTdim, kRTdim, D3DFMT_D24S8,
+                                                     (D3DMULTISAMPLE_TYPE)type, quality,
+                                                     FALSE, &scratchDepthMS, nullptr)))
+            scratchDepthMSType = type;
+        else
+            scratchDepthMS = nullptr;
+        return scratchDepthMS;
     }
 
     static void ReplayPass()
@@ -1170,12 +1242,14 @@ class ShaderPrecompiler
             IDirect3DSurface9* rt0 = nullptr;
             for (uint32_t i = 0; i < kMaxRT; i++)
             {
-                IDirect3DSurface9* surf = k.rtFmt[i] ? ScratchFor((D3DFORMAT)k.rtFmt[i]) : nullptr;
+                IDirect3DSurface9* surf = k.rtFmt[i]
+                    ? ScratchForMS((D3DFORMAT)k.rtFmt[i], k.msType, k.msQuality)
+                    : nullptr;
                 if (i == 0) rt0 = surf;
                 dev->SetRenderTarget(i, surf);
             }
             if (!rt0) { skippedRT++; workDone += kPassW; continue; }
-            dev->SetDepthStencilSurface(ReplayDepthFor(k.dsFmt));
+            dev->SetDepthStencilSurface(ReplayDepthForMS(k.dsFmt, k.msType, k.msQuality));
 
             D3DVIEWPORT9 vp{ 0, 0, kRTdim, kRTdim, 0.0f, 1.0f };
             dev->SetViewport(&vp);
@@ -1262,6 +1336,10 @@ class ShaderPrecompiler
         if (scratchDepthINTZTex) { scratchDepthINTZTex->Release(); scratchDepthINTZTex = nullptr; }
         for (auto& d : replayDeclObjs) SAFE_RELEASE(d);
         replayDeclObjs.clear();
+        for (auto& s : scratchMS) SAFE_RELEASE(s.surf);
+        scratchMS.clear();
+        SAFE_RELEASE(scratchDepthMS);
+        scratchDepthMSType = 0;
         SAFE_RELEASE(dummyVB);
         SAFE_RELEASE(dummyIB);
         SAFE_RELEASE(tex2D);
