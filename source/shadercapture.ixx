@@ -57,6 +57,7 @@ module;
 #include <unordered_map>
 #include <chrono>
 #include <algorithm>
+#include "pipelinekeys.h"
 
 export module shadercapture;
 
@@ -162,6 +163,37 @@ struct KeyRecord
 };
 #pragma pack(pop)
 
+// The replay pass reads this file back through pipelinekeys.h. If the two
+// definitions ever drift, the file would still PARSE and replay the wrong state
+// -- indistinguishable from the synthetic pass's failure mode, and just as
+// expensive to diagnose. Make that a build error instead of a mystery.
+static_assert(sizeof(KeyRecord) == sizeof(pipelinekeys::KeyRecord),
+              "KeyRecord layout drifted from pipelinekeys.h");
+static_assert(kNumRS == pipelinekeys::kNumRS,
+              "tracked render-state count drifted from pipelinekeys.h");
+static_assert(kNumSamplers == pipelinekeys::kNumSamplers,
+              "sampler count drifted from pipelinekeys.h");
+static_assert(offsetof(KeyRecord, count) == pipelinekeys::kKeyHashBytes,
+              "key-hash extent drifted from pipelinekeys.h");
+static_assert(offsetof(KeyRecord, rs) == offsetof(pipelinekeys::KeyRecord, rs),
+              "render-state block moved relative to pipelinekeys.h");
+static_assert(offsetof(KeyRecord, samplerType) == offsetof(pipelinekeys::KeyRecord, samplerType),
+              "sampler block moved relative to pipelinekeys.h");
+
+// Sizes matching is not enough: REORDERING the render states keeps every size and
+// offset identical while silently changing what each rs[] slot means. That is the
+// drift most likely to happen and least likely to be noticed, so check the values.
+static constexpr bool TrackedRSMatchesHeader()
+{
+    for (uint32_t i = 0; i < kNumRS; i++)
+        if (kTrackedRS[i].rs != pipelinekeys::kTrackedRS[i].rs ||
+            kTrackedRS[i].pipeline != pipelinekeys::kTrackedRS[i].pipeline)
+            return false;
+    return true;
+}
+static_assert(TrackedRSMatchesHeader(),
+              "the tracked render-state list drifted from pipelinekeys.h (order or pipeline flags)");
+
 // ---------------------------------------------------------------------------
 class ShaderCapture
 {
@@ -205,6 +237,7 @@ class ShaderCapture
     // previous shader's hash (sizes would have to match too).
     static inline std::unordered_map<uint64_t, uint64_t> shaderHashCache;
 
+    static inline uint32_t mergedIn = 0;     // keys inherited from a previous session
     static inline uint64_t totalDraws = 0;
     static inline uint64_t frameOrdinal = 0;
     static inline uint32_t lastReportedUnique = 0;
@@ -435,6 +468,9 @@ class ShaderCapture
     {
         if (!lockReady) { InitializeCriticalSection(&lock); lockReady = true; }
 
+        // Inherit previous sessions' coverage before recording anything new.
+        LoadExisting();
+
         auto vtbl = *reinterpret_cast<void***>(d);
         bool ok = true;
         ok &= PatchSlot(vtbl, kVT_DrawPrimitive,          (void*)&Hook_DrawPrimitive,          (void**)&origDP);
@@ -606,6 +642,90 @@ class ShaderCapture
         }
 
         fclose(f);
+    }
+
+    // Merge an existing cache in at startup.
+    //
+    // Without this, every session starts from an empty set and throws the last one
+    // away, so coverage can never exceed what ONE playthrough happens to touch --
+    // and GTA IV is far too large for that to be most of the pipeline space. With
+    // it, the file grows monotonically across sessions (and, later, across
+    // contributors: merging two players' caches is the same operation).
+    static void LoadExisting()
+    {
+        FILE* f = fopen(OutPath("FusionFix.pipelinekeys.bin").c_str(), "rb");
+        if (!f) { Log("no existing cache - starting a new one"); return; }
+
+        uint32_t magic = 0, version = 0, numRS = 0, numSamplers = 0, declCount = 0, recCount = 0;
+        if (fread(&magic, 4, 1, f) != 1 || magic != 0x4B504646u) { fclose(f); return; }
+        if (fread(&version, 4, 1, f) != 1 || fread(&numRS, 4, 1, f) != 1 ||
+            fread(&numSamplers, 4, 1, f) != 1 || fread(&declCount, 4, 1, f) != 1 ||
+            fread(&recCount, 4, 1, f) != 1) { fclose(f); return; }
+
+        // A cache recorded against a different state set cannot be merged field for
+        // field. Keep it rather than silently corrupting it: bail and start fresh.
+        if (version != 1 || numRS != kNumRS || numSamplers != kNumSamplers)
+        {
+            Log("existing cache tracks %u states / %u samplers (this build: %u / %u) - not merging",
+                numRS, numSamplers, kNumRS, kNumSamplers);
+            fclose(f);
+            return;
+        }
+
+        std::vector<uint32_t> rsTypes(numRS);
+        if (fread(rsTypes.data(), 4, numRS, f) != numRS) { fclose(f); return; }
+        for (uint32_t i = 0; i < numRS; i++)
+            if (rsTypes[i] != (uint32_t)kTrackedRS[i].rs) { fclose(f); return; }
+
+        // Declaration indices are file-local, so they must be remapped into our
+        // table before a record's key is hashed -- declIndex is part of the key.
+        std::vector<uint32_t> remap(declCount, 0);
+        for (uint32_t i = 0; i < declCount; i++)
+        {
+            uint32_t n = 0;
+            if (fread(&n, 4, 1, f) != 1 || n == 0 || n > MAXD3DDECLLENGTH + 1) { fclose(f); return; }
+            std::vector<D3DVERTEXELEMENT9> elems(n);
+            if (fread(elems.data(), sizeof(D3DVERTEXELEMENT9), n, f) != n) { fclose(f); return; }
+
+            uint64_t h = fnv1a(elems.data(), elems.size() * sizeof(D3DVERTEXELEMENT9));
+            auto it = declIndexByHash.find(h);
+            if (it != declIndexByHash.end())
+            {
+                remap[i] = it->second;
+            }
+            else
+            {
+                remap[i] = (uint32_t)declTable.size();
+                declIndexByHash.emplace(h, remap[i]);
+                declTable.push_back(std::move(elems));
+            }
+        }
+
+        for (uint32_t i = 0; i < recCount; i++)
+        {
+            KeyRecord k{};
+            if (fread(&k, sizeof(k), 1, f) != 1) break;   // short file: keep what is whole
+            if (k.declIndex != 0xFFFFFFFFu)
+            {
+                if (k.declIndex >= declCount) continue;
+                k.declIndex = remap[k.declIndex];
+            }
+
+            uint64_t h = fnv1a(&k, offsetof(KeyRecord, count));
+            auto it = keyIndex.find(h);
+            if (it != keyIndex.end())
+                records[it->second].count += k.count;     // same key across sessions
+            else
+            {
+                keyIndex.emplace(h, (uint32_t)records.size());
+                records.push_back(k);
+            }
+            mergedIn++;
+        }
+        fclose(f);
+
+        Log("merged %u keys from the existing cache (%zu unique, %zu declarations)",
+            mergedIn, records.size(), declTable.size());
     }
 
     static void Flush(bool force)

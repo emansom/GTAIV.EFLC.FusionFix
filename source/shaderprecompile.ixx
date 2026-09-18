@@ -57,8 +57,11 @@ module;
 #include <algorithm>
 #include <filesystem>
 #include <system_error>
+#include <unordered_map>
+#include <unordered_set>
 #include "fxc_parse.h"
 #include "dxvk_d3d9_interfaces.h"
+#include "pipelinekeys.h"
 
 export module shaderprecompile;
 
@@ -91,6 +94,7 @@ struct PrecompileConfig
     bool    coverSdr      = false;  // PrecompileCoverSdr: also cover stock A8R8G8B8/A2B10G10R10 scene formats
     bool    coverPresent  = true;   // PrecompileCoverPresentModes: cover both PQ(10-bit) and scRGB(fp16) present formats
     int     flashProbe    = 0;      // PrecompileFlashProbe: see the probe note below (0 = off, N = flash every Nth loadscreen frame)
+    bool    replay        = true;   // PrecompileReplayCapturedKeys: replay FusionFix.pipelinekeys.bin when present
 };
 
 // ===========================================================================
@@ -937,6 +941,298 @@ class ShaderPrecompiler
     }
 
     // -------------------------------------------------------------------
+    //  Replay pass — rebuild the pipeline keys the game ACTUALLY used.
+    //
+    //  This is the answer to why the synthetic pass measured as useless: with
+    //  graphics-pipeline-library off, a pipeline is keyed on the whole state
+    //  vector, and synthetic draws match the game's in almost none of those
+    //  fields, so they build different objects. shadercapture.ixx records the
+    //  real keys during play; this replays them, which by construction produces
+    //  the same keys rather than lookalikes.
+    // -------------------------------------------------------------------
+
+    static inline std::vector<pipelinekeys::KeyRecord> replayRecs;
+    static inline std::vector<std::vector<D3DVERTEXELEMENT9>> replayDecls;
+    static inline std::vector<IDirect3DVertexDeclaration9*> replayDeclObjs;
+    static inline std::unordered_map<uint64_t, IDirect3DVertexShader9*> vsByHash;
+    static inline std::unordered_map<uint64_t, IDirect3DPixelShader9*>  psByHash;
+
+    static std::string KeyFilePath()
+    {
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(hSelf, path, MAX_PATH);
+        std::string s(path);
+        auto slash = s.find_last_of("\\/");
+        s = (slash == std::string::npos) ? std::string() : s.substr(0, slash + 1);
+        return s + "FusionFix.pipelinekeys.bin";
+    }
+
+    // Returns false (and leaves replayRecs empty) for any malformed or absent file,
+    // so the caller can fall back to the synthetic pass rather than doing nothing.
+    static bool LoadKeyFile()
+    {
+        using namespace pipelinekeys;
+
+        replayRecs.clear();
+        replayDecls.clear();
+
+        FILE* f = fopen(KeyFilePath().c_str(), "rb");
+        if (!f) { Log("replay: no key file at %s", KeyFilePath().c_str()); return false; }
+
+        FileHeader h{};
+        if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); return false; }
+        if (h.magic != kMagic)     { Log("replay: bad magic 0x%08X", h.magic); fclose(f); return false; }
+        if (h.version != kVersion) { Log("replay: version %u, expected %u", h.version, kVersion); fclose(f); return false; }
+        // A file written by a build tracking a different state set cannot be
+        // replayed field-for-field, and guessing would be worse than not trying.
+        if (h.numRS != kNumRS || h.numSamplers != kNumSamplers)
+        {
+            Log("replay: file tracks %u states / %u samplers, this build expects %u / %u",
+                h.numRS, h.numSamplers, kNumRS, kNumSamplers);
+            fclose(f);
+            return false;
+        }
+
+        std::vector<uint32_t> rsTypes(h.numRS);
+        if (fread(rsTypes.data(), sizeof(uint32_t), h.numRS, f) != h.numRS) { fclose(f); return false; }
+        for (uint32_t i = 0; i < h.numRS; i++)
+            if (rsTypes[i] != (uint32_t)kTrackedRS[i].rs)
+            {
+                Log("replay: state %u is %u in the file but %u here - refusing", i, rsTypes[i], (uint32_t)kTrackedRS[i].rs);
+                fclose(f);
+                return false;
+            }
+
+        replayDecls.resize(h.declCount);
+        for (uint32_t i = 0; i < h.declCount; i++)
+        {
+            uint32_t n = 0;
+            if (fread(&n, sizeof(n), 1, f) != 1 || n == 0 || n > MAXD3DDECLLENGTH + 1) { fclose(f); return false; }
+            replayDecls[i].resize(n);
+            if (fread(replayDecls[i].data(), sizeof(D3DVERTEXELEMENT9), n, f) != n) { fclose(f); return false; }
+        }
+
+        replayRecs.resize(h.recCount);
+        size_t got = h.recCount ? fread(replayRecs.data(), sizeof(KeyRecord), h.recCount, f) : 0;
+        fclose(f);
+
+        // A capture flushed while the game was killed can be short; keep what is
+        // whole rather than discarding a useful file over its last record.
+        if (got != h.recCount)
+        {
+            Log("replay: file claims %u records, read %zu - using the complete ones", h.recCount, got);
+            replayRecs.resize(got);
+        }
+
+        Log("replay: loaded %zu keys, %zu declarations", replayRecs.size(), replayDecls.size());
+        return !replayRecs.empty();
+    }
+
+    // Index the shaders we just created by the same bytecode hash the capture used,
+    // so a recorded key can name the exact shader objects to bind.
+    static void IndexShadersByHash(fxc_db* db)
+    {
+        vsByHash.clear();
+        psByHash.clear();
+        uint32_t n = fxc_unique_count(db);
+        for (uint32_t i = 0; i < n; i++)
+        {
+            const fxc_shader* s = fxc_unique_shader(db, i);
+            if (!s || !s->bytecode || !s->size) continue;
+            uint64_t h = pipelinekeys::Fnv1a(s->bytecode, s->size);
+            if (s->stage == FXC_STAGE_VS) { if (vsHandles[i]) vsByHash.emplace(h, vsHandles[i]); }
+            else                          { if (psHandles[i]) psByHash.emplace(h, psHandles[i]); }
+        }
+        Log("replay: indexed %zu VS + %zu PS by bytecode hash", vsByHash.size(), psByHash.size());
+    }
+
+    static UINT DeclTypeSize(BYTE type)
+    {
+        switch (type)
+        {
+        case D3DDECLTYPE_FLOAT1:    return 4;
+        case D3DDECLTYPE_FLOAT2:    return 8;
+        case D3DDECLTYPE_FLOAT3:    return 12;
+        case D3DDECLTYPE_FLOAT4:    return 16;
+        case D3DDECLTYPE_D3DCOLOR:  return 4;
+        case D3DDECLTYPE_UBYTE4:    return 4;
+        case D3DDECLTYPE_SHORT2:    return 4;
+        case D3DDECLTYPE_SHORT4:    return 8;
+        case D3DDECLTYPE_UBYTE4N:   return 4;
+        case D3DDECLTYPE_SHORT2N:   return 4;
+        case D3DDECLTYPE_SHORT4N:   return 8;
+        case D3DDECLTYPE_USHORT2N:  return 4;
+        case D3DDECLTYPE_USHORT4N:  return 8;
+        case D3DDECLTYPE_UDEC3:     return 4;
+        case D3DDECLTYPE_DEC3N:     return 4;
+        case D3DDECLTYPE_FLOAT16_2: return 4;
+        case D3DDECLTYPE_FLOAT16_4: return 8;
+        default:                    return 0;
+        }
+    }
+
+    static IDirect3DVertexDeclaration9* ReplayDecl(uint32_t index)
+    {
+        if (index >= replayDecls.size()) return nullptr;
+        if (replayDeclObjs.size() < replayDecls.size()) replayDeclObjs.resize(replayDecls.size(), nullptr);
+        if (replayDeclObjs[index]) return replayDeclObjs[index];
+
+        auto& elems = replayDecls[index];
+        // The capture stores the array exactly as GetDeclaration returned it,
+        // including D3DDECL_END, so it can be handed straight back.
+        IDirect3DVertexDeclaration9* obj = nullptr;
+        if (SUCCEEDED(dev->CreateVertexDeclaration(elems.data(), &obj)))
+            replayDeclObjs[index] = obj;
+        return obj;
+    }
+
+    // Depth surface matching the RECORDED format. The synthetic pass always
+    // preferred INTZ; here the format is part of the key, so honour it.
+    static IDirect3DSurface9* ReplayDepthFor(uint32_t fmt)
+    {
+        if (fmt == 0) return nullptr;
+        if (fmt == (uint32_t)FOURCC_INTZ) return scratchDepthINTZ ? scratchDepthINTZ : scratchDepthD24S8;
+        return scratchDepthD24S8 ? scratchDepthD24S8 : scratchDepthINTZ;
+    }
+
+    static void ReplayPass()
+    {
+        using namespace pipelinekeys;
+
+        uint32_t drawn = 0, skippedShader = 0, skippedDecl = 0, skippedRT = 0, skippedDup = 0;
+
+        // Bind the dummy geometry once; only the declaration changes per key.
+        dev->SetIndices(dummyIB);
+
+        // Records are deduplicated on the STRICT key, which includes state the
+        // driver sets dynamically -- stencil ref/mask, alpha ref, depth bias. Two
+        // records differing only there compile to the same pipeline, so replaying
+        // both is pure waste. On the 2026-09-18 capture that is 7846 strict keys
+        // against 5110 real pipelines: a third of the work, for nothing.
+        std::unordered_set<uint64_t> seenPipeline;
+        seenPipeline.reserve(replayRecs.size());
+
+        for (size_t r = 0; r < replayRecs.size(); r++)
+        {
+            const KeyRecord& k = replayRecs[r];
+
+            {
+                KeyRecord reduced = k;
+                for (uint32_t i = 0; i < kNumRS; i++)
+                    if (!kTrackedRS[i].pipeline) reduced.rs[i] = 0;
+                reduced.upDraw = 0;          // UP vs buffered draws share a pipeline
+                reduced.count = 0;
+                reduced.firstFrame = 0;
+                if (!seenPipeline.insert(Fnv1a(&reduced, kKeyHashBytes)).second)
+                {
+                    skippedDup++;
+                    workDone += kPassW;
+                    continue;
+                }
+            }
+
+            // Shaders. A miss means the capture saw a shader this .fxc database does
+            // not contain (a different episode, or a mod) -- skip rather than draw
+            // with the wrong one, which would warm a pipeline nothing will use.
+            IDirect3DVertexShader9* vs = nullptr;
+            IDirect3DPixelShader9*  ps = nullptr;
+            if (k.vsHash) { auto it = vsByHash.find(k.vsHash); if (it == vsByHash.end()) { skippedShader++; workDone += kPassW; continue; } vs = it->second; }
+            if (k.psHash) { auto it = psByHash.find(k.psHash); if (it == psByHash.end()) { skippedShader++; workDone += kPassW; continue; } ps = it->second; }
+
+            // Vertex layout.
+            UINT stride[4] = { 0, 0, 0, 0 };
+            if (k.declIndex != kDeclNone)
+            {
+                auto decl = ReplayDecl(k.declIndex);
+                if (!decl) { skippedDecl++; workDone += kPassW; continue; }
+                dev->SetVertexDeclaration(decl);
+
+                for (auto& e : replayDecls[k.declIndex])
+                {
+                    if (e.Stream == 0xFF) break;                 // D3DDECL_END
+                    if (e.Stream >= 4) continue;
+                    stride[e.Stream] = std::max(stride[e.Stream], (UINT)e.Offset + DeclTypeSize(e.Type));
+                }
+            }
+            else
+            {
+                dev->SetVertexDeclaration(nullptr);
+                dev->SetFVF(k.fvf);
+            }
+            for (UINT s = 0; s < 4; s++)
+                if (stride[s]) dev->SetStreamSource(s, dummyVB, 0, stride[s]);
+
+            dev->SetVertexShader(vs);
+            dev->SetPixelShader(ps);
+
+            // Render targets, in the recorded formats -- this is the field the
+            // synthetic pass got most wrong, and MRT count is part of the key.
+            IDirect3DSurface9* rt0 = nullptr;
+            for (uint32_t i = 0; i < kMaxRT; i++)
+            {
+                IDirect3DSurface9* surf = k.rtFmt[i] ? ScratchFor((D3DFORMAT)k.rtFmt[i]) : nullptr;
+                if (i == 0) rt0 = surf;
+                dev->SetRenderTarget(i, surf);
+            }
+            if (!rt0) { skippedRT++; workDone += kPassW; continue; }
+            dev->SetDepthStencilSurface(ReplayDepthFor(k.dsFmt));
+
+            D3DVIEWPORT9 vp{ 0, 0, kRTdim, kRTdim, 0.0f, 1.0f };
+            dev->SetViewport(&vp);
+
+            for (uint32_t i = 0; i < kNumRS; i++)
+                dev->SetRenderState(kTrackedRS[i].rs, k.rs[i]);
+
+            // Sampler dimensions are folded into DXVK's SPIR-V spec constants, so a
+            // 2D texture where the game bound a cube is a different pipeline.
+            for (uint32_t i = 0; i < kPSSamplers; i++)
+            {
+                IDirect3DBaseTexture9* t = nullptr;
+                switch (k.samplerType[i])
+                {
+                case kSampler2D:     t = tex2D;   break;
+                case kSamplerCube:   t = texCube; break;
+                case kSamplerVolume: t = texVol;  break;
+                default:             t = nullptr; break;
+                }
+                dev->SetTexture(i, t);
+            }
+            for (uint32_t i = 0; i < kVSSamplers; i++)
+            {
+                IDirect3DBaseTexture9* t = nullptr;
+                switch (k.samplerType[kPSSamplers + i])
+                {
+                case kSampler2D:     t = tex2D;   break;
+                case kSamplerCube:   t = texCube; break;
+                case kSamplerVolume: t = texVol;  break;
+                default:             t = nullptr; break;
+                }
+                dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + i, t);
+            }
+
+            // One degenerate primitive: the vertex buffer is zeroed, so nothing is
+            // rasterised, but the pipeline is created -- which is the whole point.
+            dev->DrawIndexedPrimitive((D3DPRIMITIVETYPE)k.primType, 0, 0, 3, 0, 1);
+            drawn++;
+
+            workDone += kPassW;
+            if ((r & 15) == 0)
+                curLabel = "pipeline " + std::to_string(r + 1) + " / " + std::to_string(replayRecs.size());
+            PresentOverlay(false);
+        }
+
+        // Unbind, so nothing below inherits a scratch target or dummy stream.
+        for (uint32_t i = 1; i < kMaxRT; i++) dev->SetRenderTarget(i, nullptr);
+        for (UINT s = 0; s < 4; s++) dev->SetStreamSource(s, nullptr, 0, 0);
+        dev->SetIndices(nullptr);
+        for (uint32_t i = 0; i < kPSSamplers; i++) dev->SetTexture(i, nullptr);
+        for (uint32_t i = 0; i < kVSSamplers; i++) dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + i, nullptr);
+
+        Log("replay: drew %u pipelines from %zu keys (skipped %u duplicate-state, %u no-shader, %u no-decl, %u no-RT)",
+            drawn, replayRecs.size(), skippedDup, skippedShader, skippedDecl, skippedRT);
+    }
+
+    // -------------------------------------------------------------------
     //  Completion gate (W4) — drain the GPU so nothing compiles in gameplay.
     // -------------------------------------------------------------------
     static void WaitUntilIdle()
@@ -964,6 +1260,8 @@ class ShaderPrecompiler
         SAFE_RELEASE(scratchDepthD24S8);
         SAFE_RELEASE(scratchDepthINTZ);
         if (scratchDepthINTZTex) { scratchDepthINTZTex->Release(); scratchDepthINTZTex = nullptr; }
+        for (auto& d : replayDeclObjs) SAFE_RELEASE(d);
+        replayDeclObjs.clear();
         SAFE_RELEASE(dummyVB);
         SAFE_RELEASE(dummyIB);
         SAFE_RELEASE(tex2D);
@@ -1053,18 +1351,34 @@ class ShaderPrecompiler
             Log("parsed %u effects, %u unique shaders, %u passes (errors %u)",
                 st.effect_count, st.unique_total, st.pass_count, st.parse_errors);
 
+            // Prefer replaying REAL captured keys over the synthetic coverage set:
+            // the synthetic pass measured as buying nothing (59 isolated spikes ON
+            // vs 55 OFF) because its draws build different pipeline keys than the
+            // game's. Fall back to it only when there is no usable capture.
+            bool useReplay = cfg.replay && LoadKeyFile();
+
             // Exact work units so the bar tracks real progress and reaches 100%:
             //   creates (unique shaders) + one unit per pass + tuple warms
             //   + present-format warms. Must match every workDone++ site below.
             uint32_t passUnits = (cfg.breadth > 0) ? st.pass_count : 0;
             uint32_t tupleUnits = (cfg.breadth > 0) ? (uint32_t)kTupleCount + (cfg.coverPresent ? 2u : 0u) : 0;
-            workTotal = st.unique_total * kCreateW + (passUnits + tupleUnits) * kPassW;
+            workTotal = useReplay
+                ? st.unique_total * kCreateW + (uint32_t)replayRecs.size() * kPassW
+                : st.unique_total * kCreateW + (passUnits + tupleUnits) * kPassW;
             if (workTotal == 0) workTotal = 1;
             workDone = 0;
 
             CreateResources();
             CreateAllShaders(db);
-            DummyDrawPass(db);
+            if (useReplay)
+            {
+                IndexShadersByHash(db);
+                ReplayPass();
+            }
+            else
+            {
+                DummyDrawPass(db);
+            }
             WaitUntilIdle();
 
             ReleaseResources();
@@ -1132,11 +1446,66 @@ class ShaderPrecompiler
     // draw after the game's own loadscreen render and let the GAME present, our
     // pixels reach the screen. They never appeared. Before rebuilding the stepper
     // on that assumption, test it directly rather than reasoning about it: clear
-    // the CURRENT render target to magenta every Nth loadscreen frame and present
-    // nothing ourselves. If the loading screen flashes, the assumption holds and
-    // the stepper's bug is in its work loop; if it never flashes, the loading
-    // screen is composited somewhere we are not drawing and the overlay needs a
-    // different target. Either answer kills a whole branch of guesswork.
+    // the CURRENT render target to magenta every Nth loadscreen frame.
+    //
+    // The first version of this asked a human to watch for the flash, which is a
+    // bad instrument — it needs someone looking at the right moment, and a "no"
+    // is indistinguishable from "wasn't paying attention". So the probe now reads
+    // the answer back itself: after clearing, it grabs the FRONT buffer (what the
+    // display is actually scanning out, via GetFrontBufferData) on the following
+    // few frames and reports whether magenta ever reached the screen. Back buffer
+    // vs front buffer matters here: sampling the back buffer would only prove our
+    // Clear landed, not that anything presented it.
+    static inline IDirect3DSurface9* frontCopy = nullptr;
+    static inline UINT frontW = 0, frontH = 0;
+    static inline int  flashWatch = 0;      // frames left to look for magenta
+    static inline bool flashAnswered = false;
+
+    static bool FrontBufferIsMagenta(IDirect3DDevice9* d)
+    {
+        if (!frontCopy)
+        {
+            // GetFrontBufferData always wants a SYSTEMMEM A8R8G8B8 surface the size
+            // of the DISPLAY MODE, not the back buffer.
+            D3DDISPLAYMODE dm{};
+            if (FAILED(d->GetDisplayMode(0, &dm)) || !dm.Width) return false;
+            frontW = dm.Width; frontH = dm.Height;
+            if (FAILED(d->CreateOffscreenPlainSurface(frontW, frontH, D3DFMT_A8R8G8B8,
+                                                      D3DPOOL_SYSTEMMEM, &frontCopy, nullptr)))
+            {
+                frontCopy = nullptr;
+                Log("probe: could not create a %ux%u readback surface", frontW, frontH);
+                return false;
+            }
+        }
+
+        if (FAILED(d->GetFrontBufferData(0, frontCopy))) return false;
+
+        D3DLOCKED_RECT lr{};
+        if (FAILED(frontCopy->LockRect(&lr, nullptr, D3DLOCK_READONLY))) return false;
+
+        // Sample a coarse grid rather than one pixel: the window may be letterboxed
+        // or composited somewhere other than the origin.
+        int magenta = 0, sampled = 0;
+        for (UINT y = frontH / 8; y < frontH; y += frontH / 8)
+        {
+            auto row = (const uint8_t*)lr.pBits + (size_t)y * lr.Pitch;
+            for (UINT x = frontW / 8; x < frontW; x += frontW / 8)
+            {
+                auto px = (const uint32_t*)(row + (size_t)x * 4);
+                uint32_t b = (*px) & 0xFF, g = (*px >> 8) & 0xFF, r = (*px >> 16) & 0xFF;
+                if (r > 200 && b > 200 && g < 60) magenta++;
+                sampled++;
+            }
+        }
+        frontCopy->UnlockRect();
+
+        if (magenta > 0)
+            Log("probe: FRONT BUFFER IS MAGENTA (%d of %d sampled pixels) - our draws DO reach the screen",
+                magenta, sampled);
+        return magenta > 0;
+    }
+
     static void FlashProbe()
     {
         static int  calls = 0;
@@ -1182,8 +1551,30 @@ class ShaderPrecompiler
             }
         }
 
-        if ((calls++ % cfg.flashProbe) == 0)
+        // Look for the previous flash before issuing a new one, so a magenta hit is
+        // unambiguously from a clear the game had a chance to present.
+        if (flashWatch > 0 && !flashAnswered)
+        {
+            flashWatch--;
+            if (FrontBufferIsMagenta(d))
+            {
+                flashAnswered = true;
+                Log("probe: VERDICT - the loadscreen presents what we draw into RT0; "
+                    "the reverted stepper's bug is in its work loop, not its target");
+            }
+            else if (flashWatch == 0)
+            {
+                Log("probe: no magenta in the front buffer after %d frames - "
+                    "RT0 is the back buffer but nothing presents it during the loadscreen",
+                    cfg.flashProbe);
+            }
+        }
+
+        if ((calls++ % cfg.flashProbe) == 0 && !flashAnswered)
+        {
             d->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_XRGB(255, 0, 255), 1.0f, 0);
+            flashWatch = cfg.flashProbe - 1;   // watch every frame until the next flash
+        }
     }
 
     // ---- injection anchor: FUN_005cc760 (render-thread loadscreen render) -----
@@ -1216,6 +1607,7 @@ class ShaderPrecompiler
         cfg.coverSdr     = ini.ReadInteger("SHADERS", "PrecompileCoverSdr", 0) != 0;
         cfg.coverPresent = ini.ReadInteger("SHADERS", "PrecompileCoverPresentModes", 1) != 0;
         cfg.flashProbe   = ini.ReadInteger("SHADERS", "PrecompileFlashProbe", 0);
+        cfg.replay       = ini.ReadInteger("SHADERS", "PrecompileReplayCapturedKeys", 1) != 0;
     }
 
 public:
