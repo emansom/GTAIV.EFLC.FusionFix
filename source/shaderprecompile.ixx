@@ -96,7 +96,15 @@ struct PrecompileConfig
     bool    coverPresent  = true;   // PrecompileCoverPresentModes: cover both PQ(10-bit) and scRGB(fp16) present formats
     int     flashProbe    = 0;      // PrecompileFlashProbe: see the probe note below (0 = off, N = flash every Nth loadscreen frame)
     bool    replay        = true;   // PrecompileReplayCapturedKeys: replay FusionFix.pipelinekeys.bin when present
-    bool    adaptiveExit  = true;   // PrecompileAdaptiveExit: stop if the driver is not actually compiling
+    // OFF by default: the heuristic behind it is invalid. It times the Draw calls,
+    // but DXVK does not block a draw on pipeline compilation -- it enqueues the work
+    // and the cost lands later, in the drain. Measured with GPL explicitly DISABLED,
+    // so compilation was definitely happening, draws still averaged 0.070 ms and the
+    // exit fired, stopping after 128 of 1863 pipelines. A false positive here
+    // silently disables the feature for exactly the users who need it. Needs a
+    // signal that reflects compilation rather than submission before it can be
+    // trusted; the code is kept for when one exists.
+    bool    adaptiveExit  = false;  // PrecompileAdaptiveExit
     // No time cap by default: the whole point is to finish the job. A pipeline left
     // unwarmed is a stutter during gameplay, which is far worse than a longer load.
     // Set a positive value only if you specifically want loading bounded.
@@ -2045,7 +2053,7 @@ class ShaderPrecompiler
         cfg.coverPresent = ini.ReadInteger("SHADERS", "PrecompileCoverPresentModes", 1) != 0;
         cfg.flashProbe   = ini.ReadInteger("SHADERS", "PrecompileFlashProbe", 0);
         cfg.replay       = ini.ReadInteger("SHADERS", "PrecompileReplayCapturedKeys", 1) != 0;
-        cfg.adaptiveExit = ini.ReadInteger("SHADERS", "PrecompileAdaptiveExit", 1) != 0;
+        cfg.adaptiveExit = ini.ReadInteger("SHADERS", "PrecompileAdaptiveExit", 0) != 0;
         cfg.budgetSeconds = ini.ReadInteger("SHADERS", "PrecompileBudgetSeconds", 0);
     }
 
