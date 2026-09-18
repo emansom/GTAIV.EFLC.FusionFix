@@ -1317,13 +1317,18 @@ class ShaderPrecompiler
     // The cache bundle for THIS graphics configuration, matching what the capture
     // writes. Keys carry render-target formats, so replaying another setup's bundle
     // would warm pipelines this one never uses and miss the ones it needs.
-    static std::string KeyFilePath()
+    static std::string ModuleDir()
     {
         char path[MAX_PATH] = {};
         GetModuleFileNameA(hSelf, path, MAX_PATH);
         std::string s(path);
         auto slash = s.find_last_of("\\/");
-        std::string dir = (slash == std::string::npos) ? std::string() : s.substr(0, slash + 1);
+        return (slash == std::string::npos) ? std::string() : s.substr(0, slash + 1);
+    }
+
+    static std::string KeyFilePath()
+    {
+        std::string dir = ModuleDir();
 
         uint32_t w = bbW, h = bbH, fmt = (uint32_t)bbFmt;
         if (dev)
@@ -1490,6 +1495,69 @@ class ShaderPrecompiler
             vsByHash.size(), psByHash.size(), fromDb, vsByHash.size() + psByHash.size() - fromDb);
     }
 
+    // Shader objects we created ourselves from captured bytecode. Held for the
+    // process lifetime like the .fxc handles: releasing them would let DXVK drop the
+    // shader module, and with it the pipelines this pass exists to build.
+    static inline std::vector<IDirect3DVertexShader9*> sidecarVS;
+    static inline std::vector<IDirect3DPixelShader9*>  sidecarPS;
+
+    // Last resort for a hash neither the .fxc database nor the runtime registry can
+    // resolve. That is not an edge case: FusionFix's own effect shaders are compiled
+    // when their effect first runs, i.e. never before this pass, so 202 of 2034
+    // pipelines had no handle to bind and were skipped. The capture keeps their
+    // bytecode; create the shader from it and the key becomes replayable. Identical
+    // bytes resolve to the same DXVK shader module, so this warms the pipeline the
+    // game will actually use, not a lookalike.
+    static void IndexShadersFromSidecar(const std::string& dir)
+    {
+        pipelinekeys::ShaderBlobMap blobs;
+        std::string path = dir + pipelinekeys::ShaderSidecarName();
+        if (!pipelinekeys::ReadShaderSidecar(path, blobs))
+        {
+            Log("replay: no shader bytecode sidecar at %s", path.c_str());
+            return;
+        }
+
+        uint32_t madeVS = 0, madePS = 0, failed = 0;
+        for (auto& [hash, blob] : blobs)
+        {
+            const DWORD* fn = reinterpret_cast<const DWORD*>(blob.code.data());
+            if (blob.stage == pipelinekeys::kStageVS)
+            {
+                if (vsByHash.count(hash)) continue;
+                IDirect3DVertexShader9* sh = nullptr;
+                if (FAILED(dev->CreateVertexShader(fn, &sh)) || !sh) { failed++; continue; }
+                sidecarVS.push_back(sh);
+                vsByHash.emplace(hash, sh);
+                madeVS++;
+            }
+            else
+            {
+                if (psByHash.count(hash)) continue;
+                IDirect3DPixelShader9* sh = nullptr;
+                if (FAILED(dev->CreatePixelShader(fn, &sh)) || !sh) { failed++; continue; }
+                sidecarPS.push_back(sh);
+                psByHash.emplace(hash, sh);
+                madePS++;
+
+                // Same reason as the registry path: without the declared-sampler mask
+                // the key keeps all 16 slots and expands into pipelines that do not
+                // exist.
+                if (psSamplerUse.find(hash) == psSamplerUse.end())
+                {
+                    ShaderIO io{};
+                    ParseShaderIO(blob.code.data(), (uint32_t)blob.code.size(), false, io);
+                    std::array<bool, 16> use{};
+                    for (int s = 0; s < 16; s++) use[s] = io.usesSampler[s];
+                    psSamplerUse.emplace(hash, use);
+                }
+            }
+        }
+
+        Log("replay: created %u VS + %u PS from the bytecode sidecar (%zu stored, %u failed)",
+            madeVS, madePS, blobs.size(), failed);
+    }
+
     static UINT DeclTypeSize(BYTE type)
     {
         switch (type)
@@ -1605,6 +1673,11 @@ class ShaderPrecompiler
 
         uint32_t drawn = 0, skippedShader = 0, skippedDecl = 0, skippedRT = 0, skippedDup = 0;
 
+        // Which shaders we could not resolve, and how many keys each cost. A bare
+        // "202 no-shader" says nothing about whether that is one ubiquitous shader or
+        // two hundred rare ones, and the answer decides whether it is worth chasing.
+        std::unordered_map<uint64_t, uint32_t> missingVS, missingPS;
+
         // Bind the dummy geometry once; only the declaration changes per key.
         dev->SetIndices(dummyIB);
 
@@ -1682,8 +1755,8 @@ class ShaderPrecompiler
             // with the wrong one, which would warm a pipeline nothing will use.
             IDirect3DVertexShader9* vs = nullptr;
             IDirect3DPixelShader9*  ps = nullptr;
-            if (k.vsHash) { auto it = vsByHash.find(k.vsHash); if (it == vsByHash.end()) { skippedShader++; workDone += kPassW; continue; } vs = it->second; }
-            if (k.psHash) { auto it = psByHash.find(k.psHash); if (it == psByHash.end()) { skippedShader++; workDone += kPassW; continue; } ps = it->second; }
+            if (k.vsHash) { auto it = vsByHash.find(k.vsHash); if (it == vsByHash.end()) { missingVS[k.vsHash]++; skippedShader++; workDone += kPassW; continue; } vs = it->second; }
+            if (k.psHash) { auto it = psByHash.find(k.psHash); if (it == psByHash.end()) { missingPS[k.psHash]++; skippedShader++; workDone += kPassW; continue; } ps = it->second; }
 
             // Vertex layout.
             UINT stride[4] = { 0, 0, 0, 0 };
@@ -1836,6 +1909,22 @@ class ShaderPrecompiler
         Log("replay: drew %u of %zu pipelines in %llds%s (skipped %u duplicate-state, %u no-shader, %u no-decl, %u no-RT)",
             drawn, drawList.size(), (long long)(elapsedMs() / 1000), exitedEarly ? " [stopped early]" : "",
             skippedDup, skippedShader, skippedDecl, skippedRT);
+
+        if (!missingVS.empty() || !missingPS.empty())
+        {
+            auto worst = [](const std::unordered_map<uint64_t, uint32_t>& m, char tag)
+            {
+                std::vector<std::pair<uint64_t, uint32_t>> v(m.begin(), m.end());
+                std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+                for (size_t i = 0; i < v.size() && i < 5; i++)
+                    Log("replay:   unresolved %cS %016llx costs %u keys",
+                        tag, (unsigned long long)v[i].first, v[i].second);
+            };
+            Log("replay: %zu distinct VS and %zu distinct PS could not be resolved",
+                missingVS.size(), missingPS.size());
+            worst(missingVS, 'V');
+            worst(missingPS, 'P');
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1991,6 +2080,7 @@ class ShaderPrecompiler
             if (useReplay)
             {
                 IndexShadersByHash(db);
+                IndexShadersFromSidecar(ModuleDir());
                 ReplayPass();
             }
             else

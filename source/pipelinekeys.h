@@ -258,6 +258,99 @@ namespace pipelinekeys
         return n;
     }
 
+    // ---- shader bytecode sidecar --------------------------------------------
+    //
+    // A recorded key names its shaders by bytecode hash, so replay has to turn that
+    // hash back into a D3D9 shader object. It had two sources, and neither is
+    // complete:
+    //
+    //   * RAGE's .fxc database — every shader the game ships, created by the
+    //     precompiler itself. Misses anything FusionFix compiles.
+    //   * the runtime Registry above — whatever the process happened to have created
+    //     by the time the pass runs. On the last capture that was TWO shaders.
+    //
+    // The gap is not a hooking-order problem and cannot be fixed by hooking earlier:
+    // FusionFix builds SMAA, FXAA, sun shafts, gamma and LOD-light shaders when each
+    // effect first runs, which is long after the loading screen the pass runs on. The
+    // shader genuinely does not exist yet. 202 of 2034 pipelines were skipped for
+    // want of a handle.
+    //
+    // So the capture stores the bytecode as well, and replay creates the missing
+    // shaders from it. That is sound because DXVK keys its shader modules on a hash
+    // of the bytecode: a second object built from identical bytes resolves to the
+    // same module and therefore warms the same pipeline. The .fxc path already
+    // demonstrates this end to end — the precompiler's own 1734 shader objects warm
+    // pipelines that the game's separate objects then reuse, which is the entire
+    // reason replay measured as a win.
+    //
+    // Bytecode does not vary with the graphics configuration, so unlike the keys this
+    // is ONE file shared by every bundle.
+    constexpr uint32_t kShaderMagic   = 0x53504646;   // 'FFPS'
+    constexpr uint32_t kShaderVersion = 1;
+
+    enum ShaderStage : uint32_t { kStageVS = 0, kStagePS = 1 };
+
+#pragma pack(push, 1)
+    struct ShaderFileHeader { uint32_t magic; uint32_t version; uint32_t count; };
+    struct ShaderBlobHeader { uint64_t hash; uint32_t stage; uint32_t size; };
+#pragma pack(pop)
+
+    struct ShaderBlob { uint32_t stage; std::vector<uint8_t> code; };
+    using ShaderBlobMap = std::unordered_map<uint64_t, ShaderBlob>;
+
+    inline const char* ShaderSidecarName() { return "FusionFix.pipelineshaders.bin"; }
+
+    // Merges into `out`; an entry already present wins, so a caller can load several
+    // files (or load over what it captured) without losing anything.
+    inline bool ReadShaderSidecar(const std::string& path, ShaderBlobMap& out)
+    {
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) return false;
+
+        ShaderFileHeader hdr{};
+        if (fread(&hdr, sizeof(hdr), 1, f) != 1 ||
+            hdr.magic != kShaderMagic || hdr.version != kShaderVersion)
+        {
+            fclose(f);
+            return false;
+        }
+
+        for (uint32_t i = 0; i < hdr.count; i++)
+        {
+            ShaderBlobHeader bh{};
+            if (fread(&bh, sizeof(bh), 1, f) != 1) break;    // short file: keep what is whole
+            // A shader token stream is DWORDs and far smaller than this; the bound
+            // only exists so a corrupt length cannot ask for a gigabyte.
+            if (bh.size == 0 || bh.size > (1u << 20) || (bh.size & 3u)) break;
+
+            std::vector<uint8_t> code(bh.size);
+            if (fread(code.data(), 1, bh.size, f) != bh.size) break;
+            if (bh.stage != kStageVS && bh.stage != kStagePS) continue;
+
+            out.emplace(bh.hash, ShaderBlob{ bh.stage, std::move(code) });
+        }
+        fclose(f);
+        return true;
+    }
+
+    inline bool WriteShaderSidecar(const std::string& path, const ShaderBlobMap& in)
+    {
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) return false;
+
+        ShaderFileHeader hdr{ kShaderMagic, kShaderVersion, (uint32_t)in.size() };
+        fwrite(&hdr, sizeof(hdr), 1, f);
+
+        for (auto& [hash, blob] : in)
+        {
+            ShaderBlobHeader bh{ hash, blob.stage, (uint32_t)blob.code.size() };
+            fwrite(&bh, sizeof(bh), 1, f);
+            fwrite(blob.code.data(), 1, blob.code.size(), f);
+        }
+        fclose(f);
+        return true;
+    }
+
     // Hash a shader the same way the capture does: from the bytes GetFunction
     // returns, never from the caller's pointer, so the two can never disagree.
     template <typename T>

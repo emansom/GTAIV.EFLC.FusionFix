@@ -41,8 +41,11 @@ module;
 //   synthetic draws land in the cache as if the game had issued them.
 //
 // OUTPUT (next to the .asi)
-//   FusionFix.pipelinekeys.bin  versioned binary, for the replay pass
-//   FusionFix.pipelinekeys.txt  human-readable summary + histograms
+//   FusionFix.pipelinekeys.<config>.bin  versioned binary, for the replay pass
+//   FusionFix.pipelinekeys.<config>.txt  human-readable summary + histograms
+//   FusionFix.pipelineshaders.bin        bytecode of every shader the keys name,
+//                                        so replay can create the ones that do not
+//                                        exist yet when it runs (see pipelinekeys.h)
 // ===========================================================================
 
 #include <common.hxx>
@@ -117,6 +120,13 @@ class ShaderCapture
     // previous shader's hash (sizes would have to match too).
     static inline std::unordered_map<uint64_t, uint64_t> shaderHashCache;
 
+    // Bytecode of every shader we have seen, by the same hash the keys carry, so
+    // replay can create the ones it cannot find any other way. Shared by every
+    // bundle: bytecode does not vary with the graphics configuration.
+    static inline pipelinekeys::ShaderBlobMap shaderBlobs;
+    static inline bool blobsDirty = false;
+    static inline size_t blobsMergedIn = 0;
+
     static inline uint32_t mergedIn = 0;     // keys inherited from a previous session
     static inline uint64_t totalDraws = 0;
     static inline uint64_t frameOrdinal = 0;
@@ -161,7 +171,7 @@ class ShaderCapture
     // frame. GetFunction/GetDeclaration with a null buffer only returns the size,
     // which is a trivial read on both native D3D9 and DXVK.
     template <typename T>
-    static uint64_t ShaderHash(T* shader)
+    static uint64_t ShaderHash(T* shader, uint32_t stage)
     {
         if (!shader) return 0;
 
@@ -177,6 +187,17 @@ class ShaderCapture
 
         uint64_t h = fnv1a(code.data(), size);
         shaderHashCache.emplace(cacheKey, h);
+
+        // Keep the bytes. Replay resolves a hash to a shader object, and the two
+        // sources it had (the .fxc database, the runtime registry) between them miss
+        // every shader FusionFix compiles lazily -- those keys were skipped outright.
+        // See the sidecar notes in pipelinekeys.h. This is the only place we hold the
+        // bytecode, so it costs one move on FIRST sight of a shader and nothing after.
+        if (shaderBlobs.find(h) == shaderBlobs.end())
+        {
+            shaderBlobs.emplace(h, pipelinekeys::ShaderBlob{ stage, std::move(code) });
+            blobsDirty = true;
+        }
         return h;
     }
 
@@ -252,8 +273,8 @@ class ShaderCapture
 
         IDirect3DVertexShader9* vs = nullptr;
         IDirect3DPixelShader9*  ps = nullptr;
-        if (SUCCEEDED(dev->GetVertexShader(&vs)) && vs) { k.vsHash = ShaderHash(vs); vs->Release(); }
-        if (SUCCEEDED(dev->GetPixelShader(&ps)) && ps)  { k.psHash = ShaderHash(ps); ps->Release(); }
+        if (SUCCEEDED(dev->GetVertexShader(&vs)) && vs) { k.vsHash = ShaderHash(vs, pipelinekeys::kStageVS); vs->Release(); }
+        if (SUCCEEDED(dev->GetPixelShader(&ps)) && ps)  { k.psHash = ShaderHash(ps, pipelinekeys::kStagePS); ps->Release(); }
 
         IDirect3DVertexDeclaration9* decl = nullptr;
         if (SUCCEEDED(dev->GetVertexDeclaration(&decl)) && decl)
@@ -433,6 +454,7 @@ class ShaderCapture
 
         // Inherit previous sessions' coverage before recording anything new.
         LoadExisting();
+        LoadShaderBlobs();
 
         auto vtbl = *reinterpret_cast<void***>(d);
         bool ok = true;
@@ -526,6 +548,39 @@ class ShaderCapture
         fclose(f);
     }
 
+    // ---- shader bytecode sidecar ---------------------------------------
+    // Only shaders that actually appear in a DRAW are stored. A shader nobody draws
+    // with has no key referencing it, so its bytecode would be dead weight -- which
+    // matters here because the precompiler creates RAGE's whole 1734-shader database
+    // through this same device, and capture is normally left on while it does.
+    static std::string ShaderSidecarPath() { return OutPath(pipelinekeys::ShaderSidecarName()); }
+
+    static void LoadShaderBlobs()
+    {
+        pipelinekeys::ShaderBlobMap existing;
+        if (!pipelinekeys::ReadShaderSidecar(ShaderSidecarPath(), existing))
+        {
+            Log("no shader bytecode sidecar yet - starting a new one");
+            return;
+        }
+        blobsMergedIn = existing.size();
+        for (auto& [h, b] : existing) shaderBlobs.emplace(h, std::move(b));
+        Log("merged %zu shaders from the existing bytecode sidecar", blobsMergedIn);
+    }
+
+    static void WriteShaderBlobs()
+    {
+        if (!blobsDirty) return;
+
+        size_t bytes = 0;
+        for (auto& [h, b] : shaderBlobs) bytes += b.code.size();
+        if (!pipelinekeys::WriteShaderSidecar(ShaderSidecarPath(), shaderBlobs)) return;
+
+        blobsDirty = false;
+        Log("wrote %zu shaders (%zu KiB of bytecode) to %s",
+            shaderBlobs.size(), bytes / 1024, pipelinekeys::ShaderSidecarName());
+    }
+
     // Count distinct keys under a reduced field set, so we can tell genuine
     // pipeline variation apart from dynamic state that inflates the strict key.
     static uint32_t CountReducedKeys()
@@ -576,6 +631,15 @@ class ShaderCapture
             fprintf(f, "distinct VS         : %u\n", uniq(vss));
             fprintf(f, "distinct PS         : %u\n", uniq(pss));
             fprintf(f, "distinct VS/PS pairs: %u\n", uniq(pairs));
+        }
+
+        // Replay can only build a key whose shaders it can resolve, so say how many
+        // of them we are carrying the bytecode for.
+        {
+            size_t bytes = 0;
+            for (auto& [h, b] : shaderBlobs) bytes += b.code.size();
+            fprintf(f, "shader bytecode kept : %zu shaders, %zu KiB (%s)\n",
+                    shaderBlobs.size(), bytes / 1024, pipelinekeys::ShaderSidecarName());
         }
 
         // render-target format combinations
@@ -753,6 +817,7 @@ class ShaderCapture
         if (lockReady) EnterCriticalSection(&lock);
         WriteBinary();
         WriteSummary();
+        WriteShaderBlobs();
         if (lockReady) LeaveCriticalSection(&lock);
 
         tLastFlush = now;
