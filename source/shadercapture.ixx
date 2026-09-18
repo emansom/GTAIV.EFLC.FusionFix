@@ -509,8 +509,8 @@ class ShaderCapture
         CIniReader ini("");
         int msaa = ini.ReadInteger("EXPERIMENTAL", "ReflectionMSAAQuality", 0);
 
-        bundleBin = pipelinekeys::BundleName(w, h, fmt, msaa, "bin");
-        bundleTxt = pipelinekeys::BundleName(w, h, fmt, msaa, "txt");
+        bundleBin = pipelinekeys::BundleName(fmt, msaa, "bin");
+        bundleTxt = pipelinekeys::BundleName(fmt, msaa, "txt");
         bundleFmt  = fmt;
         bundleMsaa = msaa;
         // Log the back buffer this was derived from. It is NOT reliably the resolution
@@ -716,42 +716,22 @@ class ShaderCapture
     // and GTA IV is far too large for that to be most of the pipeline space. With
     // it, the file grows monotonically across sessions (and, later, across
     // contributors: merging two players' caches is the same operation).
-    // Load this configuration's bundle AND every predecessor of it, merging them all.
+    // Load this configuration's bundle.
     //
-    // This used to pick one predecessor by name, computed from the back-buffer size at
-    // the first EndScene -- and that size is not reliably the resolution the session
-    // runs at. Observed live: the window persisted at 1280x720 from a previous run, so
-    // the game came up 720p and only later reset to 1080p; adoption looked for
-    // "720p-f21-ms0.bin", missed the real 13647-key "1080p-..." capture entirely, and
-    // silently fell through to a smaller pre-bundle file. Nothing announced the loss.
-    //
-    // Since resolution provably does not affect the keys (see BundleName), there is no
-    // reason to choose at all: merge every per-resolution predecessor for this format
-    // and MSAA level. More coverage, and no dependence on a transient size.
+    // This used to merge a list of predecessor names too (per-resolution buckets and a
+    // pre-bundle file) so that no accumulated capture was orphaned by a rename. That
+    // mattered while the on-disk name kept changing under us; it does not now. The
+    // feature has never shipped, so there is no user cache in the wild to rescue, and
+    // every extra candidate is another file whose counts get merged in AGAIN on every
+    // run -- which is exactly how this file's draw counts reached 41.5e9 against
+    // 5,073,509 draws actually recorded. One bundle per (format, MSAA), nothing else.
     static void LoadExisting()
     {
-        const char* kResClasses[] = { "4k", "1440p", "1080p", "720p", "low" };
-
-        std::vector<std::string> candidates;
-        candidates.push_back(bundleBin);
-        for (const char* cls : kResClasses)
-        {
-            char buf[128];
-            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "FusionFix.pipelinekeys.%s-f%u-ms%d.bin",
-                        cls, bundleFmt, bundleMsaa);
-            candidates.push_back(buf);
-        }
-        candidates.push_back(pipelinekeys::LegacyBundleName("bin"));
-
-        uint32_t loadedFiles = 0;
-        for (auto& leaf : candidates)
-            if (MergeBundleFile(OutDir() + leaf, leaf.c_str())) loadedFiles++;
-
-        if (loadedFiles == 0)
-            Log("no existing cache for this configuration - starting a new one");
+        if (MergeBundleFile(OutDir() + bundleBin, bundleBin.c_str()))
+            Log("merged %u keys from the existing cache (%zu unique, %zu declarations)",
+                mergedIn, records.size(), declTable.size());
         else
-            Log("merged %u keys from %u cache file(s) (%zu unique, %zu declarations)",
-                mergedIn, loadedFiles, records.size(), declTable.size());
+            Log("no existing cache for this configuration - starting a new one");
     }
 
     // Merge one bundle file. Returns false if it is absent or unusable, so the caller
@@ -771,19 +751,16 @@ class ShaderCapture
             fread(&numSamplers, 4, 1, f) != 1 || fread(&declCount, 4, 1, f) != 1 ||
             fread(&recCount, 4, 1, f) != 1) { fclose(f); return false; }
 
-        // A cache recorded against a different state set cannot be merged field for
-        // field. Keep it rather than silently corrupting it: bail and start fresh.
-        // A v1 cache CAN be merged -- it predates the multisample fields, and every
-        // v1 capture was taken with MSAA off, so it migrates by filling in NONE.
-        if ((version != pipelinekeys::kVersion && version != pipelinekeys::kVersionV1) ||
-            numRS != kNumRS || numSamplers != kNumSamplers)
+        // A cache recorded against a different version or state set cannot be merged
+        // field for field. Keep it rather than silently corrupting it: bail and start
+        // fresh. There is deliberately no migration path (see kVersion).
+        if (version != pipelinekeys::kVersion || numRS != kNumRS || numSamplers != kNumSamplers)
         {
             Log("%s is v%u tracking %u states / %u samplers (this build: v%u, %u / %u) - not merging",
                 label, version, numRS, numSamplers, pipelinekeys::kVersion, kNumRS, kNumSamplers);
             fclose(f);
             return false;
         }
-        const bool isV1 = (version == pipelinekeys::kVersionV1);
 
         std::vector<uint32_t> rsTypes(numRS);
         if (fread(rsTypes.data(), 4, numRS, f) != numRS) { fclose(f); return false; }
@@ -817,16 +794,8 @@ class ShaderCapture
         for (uint32_t i = 0; i < recCount; i++)
         {
             KeyRecord k{};
-            if (isV1)
-            {
-                pipelinekeys::KeyRecordV1 v1{};
-                if (fread(&v1, sizeof(v1), 1, f) != 1) break;
-                pipelinekeys::MigrateV1(v1, k);
-            }
-            else if (fread(&k, sizeof(k), 1, f) != 1)
-            {
+            if (fread(&k, sizeof(k), 1, f) != 1)
                 break;   // short file: keep what is whole
-            }
             if (k.declIndex != 0xFFFFFFFFu)
             {
                 if (k.declIndex >= declCount) continue;
@@ -836,7 +805,14 @@ class ShaderCapture
             uint64_t h = fnv1a(&k, offsetof(KeyRecord, count));
             auto it = keyIndex.find(h);
             if (it != keyIndex.end())
-                records[it->second].count += k.count;     // same key across sessions
+                // Only reachable if a single file holds the same key twice, or if a
+                // second cache is ever merged in deliberately (two players pooling
+                // coverage), where summing is what you want. It must NOT be reachable
+                // from re-merging files that share history: `count` drives the
+                // warm-most-used-first ordering, and re-adding an already-accumulated
+                // file compounds it -- that is how this cache reached 41.5e9 counted
+                // draws against 5,073,509 actually recorded.
+                records[it->second].count += k.count;
             else
             {
                 keyIndex.emplace(h, (uint32_t)records.size());

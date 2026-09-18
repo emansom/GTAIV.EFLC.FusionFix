@@ -21,14 +21,13 @@ namespace pipelinekeys
 {
     constexpr uint32_t kMagic   = 0x4B504646;   // 'FFPK'
 
-    // v1 -> v2 added the render targets' multisample type/quality. Vulkan bakes the
-    // sample count into the pipeline, so a capture taken with ReflectionMSAAQuality
-    // set would otherwise replay as non-multisampled pipelines that gameplay never
-    // asks for -- the same wrong-key failure this whole design exists to avoid.
-    // v1 files are still readable: they were all recorded with MSAA off, so they
-    // migrate by filling in D3DMULTISAMPLE_NONE.
-    constexpr uint32_t kVersion   = 2;
-    constexpr uint32_t kVersionV1 = 1;
+    // The on-disk format carries a version purely so a stale or foreign file is
+    // REJECTED rather than misread -- there is deliberately no migration path. This
+    // feature is not upstream yet, so no user has a cache worth preserving, and
+    // carrying readers for formats nobody has costs more than re-capturing does.
+    // Bump this on any layout change; add migration only once upstream ships a
+    // release whose caches must survive.
+    constexpr uint32_t kVersion = 2;
 
     constexpr uint32_t kMaxRT       = 4;
     constexpr uint32_t kPSSamplers  = 16;       // s0..s15
@@ -132,39 +131,6 @@ namespace pipelinekeys
         uint32_t firstFrame;                // frame ordinal of first sighting
     };
 
-    // The v1 record, kept solely so existing caches can be migrated rather than
-    // discarded -- they represent real play time that cannot be recovered cheaply.
-    struct KeyRecordV1
-    {
-        uint64_t vsHash;
-        uint64_t psHash;
-        uint32_t declIndex;
-        uint32_t fvf;
-        uint32_t primType;
-        uint32_t upDraw;
-        uint32_t rtFmt[kMaxRT];
-        uint32_t dsFmt;
-        uint32_t rs[kNumRS];
-        uint8_t  samplerType[kNumSamplers];
-        uint32_t count;
-        uint32_t firstFrame;
-    };
-
-    inline void MigrateV1(const KeyRecordV1& in, KeyRecord& out)
-    {
-        out = KeyRecord{};
-        out.vsHash = in.vsHash;   out.psHash = in.psHash;
-        out.declIndex = in.declIndex; out.fvf = in.fvf;
-        out.primType = in.primType;   out.upDraw = in.upDraw;
-        for (uint32_t i = 0; i < kMaxRT; i++) out.rtFmt[i] = in.rtFmt[i];
-        out.dsFmt = in.dsFmt;
-        out.msType = 0;      // D3DMULTISAMPLE_NONE - true for every v1 capture
-        out.msQuality = 0;
-        for (uint32_t i = 0; i < kNumRS; i++) out.rs[i] = in.rs[i];
-        for (uint32_t i = 0; i < kNumSamplers; i++) out.samplerType[i] = in.samplerType[i];
-        out.count = in.count; out.firstFrame = in.firstFrame;
-    }
-
     // File header, immediately followed by:
     //   uint32_t rsTypes[numRS]
     //   declCount x { uint32_t n; D3DVERTEXELEMENT9 elems[n] }
@@ -208,35 +174,12 @@ namespace pipelinekeys
     // resolution therefore fragmented the cache for nothing: it split one cache into
     // near-identical copies, reset a user's coverage whenever they changed
     // resolution, and would have forced us to ship a separate baseline per bucket.
-    inline std::string BundleName(uint32_t width, uint32_t height, uint32_t bbFormat,
-                                  int msaa, const char* ext)
+    inline std::string BundleName(uint32_t bbFormat, int msaa, const char* ext)
     {
         char buf[128];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE, "FusionFix.pipelinekeys.f%u-ms%d.%s",
                     bbFormat, msaa, ext);
-        (void)width; (void)height;
         return std::string(buf);
-    }
-
-    // The previous per-resolution name. Still read, so nobody's accumulated capture
-    // is orphaned by the rename; the merged result is written under the new name.
-    inline std::string ResolutionBundleName(uint32_t width, uint32_t height, uint32_t bbFormat,
-                                            int msaa, const char* ext)
-    {
-        char buf[128];
-        const char* cls = (height >= 2000) ? "4k" : (height >= 1300) ? "1440p"
-                        : (height >= 1000) ? "1080p" : (height >= 700) ? "720p" : "low";
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "FusionFix.pipelinekeys.%s-f%u-ms%d.%s",
-                    cls, bbFormat, msaa, ext);
-        (void)width;
-        return std::string(buf);
-    }
-
-    // The pre-bundle file name, kept so an existing cache is not orphaned.
-    inline const char* LegacyBundleName(const char* ext)
-    {
-        return (ext && ext[0] == 'b') ? "FusionFix.pipelinekeys.bin"
-                                      : "FusionFix.pipelinekeys.txt";
     }
 
     inline uint64_t Fnv1a(const void* data, size_t len, uint64_t h = 1469598103934665603ull)

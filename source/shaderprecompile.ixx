@@ -1352,16 +1352,8 @@ class ShaderPrecompiler
         CIniReader ini("");
         int msaa = ini.ReadInteger("EXPERIMENTAL", "ReflectionMSAAQuality", 0);
 
-        std::string bundle = dir + pipelinekeys::BundleName(w, h, fmt, msaa, "bin");
-        if (FILE* f = fopen(bundle.c_str(), "rb")) { fclose(f); return bundle; }
-
-        // The per-resolution name, from before resolution was measured not to affect
-        // render-target formats. Still read so an existing cache keeps working.
-        std::string byRes = dir + pipelinekeys::ResolutionBundleName(w, h, fmt, msaa, "bin");
-        if (FILE* f = fopen(byRes.c_str(), "rb")) { fclose(f); return byRes; }
-
-        // Fall back to the pre-bundle name so an existing cache still works.
-        return dir + pipelinekeys::LegacyBundleName("bin");
+        (void)w; (void)h;   // resolution provably does not affect the keys, see BundleName
+        return dir + pipelinekeys::BundleName(fmt, msaa, "bin");
     }
 
     // A shipped baseline, so the very first launch on a machine that has never
@@ -1413,15 +1405,13 @@ class ShaderPrecompiler
         FileHeader h{};
         if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); return false; }
         if (h.magic != kMagic) { Log("replay: bad magic 0x%08X", h.magic); fclose(f); return false; }
-        // v1 predates the multisample fields; every v1 capture was taken with MSAA
-        // off, so it migrates rather than being thrown away.
-        if (h.version != kVersion && h.version != kVersionV1)
+        // No migration path by design (see kVersion): reject rather than misread.
+        if (h.version != kVersion)
         {
-            Log("replay: file is v%u, this build reads v%u and v%u", h.version, kVersion, kVersionV1);
+            Log("replay: file is v%u, this build reads v%u", h.version, kVersion);
             fclose(f);
             return false;
         }
-        const bool isV1 = (h.version == kVersionV1);
         // A file written by a build tracking a different state set cannot be
         // replayed field-for-field, and guessing would be worse than not trying.
         if (h.numRS != kNumRS || h.numSamplers != kNumSamplers)
@@ -1468,16 +1458,8 @@ class ShaderPrecompiler
         for (uint32_t i = 0; i < h.recCount; i++)
         {
             KeyRecord k{};
-            if (isV1)
-            {
-                KeyRecordV1 v1{};
-                if (fread(&v1, sizeof(v1), 1, f) != 1) break;
-                MigrateV1(v1, k);
-            }
-            else if (fread(&k, sizeof(k), 1, f) != 1)
-            {
+            if (fread(&k, sizeof(k), 1, f) != 1)
                 break;
-            }
             got++;
 
             if (k.declIndex != kDeclNone)
