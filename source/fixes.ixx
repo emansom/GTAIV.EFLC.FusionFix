@@ -1103,16 +1103,43 @@ public:
                 // that: empty() only asks whether a pattern matched *anywhere*, and
                 // get_first() -> count(1) is assert_err_policy, a no-op under NDEBUG. So
                 // require a unique match, and try the long unambiguous form first.
-                auto specific = hook::pattern("6A ? 56 53 55 E8 ? ? ? ? 69 FF");
+                //
+                // MEASURED on 1.2.0.59 by scanning the LIVE image over hook::pattern's own
+                // range (module base .. end of the last executable section):
+                //   "6A ? 53 55 56"                    -> 2 matches: 0x439655 and 0x942ac0
+                //   "6A ? 53 55 56 E8 ? ? ? ? 69 FF"   -> 1 match:   0x942ac0  (the real site)
+                // Only ONE of those exists on disk; Ghidra finds a single match, because
+                // 0x439655 lies in a SecuROM-encrypted region that is decrypted in memory. So
+                // the ambiguity is invisible to static inspection -- which is why this needed a
+                // bisect to find. 0x439655 is not even an instruction boundary: it is the tail
+                // of the absolute operand in `mov ecx,[0x7b6a5630]` (8B 0D 30 56 6A 7B) followed
+                // by push ebx/ebp/esi. Patching it rewrites the operand to [0x6A535630], which
+                // is exactly the recorded fault: "read 6A535630 at PC 0x439651".
+                //
+                // The two long forms differ only in which register the callee pushes (esi vs
+                // ebx); 1.2.0.59 is the ebx one. Its 5-byte prefix is the ambiguous pattern, so
+                // it MUST be tried before the generic fallback or the fix silently does nothing.
+                auto specificEsi = hook::pattern("6A ? 56 53 55 E8 ? ? ? ? 69 FF");
+                auto specificEbx = hook::pattern("6A ? 53 55 56 E8 ? ? ? ? 69 FF");
                 auto generic = hook::pattern("6A ? 53 55 56");
 
-                if (specific.size() == 1)
+                if (specificEsi.size() == 1)
                 {
-                    uint8_t* ptr = (uint8_t*)specific.get_first(0);
+                    uint8_t* ptr = (uint8_t*)specificEsi.get_first(0);
 
                     injector::scoped_unprotect protect{ ptr, 3 };
 
                     ptr[0] = 0x56; // Push day register
+                    ptr[1] = 0x6A;
+                    ptr[2] = 0xFF;
+                }
+                else if (specificEbx.size() == 1)
+                {
+                    uint8_t* ptr = (uint8_t*)specificEbx.get_first(0);
+
+                    injector::scoped_unprotect protect{ ptr, 3 };
+
+                    ptr[0] = 0x53; // Push day register
                     ptr[1] = 0x6A;
                     ptr[2] = 0xFF;
                 }
