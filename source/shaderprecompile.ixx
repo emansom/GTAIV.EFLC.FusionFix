@@ -699,11 +699,8 @@ class ShaderPrecompiler
         dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
     }
 
-    // Draw a progress frame (throttled). When doPresent is false the frame is drawn
-    // onto the current back buffer and left there for the GAME to present, which is
-    // what the incremental stepper wants: our own Present() from inside a blocking
-    // loadscreen call never reached the compositor (the bar appeared stuck).
-    static void PresentOverlay(bool force, bool doPresent = true)
+    // Present a progress frame (throttled). frac in [0,1].
+    static void PresentOverlay(bool force)
     {
         // Always pump — keeps the window alive even on throttled (skipped) frames.
         PumpMessages();
@@ -780,7 +777,7 @@ class ShaderPrecompiler
             if (!warnedScene) { warnedScene = true; Log("overlay BeginScene failed — progress bar cannot update"); }
         }
 
-        if (doPresent) dev->Present(nullptr, nullptr, nullptr, nullptr);
+        dev->Present(nullptr, nullptr, nullptr, nullptr);
 
         if (prevRT) { dev->SetRenderTarget(0, prevRT); prevRT->Release(); }
         dev->SetDepthStencilSurface(prevDS);
@@ -810,7 +807,7 @@ class ShaderPrecompiler
 
             workDone++;
             if ((i & 15) == 0) curLabel = "shader " + std::to_string(i + 1) + " / " + std::to_string(n);
-            PumpMessages();        // overlay is drawn once per slice by RunSlice
+            PresentOverlay(false); // pumps every iter; presents on the ~33ms throttle
         }
         Log("created %u shaders", n);
     }
@@ -818,17 +815,12 @@ class ShaderPrecompiler
     // -------------------------------------------------------------------
     //  Dummy-draw pass (W3b) — walk real passes, reproduce DXVK pipeline keys.
     // -------------------------------------------------------------------
-    // Resumable section (A): walk the real (vs,ps) passes. Returns true when the walk
-    // is complete; otherwise stores its cursor and returns false so the caller can hand
-    // the frame back to the game.
-    static bool StepPasses(const std::chrono::steady_clock::time_point& tSlice)
+    static void DummyDrawPass(fxc_db* db)
     {
-        if (cfg.breadth <= 0) return true;
-        fxc_db* db = stepDb;
-        if (!db) return true;
+        if (cfg.breadth <= 0) return;
 
-        // Re-applied every slice: the game renders between slices, so these dynamic
-        // (non-baked) defaults cannot be assumed to have survived.
+        // Fixed opaque, filled, front-facing defaults for the non-baked (dynamic)
+        // states; the baked axes are set per draw below.
         dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
         dev->SetRenderState(D3DRS_ZENABLE, TRUE);
         dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
@@ -845,24 +837,16 @@ class ShaderPrecompiler
         // ---- (A) per-pass shader/spec coverage into the dominant scene format.
         // Iterating real (vs,ps) passes builds each shader set's base pipeline +
         // stage spec variants with the correct sampler-type bindings.
-        // Resume where the previous slice stopped. Local copies, because the cursor
-        // globals are rewritten the moment we run out of budget.
-        const uint32_t e0 = stepEff, t0 = stepTech, p0 = stepPass;
         uint32_t nEff = fxc_effect_count(db);
-        for (uint32_t e = e0; e < nEff; e++)
+        for (uint32_t e = 0; e < nEff; e++)
         {
             const fxc_effect* ef = fxc_get_effect(db, e);
             if (!ef) continue;
-            for (uint32_t t = (e == e0 ? t0 : 0); t < ef->technique_count; t++)
+            for (uint32_t t = 0; t < ef->technique_count; t++)
             {
                 const fxc_technique& tech = ef->techniques[t];
-                for (uint32_t p = (e == e0 && t == t0 ? p0 : 0); p < tech.pass_count; p++)
+                for (uint32_t p = 0; p < tech.pass_count; p++)
                 {
-                    if (SliceBudgetExpired(tSlice))
-                    {
-                        stepEff = e; stepTech = t; stepPass = p;
-                        return false;       // resume here next loading-screen frame
-                    }
                     const fxc_pass& pass = tech.passes[p];
                     if (pass.vs_unique == FXC_NO_SHADER || pass.vs_unique >= vsHandles.size()) { workDone += kPassW; continue; }
                     IDirect3DVertexShader9* vs = vsHandles[pass.vs_unique];
@@ -896,30 +880,13 @@ class ShaderPrecompiler
                     SAFE_RELEASE(decl);
                     workDone += kPassW;
                     if (ef->name) curLabel = ef->name;
-                    // Pump only. The overlay is drawn once per slice by RunSlice and
-                    // presented by the GAME; presenting from inside this loop is what
-                    // used to leave the window unresponsive with a stale bar.
-                    PumpMessages();
+                    // Present every pass: pumps messages, advances the bar smoothly,
+                    // and (on native D3D9) periodically flushes so the driver actually
+                    // compiles the batched draws' ISA instead of deferring it all.
+                    PresentOverlay(false);
                 }
             }
         }
-        return true;    // whole walk complete
-    }
-
-    // Section (B): state-library + present-format coverage. Small and bounded
-    // (kTupleCount + 2 draws), so it runs as one final slice rather than resumably.
-    static void TupleAndPresentWarm()
-    {
-        if (cfg.breadth <= 0) return;
-
-        dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-        dev->SetRenderState(D3DRS_ZENABLE, TRUE);
-        dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
-        dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
-        dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
-        RECT scB{ 0, 0, 1, 1 }; dev->SetScissorRect(&scB);
-
-        const BlendConfig* bOpaque = FindBlend("BL00");
 
         // ---- (B) state-library warm: cover every observed (format,blend,topo)
         // tuple so the non-scene fragment-output libraries (G-buffer MRT, shadow
@@ -946,7 +913,7 @@ class ShaderPrecompiler
                 if (BindFormatSet(f)) { ApplyBlend(b); IssueDraw(tp.topo, stride); }
                 workDone += kPassW;
                 curLabel = "state coverage";
-                PumpMessages();
+                PresentOverlay(false);
             }
             // Present-format coverage (scope decision 3): both HDR output modes.
             if (cfg.coverPresent)
@@ -965,6 +932,7 @@ class ShaderPrecompiler
             }
             SAFE_RELEASE(decl);
         }
+        PresentOverlay(true);
     }
 
     // -------------------------------------------------------------------
@@ -979,14 +947,13 @@ class ShaderPrecompiler
             for (int spin = 0; spin < 200000; spin++)
             {
                 if (q->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_OK) break;
-                PumpMessages();
+                PresentOverlay(false);
             }
             q->Release();
         }
-        // Settle: give the DXVK worker queue (background GPL "optimized" upgrades
-        // under the default Auto) a moment to drain before gameplay. We no longer
-        // present our own frames here — the game owns Present now — so just pump.
-        for (int i = 0; i < 6; i++) { PumpMessages(); }
+        // Settle: a few extra presents so the DXVK worker queue (background GPL
+        // "optimized" upgrades under the default Auto) drains before gameplay.
+        for (int i = 0; i < 6; i++) { PresentOverlay(true); }
     }
 
     static void ReleaseResources()
@@ -1027,157 +994,100 @@ class ShaderPrecompiler
         return base.string();
     }
 
-    // ---- incremental stepper -------------------------------------------------
-    //
-    // The pass used to do all ~115s of work inside ONE loadscreen-render call. That
-    // blocks the game's render thread outright: the window stops being serviced, and
-    // the progress frames we presented ourselves never reached the compositor, so the
-    // bar appeared frozen (observed live: "jumps from 0% to 100%"). Users reasonably
-    // read that as a hang.
-    //
-    // Instead, do a small slice of work per loading-screen frame and RETURN, letting
-    // the game finish and present its own frame with our overlay drawn on top. The
-    // device is shared with the game between slices, so every slice snapshots and
-    // restores full device state.
-    enum class Phase : int { Idle, Passes, Finish, Done };
-    static inline Phase phase = Phase::Idle;
-    static inline fxc_db* stepDb = nullptr;
-    static inline uint32_t stepEff = 0, stepTech = 0, stepPass = 0;
-    static constexpr int kSliceMs = 20;     // work budget per loading-screen frame
-
-    // Per-slice device-state guard. Non-copyable; restores on scope exit.
-    struct SliceState
-    {
-        IDirect3DStateBlock9* sb = nullptr;
-        IDirect3DSurface9 *rt0 = nullptr, *rt1 = nullptr, *rt2 = nullptr, *rt3 = nullptr, *ds = nullptr;
-        D3DVIEWPORT9 vp{};
-        bool ok = false;
-
-        bool Begin()
-        {
-            if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) || !sb)
-            {
-                Log("CreateStateBlock failed — aborting precompile rather than corrupt device state");
-                return false;
-            }
-            dev->GetRenderTarget(0, &rt0);
-            dev->GetRenderTarget(1, &rt1);
-            dev->GetRenderTarget(2, &rt2);
-            dev->GetRenderTarget(3, &rt3);
-            dev->GetDepthStencilSurface(&ds);
-            dev->GetViewport(&vp);
-            ok = true;
-            return true;
-        }
-
-        ~SliceState()
-        {
-            if (!ok) { if (sb) sb->Release(); return; }
-            dev->SetRenderTarget(0, rt0);
-            dev->SetRenderTarget(1, rt1);
-            dev->SetRenderTarget(2, rt2);
-            dev->SetRenderTarget(3, rt3);
-            dev->SetDepthStencilSurface(ds);
-            dev->SetViewport(&vp);
-            SAFE_RELEASE(rt0); SAFE_RELEASE(rt1); SAFE_RELEASE(rt2); SAFE_RELEASE(rt3);
-            SAFE_RELEASE(ds);
-            if (sb) { sb->Apply(); sb->Release(); }
-        }
-    };
-
-    static bool SliceBudgetExpired(const std::chrono::steady_clock::time_point& t0)
-    {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-                   std::chrono::steady_clock::now() - t0).count() >= kSliceMs;
-    }
-
-    // One-time setup: device, shader DB, resources, and the (fast) shader creates.
-    static bool StepInit()
+    static void RunBlocking()
     {
         tStart = std::chrono::steady_clock::now();
         tLastPresent = tStart - std::chrono::milliseconds(1000);
 
         dev = AcquireDevice();
-        if (!dev) { Log("no device — aborting precompile"); return false; }
+        if (!dev) { Log("no device — aborting precompile"); return; }
         dev->AddRef();
         DetectBackend();
         Log("backend = %s, device = %p", backend == Backend::DXVK ? "DXVK" : "native", (void*)dev);
 
-        // A slice must not run inside the game's BeginScene (CreateStateBlock is
-        // illegal there). Probe once and record it; the detour calls us after the
-        // game's own loadscreen render, so we expect to be outside a scene.
+        // We are armed on the loading-screen render, so the game is very likely already
+        // inside a BeginScene/EndScene pair. D3D9 forbids CreateStateBlock there (it
+        // returns D3DERR_INVALIDCALL) and BeginScene fails too, which previously meant:
+        //   - sb stayed null, Apply() was skipped, and NOTHING we changed was restored
+        //     -> the game resumed with our render states/textures/constants live
+        //        (black sky, depth/occlusion mismatches), and
+        //   - the overlay's BeginScene failed, so the progress bar froze after one frame.
+        // Detect the enclosing scene by probing BeginScene, leave it for the duration,
+        // and re-enter it before handing control back.
         HRESULT hrProbe = dev->BeginScene();
-        if (SUCCEEDED(hrProbe)) dev->EndScene();
-        else Log("note: loadscreen hook runs INSIDE the game's scene");
+        bool insideGameScene = FAILED(hrProbe);   // INVALIDCALL => the game owns a scene
+        dev->EndScene();                          // ends ours, or leaves the game's
+        if (insideGameScene) Log("entered inside the game's scene — suspended it for the pass");
+
+        // Snapshot ALL device state so the game resumes byte-identical afterwards.
+        IDirect3DStateBlock9* sb = nullptr;
+        HRESULT hrSB = dev->CreateStateBlock(D3DSBT_ALL, &sb);
+        if (FAILED(hrSB) || !sb)
+        {
+            // Without this we cannot put the device back the way we found it. Abort
+            // rather than corrupt the frame -- a missing precompile is a perf issue,
+            // a corrupted device is a visual bug.
+            Log("CreateStateBlock failed (hr=0x%08lX) — aborting precompile to avoid corrupting device state", (unsigned long)hrSB);
+            if (insideGameScene) dev->BeginScene();
+            dev->Release(); dev = nullptr;
+            return;
+        }
+        IDirect3DSurface9* saveRT = nullptr; IDirect3DSurface9* saveDS = nullptr;
+        IDirect3DSurface9* saveRT1 = nullptr; IDirect3DSurface9* saveRT2 = nullptr; IDirect3DSurface9* saveRT3 = nullptr;
+        dev->GetRenderTarget(0, &saveRT);
+        dev->GetRenderTarget(1, &saveRT1);
+        dev->GetRenderTarget(2, &saveRT2);
+        dev->GetRenderTarget(3, &saveRT3);
+        dev->GetDepthStencilSurface(&saveDS);
+        D3DVIEWPORT9 saveVP{}; dev->GetViewport(&saveVP);
 
         CreateOverlay();
+        PresentOverlay(true);
 
-        stepDb = fxc_load_all(ResolveShaderDir().c_str());
-        if (!stepDb) { Log("fxc_load_all failed: %s", fxc_last_error()); return false; }
+        fxc_db* db = fxc_load_all(ResolveShaderDir().c_str());
+        if (!db) { Log("fxc_load_all failed: %s", fxc_last_error()); }
+        else
+        {
+            fxc_stats st{}; fxc_get_stats(db, &st);
+            Log("parsed %u effects, %u unique shaders, %u passes (errors %u)",
+                st.effect_count, st.unique_total, st.pass_count, st.parse_errors);
 
-        fxc_stats st{}; fxc_get_stats(stepDb, &st);
-        Log("parsed %u effects, %u unique shaders, %u passes (errors %u)",
-            st.effect_count, st.unique_total, st.pass_count, st.parse_errors);
+            // Exact work units so the bar tracks real progress and reaches 100%:
+            //   creates (unique shaders) + one unit per pass + tuple warms
+            //   + present-format warms. Must match every workDone++ site below.
+            uint32_t passUnits = (cfg.breadth > 0) ? st.pass_count : 0;
+            uint32_t tupleUnits = (cfg.breadth > 0) ? (uint32_t)kTupleCount + (cfg.coverPresent ? 2u : 0u) : 0;
+            workTotal = st.unique_total * kCreateW + (passUnits + tupleUnits) * kPassW;
+            if (workTotal == 0) workTotal = 1;
+            workDone = 0;
 
-        // Exact work units so the bar tracks real progress and reaches 100%.
-        uint32_t passUnits  = (cfg.breadth > 0) ? st.pass_count : 0;
-        uint32_t tupleUnits = (cfg.breadth > 0) ? (uint32_t)kTupleCount + (cfg.coverPresent ? 2u : 0u) : 0;
-        workTotal = st.unique_total * kCreateW + (passUnits + tupleUnits) * kPassW;
-        if (workTotal == 0) workTotal = 1;
-        workDone = 0;
+            CreateResources();
+            CreateAllShaders(db);
+            DummyDrawPass(db);
+            WaitUntilIdle();
 
-        CreateResources();
-        CreateAllShaders(stepDb);       // fast (<1s measured); fine within one slice
-        stepEff = stepTech = stepPass = 0;
-        return true;
-    }
+            ReleaseResources();
+            fxc_free(db);
+        }
 
-    // Final slice: state-library + present-format coverage, then drain the GPU.
-    static void StepFinish()
-    {
-        TupleAndPresentWarm();
-        WaitUntilIdle();
-        ReleaseResources();
-        if (stepDb) { fxc_free(stepDb); stepDb = nullptr; }
+        // Restore device state fully.
+        dev->SetRenderTarget(0, saveRT);
+        dev->SetRenderTarget(1, saveRT1);
+        dev->SetRenderTarget(2, saveRT2);
+        dev->SetRenderTarget(3, saveRT3);
+        dev->SetDepthStencilSurface(saveDS);
+        dev->SetViewport(&saveVP);
+        SAFE_RELEASE(saveRT); SAFE_RELEASE(saveRT1); SAFE_RELEASE(saveRT2); SAFE_RELEASE(saveRT3);
+        SAFE_RELEASE(saveDS);
+        if (sb) { sb->Apply(); sb->Release(); }
 
-        auto secs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - tStart).count() / 1000.0;
+        // Re-enter the scene we suspended, so the game's own EndScene still pairs up.
+        if (insideGameScene) dev->BeginScene();
+
+        auto secs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tStart).count() / 1000.0;
         Log("precompile complete in %.1fs", secs);
-        if (dev) { dev->Release(); dev = nullptr; }
-    }
-
-    // Called once per loading-screen frame, AFTER the game has drawn its loading
-    // screen. Does a bounded amount of work, leaves the overlay on the back buffer
-    // for the game to present, and returns so the frame can complete.
-    static void RunSlice()
-    {
-        auto t0 = std::chrono::steady_clock::now();
-
-        if (phase == Phase::Idle)
-        {
-            if (!StepInit()) { phase = Phase::Done; finished = true; return; }
-            phase = Phase::Passes;
-        }
-
-        {
-            SliceState guard;               // snapshot + restore around this slice
-            if (!guard.Begin()) { phase = Phase::Done; finished = true; return; }
-
-            if (phase == Phase::Passes && StepPasses(t0))
-                phase = Phase::Finish;
-            else if (phase == Phase::Finish)
-                phase = Phase::Done;
-
-            // Draw the bar onto the back buffer WITHOUT presenting — the game's own
-            // Present carries it, which is what keeps the window live.
-            PresentOverlay(true, /*doPresent=*/false);
-        }   // guard restores device state here
-
-        if (phase == Phase::Done && !finished.load())
-        {
-            StepFinish();
-            finished = true;
-        }
+        dev->Release();
+        dev = nullptr;
     }
 
     // Readiness gate (fixes the "ran before windowed-borderless / half-ready" bug).
@@ -1219,30 +1129,19 @@ class ShaderPrecompiler
     // ---- injection anchor: FUN_005cc760 (render-thread loadscreen render) -----
     static void __cdecl LoadscreenRenderDetour()
     {
-        // Let the game draw its loading screen FIRST, then put our overlay on top of
-        // the finished frame and let the game present it. The old order (work first,
-        // game's render second) meant the game painted over our overlay, which is why
-        // the pass had to present its own frames — and those never reached the
-        // compositor while we held the render thread.
-        shLoadscreenRender.call<void>();
-
-        if (finished.load()) return;
-
-        if (phase == Phase::Idle)
+        if (!finished.load() && !started.load())
         {
             loadscreenFramesSeen++;
-            if (!GateReady()) return;
-            Log("gate: starting after %d loadscreen frames at %ux%u", loadscreenFramesSeen, gateW, gateH);
-            started = true;
+            if (GateReady())
+            {
+                started = true;   // guard against any re-entry
+                __try { RunBlocking(); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { Log("precompile faulted - continuing to game"); }
+                finished = true;
+                Log("gate: ran after %d loadscreen frames at %ux%u", loadscreenFramesSeen, gateW, gateH);
+            }
         }
-
-        __try { RunSlice(); }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            Log("precompile faulted - continuing to game");
-            phase = Phase::Done;
-            finished = true;
-        }
+        shLoadscreenRender.call<void>();
     }
 
     static void ReadConfig()
