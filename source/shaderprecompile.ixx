@@ -109,6 +109,7 @@ struct PrecompileConfig
     // unwarmed is a stutter during gameplay, which is far worse than a longer load.
     // Set a positive value only if you specifically want loading bounded.
     int     budgetSeconds = 0;      // PrecompileBudgetSeconds: 0 = run until everything is warm
+    int     fenceChunk    = 1;      // PrecompileFenceChunk: pipelines per fence; 1 = smoothest bar
 };
 
 // ===========================================================================
@@ -390,6 +391,9 @@ class ShaderPrecompiler
     static inline std::chrono::steady_clock::time_point tStart;
     static inline std::chrono::steady_clock::time_point tLastPresent;
     static inline uint32_t overlayFrames = 0;   // overlay frames actually presented
+    static inline uint32_t overlayGapMin = 0xFFFFFFFFu, overlayGapMax = 0;
+    static inline uint64_t overlayGapSum = 0;
+    static inline uint32_t overlayGapCount = 0;
 
     // -------------------------------------------------------------------
     static void Log(const char* fmt, ...)
@@ -839,6 +843,30 @@ class ShaderPrecompiler
         dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
     }
 
+    // Minimum gap between overlay frames, derived from the display's refresh rate.
+    //
+    // This used to be a hard-coded 33 ms, capping the progress bar at 30 fps on any
+    // monitor and making it visibly choppy next to the rest of the game. Presenting
+    // at the refresh rate is what makes it look like a loading screen rather than a
+    // stuttering one; there is nothing else competing for the thread while we wait
+    // on a fence, so the frames are essentially free.
+    static inline int overlayIntervalMs = 16;   // sane default until the mode is read
+
+    static void ResolveOverlayInterval()
+    {
+        int hz = 60;
+        if (dev)
+        {
+            D3DDISPLAYMODE dm{};
+            if (SUCCEEDED(dev->GetDisplayMode(0, &dm)) && dm.RefreshRate >= 24 && dm.RefreshRate <= 480)
+                hz = (int)dm.RefreshRate;
+        }
+        overlayIntervalMs = 1000 / hz;
+        if (overlayIntervalMs < 4) overlayIntervalMs = 4;    // cap at 250 fps
+        if (overlayIntervalMs > 33) overlayIntervalMs = 33;  // never slower than 30
+        Log("overlay refresh: %d Hz -> one frame per %d ms", hz, overlayIntervalMs);
+    }
+
     // Present a progress frame (throttled). frac in [0,1].
     static void PresentOverlay(bool force)
     {
@@ -846,8 +874,19 @@ class ShaderPrecompiler
         PumpMessages();
 
         auto now = std::chrono::steady_clock::now();
-        if (!force && std::chrono::duration_cast<std::chrono::milliseconds>(now - tLastPresent).count() < 33)
+        auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(now - tLastPresent).count();
+        if (!force && gap < overlayIntervalMs)
             return;
+        // Track the cadence. A bar that "flashes in and out" is usually not dropped
+        // frames -- BeginScene and Present both reported success every frame -- but
+        // an uneven interval, which the eye reads as flicker. Numbers beat adjectives.
+        if (overlayFrames > 0 && gap < 100000)
+        {
+            if (gap > overlayGapMax) overlayGapMax = (uint32_t)gap;
+            if (gap < overlayGapMin) overlayGapMin = (uint32_t)gap;
+            overlayGapSum += (uint64_t)gap;
+            overlayGapCount++;
+        }
         tLastPresent = now;
 
         IDirect3DSurface9* bb = nullptr;
@@ -1442,9 +1481,16 @@ class ShaderPrecompiler
     {
         if (!q) return;
         q->Issue(D3DISSUE_END);
+        // Flush ONCE to get the work moving, then poll without it. D3DGETDATA_FLUSH
+        // on every poll re-flushes the command stream thousands of times per chunk,
+        // which competes with the compilation we are waiting for and shows up as a
+        // 25 ms average overlay frame gap against a 5 ms target.
+        bool flushed = false;
         for (int spin = 0; spin < 200000; spin++)
         {
-            if (q->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_OK) break;
+            DWORD flags = flushed ? 0 : D3DGETDATA_FLUSH;
+            flushed = true;
+            if (q->GetData(nullptr, 0, flags) == S_OK) break;
             PresentOverlay(false);
         }
     }
@@ -1509,9 +1555,16 @@ class ShaderPrecompiler
         const double kFastLinkMs = 1.0;  // below this, nothing is being compiled
         bool exitedEarly = false;
 
-        // Chunked fencing: small enough that the bar moves often, large enough that
-        // the GPU is not serialised on a round trip per pipeline.
-        const uint32_t kFenceChunk = 32;
+        // Fence after EVERY pipeline by default.
+        //
+        // DXVK queues Present onto the same CS thread that compiles pipelines, so an
+        // overlay frame cannot overtake queued compile work: with chunks of 8 the
+        // frame gap averaged 25 ms against a 5 ms target and spiked to 305 ms, which
+        // is the bar visibly stalling. One pipeline per fence gives the overlay a
+        // slot between every compile, which is the smoothest this can be without a
+        // second thread -- and loading time is explicitly not the constraint here,
+        // an unwarmed pipeline is.
+        const uint32_t kFenceChunk = (cfg.fenceChunk > 0) ? (uint32_t)cfg.fenceChunk : 1;
         uint32_t sinceFence = 0;
         IDirect3DQuery9* fence = nullptr;
         dev->CreateQuery(D3DQUERYTYPE_EVENT, &fence);
@@ -1746,6 +1799,7 @@ class ShaderPrecompiler
         dev->AddRef();
         DetectBackend();
         Log("backend = %s, device = %p", backend == Backend::DXVK ? "DXVK" : "native", (void*)dev);
+        ResolveOverlayInterval();
 
         // We are armed on the loading-screen render, so the game is very likely already
         // inside a BeginScene/EndScene pair. D3D9 forbids CreateStateBlock there (it
@@ -1865,8 +1919,12 @@ class ShaderPrecompiler
         if (insideGameScene) dev->BeginScene();
 
         auto secs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tStart).count() / 1000.0;
-        Log("precompile complete in %.1fs (%u overlay frames presented, %.1f/s)",
-            secs, overlayFrames, secs > 0.0 ? overlayFrames / secs : 0.0);
+        Log("precompile complete in %.1fs (%u overlay frames, %.1f/s; frame gap min %u ms, "
+            "avg %llu ms, max %u ms, target %d ms)",
+            secs, overlayFrames, secs > 0.0 ? overlayFrames / secs : 0.0,
+            overlayGapMin == 0xFFFFFFFFu ? 0u : overlayGapMin,
+            (unsigned long long)(overlayGapCount ? overlayGapSum / overlayGapCount : 0),
+            overlayGapMax, overlayIntervalMs);
         dev->Release();
         dev = nullptr;
     }
@@ -2096,6 +2154,7 @@ class ShaderPrecompiler
         cfg.replay       = ini.ReadInteger("SHADERS", "PrecompileReplayCapturedKeys", 1) != 0;
         cfg.adaptiveExit = ini.ReadInteger("SHADERS", "PrecompileAdaptiveExit", 0) != 0;
         cfg.budgetSeconds = ini.ReadInteger("SHADERS", "PrecompileBudgetSeconds", 0);
+        cfg.fenceChunk    = ini.ReadInteger("SHADERS", "PrecompileFenceChunk", 1);
     }
 
 public:
