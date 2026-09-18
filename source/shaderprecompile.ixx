@@ -1684,6 +1684,97 @@ class ShaderPrecompiler
             madeVS, madePS, blobs.size(), failed);
     }
 
+    // ---- FusionFix's OWN embedded shaders ------------------------------------
+    //
+    // FusionFix ships compiled shaders as RT_RCDATA resources and hands the raw
+    // resource bytes straight to CreatePixelShader/CreateVertexShader, so the
+    // resource IS the bytecode the capture hashes. Reading them here makes every one
+    // of them resolvable without depending on a capture session having happened to
+    // enable the effect that uses it.
+    //
+    // A static audit of the .asi against the sidecar found 12 of 18 covered and SIX
+    // missing: FXAA's pixel shader, the dithered console-gamma blit, the blit pair
+    // and the snow pair. Each is gated behind a graphics setting, so whether they got
+    // captured was down to which settings the capturing machine happened to run.
+    //
+    // This matters most for what it makes DETERMINISTIC. SMAA and FXAA are normally
+    // compiled at runtime from HLSL resources (loadCompiledShader is only the
+    // fallback), and runtime-compiled bytecode depends on the machine's d3dcompiler,
+    // so its hash is not portable -- a shipped baseline can never reliably name those
+    // shaders for someone else. The EMBEDDED ones are byte-identical everywhere, so
+    // resolving them from resources works for every user by construction.
+    //
+    // NB this makes shaders resolvable; it does not by itself create pipelines. A key
+    // naming one still has to come from a capture. What it removes is the failure
+    // where such a key arrives and cannot be replayed.
+    static inline std::vector<IDirect3DVertexShader9*> ownResVSObjs;
+    static inline std::vector<IDirect3DPixelShader9*>  ownResPSObjs;
+    static inline uint32_t ownResVS = 0, ownResPS = 0, ownResKnown = 0, ownResFailed = 0;
+
+    static BOOL CALLBACK OnOwnRcData(HMODULE mod, LPCWSTR type, LPWSTR name, LONG_PTR)
+    {
+        HRSRC hRes = FindResourceW(mod, name, type);
+        if (!hRes) return TRUE;
+        DWORD size = SizeofResource(mod, hRes);
+        HGLOBAL hGlob = LoadResource(mod, hRes);
+        if (!hGlob || size < 8 || (size & 3u)) return TRUE;
+        const void* data = LockResource(hGlob);
+        if (!data) return TRUE;
+
+        // A D3D9 token stream opens with a version token: 0xFFFF in the high word for
+        // a pixel shader, 0xFFFE for a vertex shader. Everything else in RCDATA
+        // (lookup textures, blue noise, data blobs) fails this and is skipped.
+        const uint32_t ver = *reinterpret_cast<const uint32_t*>(data);
+        const uint32_t hi = ver >> 16;
+        const bool isPS = (hi == 0xFFFFu);
+        const bool isVS = (hi == 0xFFFEu);
+        if (!isPS && !isVS) return TRUE;
+
+        const uint64_t h = pipelinekeys::Fnv1a(data, size);
+        const DWORD* fn = reinterpret_cast<const DWORD*>(data);
+
+        if (isVS)
+        {
+            if (vsByHash.count(h)) { ownResKnown++; return TRUE; }
+            IDirect3DVertexShader9* sh = nullptr;
+            if (FAILED(dev->CreateVertexShader(fn, &sh)) || !sh) { ownResFailed++; return TRUE; }
+            ownResVSObjs.push_back(sh);
+            vsByHash.emplace(h, sh);
+            ownResVS++;
+        }
+        else
+        {
+            if (psByHash.count(h)) { ownResKnown++; return TRUE; }
+            IDirect3DPixelShader9* sh = nullptr;
+            if (FAILED(dev->CreatePixelShader(fn, &sh)) || !sh) { ownResFailed++; return TRUE; }
+            ownResPSObjs.push_back(sh);
+            psByHash.emplace(h, sh);
+            ownResPS++;
+
+            if (psSamplerUse.find(h) == psSamplerUse.end())
+            {
+                ShaderIO io{};
+                ParseShaderIO(reinterpret_cast<const uint8_t*>(data), (uint32_t)size, false, io);
+                std::array<bool, 16> use{};
+                for (int s = 0; s < 16; s++) use[s] = io.usesSampler[s];
+                psSamplerUse.emplace(h, use);
+            }
+        }
+        return TRUE;
+    }
+
+    static void IndexShadersFromOwnResources()
+    {
+        if (!hSelf) { Log("replay: no module handle, skipping our own shader resources"); return; }
+
+        ownResVS = ownResPS = ownResKnown = ownResFailed = 0;
+        EnumResourceNamesW(hSelf, RT_RCDATA, &OnOwnRcData, 0);
+
+        Log("replay: created %u VS + %u PS from FusionFix's own resources "
+            "(%u already resolvable, %u failed)",
+            ownResVS, ownResPS, ownResKnown, ownResFailed);
+    }
+
     static UINT DeclTypeSize(BYTE type)
     {
         switch (type)
@@ -2209,6 +2300,7 @@ class ShaderPrecompiler
             {
                 IndexShadersByHash(db);
                 IndexShadersFromSidecar(ModuleDir());
+                IndexShadersFromOwnResources();
                 ReplayPass();
             }
             else
