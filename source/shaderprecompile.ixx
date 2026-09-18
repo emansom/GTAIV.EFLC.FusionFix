@@ -59,6 +59,7 @@ module;
 #include <system_error>
 #include <unordered_map>
 #include <unordered_set>
+#include <array>
 #include "fxc_parse.h"
 #include "dxvk_d3d9_interfaces.h"
 #include "pipelinekeys.h"
@@ -95,6 +96,11 @@ struct PrecompileConfig
     bool    coverPresent  = true;   // PrecompileCoverPresentModes: cover both PQ(10-bit) and scRGB(fp16) present formats
     int     flashProbe    = 0;      // PrecompileFlashProbe: see the probe note below (0 = off, N = flash every Nth loadscreen frame)
     bool    replay        = true;   // PrecompileReplayCapturedKeys: replay FusionFix.pipelinekeys.bin when present
+    bool    adaptiveExit  = true;   // PrecompileAdaptiveExit: stop if the driver is not actually compiling
+    // No time cap by default: the whole point is to finish the job. A pipeline left
+    // unwarmed is a stutter during gameplay, which is far worse than a longer load.
+    // Set a positive value only if you specifically want loading bounded.
+    int     budgetSeconds = 0;      // PrecompileBudgetSeconds: 0 = run until everything is warm
 };
 
 // ===========================================================================
@@ -375,6 +381,7 @@ class ShaderPrecompiler
     static inline std::string curLabel;
     static inline std::chrono::steady_clock::time_point tStart;
     static inline std::chrono::steady_clock::time_point tLastPresent;
+    static inline uint32_t overlayFrames = 0;   // overlay frames actually presented
 
     // -------------------------------------------------------------------
     static void Log(const char* fmt, ...)
@@ -402,6 +409,126 @@ class ShaderPrecompiler
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+
+    // ---- state-neutrality verification --------------------------------
+    // Pointers here are compared for IDENTITY only and never dereferenced, so the
+    // references taken by the Get* calls are dropped immediately.
+    struct StateSnapshot
+    {
+        DWORD rs[pipelinekeys::kNumRS]{};
+        void* tex[pipelinekeys::kNumSamplers]{};
+        void* vs{}; void* ps{}; void* decl{}; void* ib{};
+        DWORD fvf{};
+        struct { void* vb; UINT offset, stride; } stream[4]{};
+        void* rt[4]{}; void* ds{};
+        D3DVIEWPORT9 vp{};
+        RECT scissor{};
+        bool valid{};
+    };
+
+    template <typename T> static void* GrabPtr(T* p) { if (p) p->Release(); return (void*)p; }
+
+    static void CaptureSnapshot(StateSnapshot& s)
+    {
+        if (!dev) return;
+        for (uint32_t i = 0; i < pipelinekeys::kNumRS; i++)
+            dev->GetRenderState(pipelinekeys::kTrackedRS[i].rs, &s.rs[i]);
+
+        for (uint32_t i = 0; i < pipelinekeys::kPSSamplers; i++)
+        {
+            IDirect3DBaseTexture9* t = nullptr;
+            dev->GetTexture(i, &t);
+            s.tex[i] = GrabPtr(t);
+        }
+        for (uint32_t i = 0; i < pipelinekeys::kVSSamplers; i++)
+        {
+            IDirect3DBaseTexture9* t = nullptr;
+            dev->GetTexture(D3DVERTEXTEXTURESAMPLER0 + i, &t);
+            s.tex[pipelinekeys::kPSSamplers + i] = GrabPtr(t);
+        }
+
+        IDirect3DVertexShader9* vs = nullptr;      dev->GetVertexShader(&vs);        s.vs = GrabPtr(vs);
+        IDirect3DPixelShader9* ps = nullptr;       dev->GetPixelShader(&ps);         s.ps = GrabPtr(ps);
+        IDirect3DVertexDeclaration9* de = nullptr; dev->GetVertexDeclaration(&de);   s.decl = GrabPtr(de);
+        IDirect3DIndexBuffer9* ib = nullptr;       dev->GetIndices(&ib);             s.ib = GrabPtr(ib);
+        dev->GetFVF(&s.fvf);
+
+        for (UINT i = 0; i < 4; i++)
+        {
+            IDirect3DVertexBuffer9* vb = nullptr;
+            dev->GetStreamSource(i, &vb, &s.stream[i].offset, &s.stream[i].stride);
+            s.stream[i].vb = GrabPtr(vb);
+        }
+        for (UINT i = 0; i < 4; i++)
+        {
+            IDirect3DSurface9* rt = nullptr;
+            dev->GetRenderTarget(i, &rt);
+            s.rt[i] = GrabPtr(rt);
+        }
+        IDirect3DSurface9* ds = nullptr; dev->GetDepthStencilSurface(&ds); s.ds = GrabPtr(ds);
+        dev->GetViewport(&s.vp);
+        dev->GetScissorRect(&s.scissor);
+        s.valid = true;
+    }
+
+    static void VerifyStateRestored(const StateSnapshot& before)
+    {
+        if (!before.valid || !dev) return;
+        StateSnapshot after{};
+        CaptureSnapshot(after);
+
+        int diffs = 0;
+        auto note = [&](const char* what) { if (diffs++ < 24) Log("STATE LEAK: %s", what); };
+
+        for (uint32_t i = 0; i < pipelinekeys::kNumRS; i++)
+            if (before.rs[i] != after.rs[i])
+            {
+                char b[128];
+                _snprintf_s(b, sizeof(b), _TRUNCATE, "render state %s: %lu -> %lu",
+                            pipelinekeys::kTrackedRS[i].name,
+                            (unsigned long)before.rs[i], (unsigned long)after.rs[i]);
+                note(b);
+            }
+        for (uint32_t i = 0; i < pipelinekeys::kNumSamplers; i++)
+            if (before.tex[i] != after.tex[i])
+            {
+                char b[128];
+                _snprintf_s(b, sizeof(b), _TRUNCATE, "texture on sampler %u: %p -> %p",
+                            i, before.tex[i], after.tex[i]);
+                note(b);
+            }
+        if (before.vs != after.vs)     note("vertex shader");
+        if (before.ps != after.ps)     note("pixel shader");
+        if (before.decl != after.decl) note("vertex declaration");
+        if (before.ib != after.ib)     note("index buffer");
+        if (before.fvf != after.fvf)   note("FVF");
+        for (UINT i = 0; i < 4; i++)
+            if (before.stream[i].vb != after.stream[i].vb ||
+                before.stream[i].offset != after.stream[i].offset ||
+                before.stream[i].stride != after.stream[i].stride)
+            {
+                char b[96];
+                _snprintf_s(b, sizeof(b), _TRUNCATE, "stream source %u", i);
+                note(b);
+            }
+        for (UINT i = 0; i < 4; i++)
+            if (before.rt[i] != after.rt[i])
+            {
+                char b[96];
+                _snprintf_s(b, sizeof(b), _TRUNCATE, "render target %u: %p -> %p", i, before.rt[i], after.rt[i]);
+                note(b);
+            }
+        if (before.ds != after.ds) note("depth-stencil surface");
+        if (memcmp(&before.vp, &after.vp, sizeof(D3DVIEWPORT9)) != 0) note("viewport");
+        if (memcmp(&before.scissor, &after.scissor, sizeof(RECT)) != 0) note("scissor rect");
+
+        if (diffs == 0)
+            Log("state verified: device handed back byte-identical across %u render states, "
+                "%u samplers, shaders, streams and targets",
+                pipelinekeys::kNumRS, pipelinekeys::kNumSamplers);
+        else
+            Log("state NOT restored: %d differences (listed above) - THIS is the black-sky bug", diffs);
     }
 
     // ---- device acquisition (robust across the 1.2.0.59 device globals) --
@@ -782,7 +909,21 @@ class ShaderPrecompiler
             if (!warnedScene) { warnedScene = true; Log("overlay BeginScene failed — progress bar cannot update"); }
         }
 
-        dev->Present(nullptr, nullptr, nullptr, nullptr);
+        // Count and check. "The bar jumps 0% -> 100% with no feedback" has now been
+        // diagnosed wrong twice by reasoning about this code; a frame counter and a
+        // checked HRESULT turn the next occurrence into a fact.
+        HRESULT hrPresent = dev->Present(nullptr, nullptr, nullptr, nullptr);
+        overlayFrames++;
+        if (FAILED(hrPresent))
+        {
+            static bool warnedPresent = false;
+            if (!warnedPresent)
+            {
+                warnedPresent = true;
+                Log("overlay Present failed (hr=0x%08lX) - the progress bar cannot reach the screen",
+                    (unsigned long)hrPresent);
+            }
+        }
 
         if (prevRT) { dev->SetRenderTarget(0, prevRT); prevRT->Release(); }
         dev->SetDepthStencilSurface(prevDS);
@@ -957,14 +1098,105 @@ class ShaderPrecompiler
     static inline std::unordered_map<uint64_t, IDirect3DVertexShader9*> vsByHash;
     static inline std::unordered_map<uint64_t, IDirect3DPixelShader9*>  psByHash;
 
+    // Which sampler slots each pixel shader actually DECLARES, by bytecode hash.
+    // DXVK's sampler-type spec constant only encodes declared slots, so two keys
+    // differing on a slot the shader never reads are the same pipeline. Recording
+    // all 20 slots blindly took the distinct-key count from 372 to 4452 against a
+    // driver that reported 663 real pipelines.
+    static inline std::unordered_map<uint64_t, std::array<bool, 16>> psSamplerUse;
+
+    // Not constexpr: a static data member of this class cannot be constant-
+    // initialised from a member function of the same class, because the function is
+    // not available until the class is complete. Resolved once at DLL load instead.
+    static int RSIndexOf(D3DRENDERSTATETYPE rs)
+    {
+        for (uint32_t i = 0; i < pipelinekeys::kNumRS; i++)
+            if (pipelinekeys::kTrackedRS[i].rs == rs) return (int)i;
+        return -1;
+    }
+    static inline const int kRS_AlphaTestEnable = RSIndexOf(D3DRS_ALPHATESTENABLE);
+    static inline const int kRS_AlphaFunc       = RSIndexOf(D3DRS_ALPHAFUNC);
+    static inline const int kRS_FogEnable       = RSIndexOf(D3DRS_FOGENABLE);
+
+    // The fields that actually select a distinct pipeline object.
+    //
+    // Measured 2026-09-18: replaying 6994 strict keys produced 634 Vulkan
+    // pipelines, and 226 new keys during play produced 29 new pipelines -- our key
+    // was ~10x more granular than the driver's, and that excess was most of the 16s
+    // stall. Everything dropped here is either set dynamically (colour-write masks,
+    // cull mode, depth/stencil ops on any driver with extended dynamic state) or
+    // configures fixed-function stages these shader-based draws never run.
+    //
+    // Deliberately KEPT even though this driver may treat them dynamically: vertex
+    // declaration and topology. They are classic pipeline state, and a driver
+    // without dynamic vertex input -- plausibly the Windows target -- will bake
+    // them. Over-warming there costs a few draws; under-warming costs a stutter.
+    static uint64_t ReplayPipelineKey(const pipelinekeys::KeyRecord& k)
+    {
+        struct Reduced
+        {
+            uint64_t vs, ps;
+            uint32_t decl, fvf, prim;
+            uint32_t rt[pipelinekeys::kMaxRT], ds, ms, msq;
+            uint32_t alphaEnable, alphaFunc, fogEnable;
+            uint8_t  samplerType[pipelinekeys::kNumSamplers];
+        } r{};
+
+        r.vs = k.vsHash; r.ps = k.psHash;
+        r.decl = k.declIndex; r.fvf = k.fvf; r.prim = k.primType;
+        for (uint32_t i = 0; i < pipelinekeys::kMaxRT; i++) r.rt[i] = k.rtFmt[i];
+        r.ds = k.dsFmt; r.ms = k.msType; r.msq = k.msQuality;
+        if (kRS_AlphaTestEnable >= 0) r.alphaEnable = k.rs[kRS_AlphaTestEnable];
+        if (kRS_AlphaFunc >= 0)       r.alphaFunc   = k.rs[kRS_AlphaFunc];
+        if (kRS_FogEnable >= 0)       r.fogEnable   = k.rs[kRS_FogEnable];
+
+        // Mask pixel-shader sampler slots to the ones the shader declares. Vertex
+        // samplers stay unmasked: there are only four and we do not parse VS
+        // sampler declarations.
+        const std::array<bool, 16>* use = nullptr;
+        if (auto it = psSamplerUse.find(k.psHash); it != psSamplerUse.end()) use = &it->second;
+        for (uint32_t i = 0; i < pipelinekeys::kPSSamplers; i++)
+            r.samplerType[i] = (!use || (*use)[i]) ? k.samplerType[i] : 0;
+        for (uint32_t i = pipelinekeys::kPSSamplers; i < pipelinekeys::kNumSamplers; i++)
+            r.samplerType[i] = k.samplerType[i];
+
+        return pipelinekeys::Fnv1a(&r, sizeof(r));
+    }
+
+    // The cache bundle for THIS graphics configuration, matching what the capture
+    // writes. Keys carry render-target formats, so replaying another setup's bundle
+    // would warm pipelines this one never uses and miss the ones it needs.
     static std::string KeyFilePath()
     {
         char path[MAX_PATH] = {};
         GetModuleFileNameA(hSelf, path, MAX_PATH);
         std::string s(path);
         auto slash = s.find_last_of("\\/");
-        s = (slash == std::string::npos) ? std::string() : s.substr(0, slash + 1);
-        return s + "FusionFix.pipelinekeys.bin";
+        std::string dir = (slash == std::string::npos) ? std::string() : s.substr(0, slash + 1);
+
+        uint32_t w = bbW, h = bbH, fmt = (uint32_t)bbFmt;
+        if (dev)
+        {
+            IDirect3DSwapChain9* sc = nullptr;
+            if (SUCCEEDED(dev->GetSwapChain(0, &sc)) && sc)
+            {
+                D3DPRESENT_PARAMETERS pp{};
+                if (SUCCEEDED(sc->GetPresentParameters(&pp)) && pp.BackBufferWidth)
+                {
+                    w = pp.BackBufferWidth; h = pp.BackBufferHeight;
+                    fmt = (uint32_t)pp.BackBufferFormat;
+                }
+                sc->Release();
+            }
+        }
+        CIniReader ini("");
+        int msaa = ini.ReadInteger("EXPERIMENTAL", "ReflectionMSAAQuality", 0);
+
+        std::string bundle = dir + pipelinekeys::BundleName(w, h, fmt, msaa, "bin");
+        if (FILE* f = fopen(bundle.c_str(), "rb")) { fclose(f); return bundle; }
+
+        // Fall back to the pre-bundle name so an existing cache still works.
+        return dir + pipelinekeys::LegacyBundleName("bin");
     }
 
     // Returns false (and leaves replayRecs empty) for any malformed or absent file,
@@ -1063,7 +1295,15 @@ class ShaderPrecompiler
             if (!s || !s->bytecode || !s->size) continue;
             uint64_t h = pipelinekeys::Fnv1a(s->bytecode, s->size);
             if (s->stage == FXC_STAGE_VS) { if (vsHandles[i]) vsByHash.emplace(h, vsHandles[i]); }
-            else                          { if (psHandles[i]) psByHash.emplace(h, psHandles[i]); }
+            else
+            {
+                if (psHandles[i]) psByHash.emplace(h, psHandles[i]);
+                // Remember which sampler slots this shader declares; the replay key
+                // masks the recorded sampler types down to these.
+                std::array<bool, 16> use{};
+                for (int s2 = 0; s2 < 16; s2++) use[s2] = shaderIO[i].usesSampler[s2];
+                psSamplerUse.emplace(h, use);
+            }
         }
         size_t fromDb = vsByHash.size() + psByHash.size();
 
@@ -1072,7 +1312,28 @@ class ShaderPrecompiler
         // database, and draws using them were previously skipped outright -- 178 of
         // 5110 pipelines on the first capture.
         for (auto& [h, obj] : pipelinekeys::Registry().vs) vsByHash.emplace(h, obj);
-        for (auto& [h, obj] : pipelinekeys::Registry().ps) psByHash.emplace(h, obj);
+        for (auto& [h, obj] : pipelinekeys::Registry().ps)
+        {
+            psByHash.emplace(h, obj);
+            // Registry shaders have no .fxc entry, so parse their declarations here
+            // too -- otherwise their keys keep all 16 sampler slots and over-expand.
+            if (psSamplerUse.find(h) == psSamplerUse.end())
+            {
+                UINT size = 0;
+                if (SUCCEEDED(obj->GetFunction(nullptr, &size)) && size)
+                {
+                    std::vector<uint8_t> code(size);
+                    if (SUCCEEDED(obj->GetFunction(code.data(), &size)))
+                    {
+                        ShaderIO io{};
+                        ParseShaderIO(code.data(), size, false, io);
+                        std::array<bool, 16> use{};
+                        for (int s2 = 0; s2 < 16; s2++) use[s2] = io.usesSampler[s2];
+                        psSamplerUse.emplace(h, use);
+                    }
+                }
+            }
+        }
 
         Log("replay: indexed %zu VS + %zu PS by bytecode hash (%zu from the .fxc db, %zu more from the registry)",
             vsByHash.size(), psByHash.size(), fromDb, vsByHash.size() + psByHash.size() - fromDb);
@@ -1176,32 +1437,60 @@ class ShaderPrecompiler
         // Bind the dummy geometry once; only the declaration changes per key.
         dev->SetIndices(dummyIB);
 
-        // Records are deduplicated on the STRICT key, which includes state the
-        // driver sets dynamically -- stencil ref/mask, alpha ref, depth bias. Two
-        // records differing only there compile to the same pipeline, so replaying
-        // both is pure waste. On the 2026-09-18 capture that is 7846 strict keys
-        // against 5110 real pipelines: a third of the work, for nothing.
+        // Deduplicate FIRST, as a separate cheap pass, then draw only the survivors.
+        //
+        // Doing this inline while drawing made the progress bar useless: of 11234
+        // records, 9371 are instant skips and 1688 are pipeline compiles costing
+        // ~10 ms each, but the weighting charged them equally. The bar raced to ~85%
+        // in under a second and then crawled for fifteen. Counting the real work
+        // before starting it makes progress linear in time, which is the only thing
+        // a progress bar is for.
         std::unordered_set<uint64_t> seenPipeline;
         seenPipeline.reserve(replayRecs.size());
-
+        std::vector<uint32_t> drawList;
+        drawList.reserve(replayRecs.size() / 4);
         for (size_t r = 0; r < replayRecs.size(); r++)
         {
-            const KeyRecord& k = replayRecs[r];
+            if (seenPipeline.insert(ReplayPipelineKey(replayRecs[r])).second)
+                drawList.push_back((uint32_t)r);
+            else
+                skippedDup++;
+        }
+        // Warm the pipelines the game uses MOST first. If a budget or an early exit
+        // cuts the pass short, what got built is then the part that matters, not an
+        // arbitrary prefix of the file.
+        std::sort(drawList.begin(), drawList.end(), [](uint32_t a, uint32_t b) {
+            return replayRecs[a].count > replayRecs[b].count;
+        });
 
-            {
-                KeyRecord reduced = k;
-                for (uint32_t i = 0; i < kNumRS; i++)
-                    if (!kTrackedRS[i].pipeline) reduced.rs[i] = 0;
-                reduced.upDraw = 0;          // UP vs buffered draws share a pipeline
-                reduced.count = 0;
-                reduced.firstFrame = 0;
-                if (!seenPipeline.insert(Fnv1a(&reduced, kKeyHashBytes)).second)
-                {
-                    skippedDup++;
-                    workDone += kPassW;
-                    continue;
-                }
-            }
+        // workDone currently holds the create-pass units; everything left is drawing.
+        workTotal = workDone + (uint32_t)drawList.size() * kPassW;
+        if (workTotal == 0) workTotal = 1;
+        Log("replay: %zu unique pipelines to build from %zu keys (ordered by use)",
+            drawList.size(), replayRecs.size());
+
+        // Adaptive exit: if pipelines are not actually being COMPILED, there is
+        // nothing to win and the whole pass is a pure loading-time regression.
+        //
+        // That is the graphics-pipeline-library case: DXVK compiles per-stage
+        // libraries at shader-create time and then fast-links them, so each draw
+        // here costs microseconds instead of milliseconds. Rather than trying to
+        // detect GPL -- which is DXVK's internal decision, not an extension bit, and
+        // could change with any release -- measure the cost and decide. This also
+        // handles a driver whose fast-linking is too slow to be worth using, where
+        // the capability flag would lie to us.
+        const auto tReplayStart = std::chrono::steady_clock::now();
+        auto elapsedMs = [&] {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - tReplayStart).count();
+        };
+        const int kProbeDraws = 128;     // enough to average out one-off costs
+        const double kFastLinkMs = 1.0;  // below this, nothing is being compiled
+        bool exitedEarly = false;
+
+        for (uint32_t r : drawList)
+        {
+            const KeyRecord& k = replayRecs[r];
 
             // Shaders. A miss means the capture saw a shader this .fxc database does
             // not contain (a different episode, or a mod) -- skip rather than draw
@@ -1289,6 +1578,29 @@ class ShaderPrecompiler
             dev->DrawIndexedPrimitive((D3DPRIMITIVETYPE)k.primType, 0, 0, 3, 0, 1);
             drawn++;
 
+            if (cfg.adaptiveExit && drawn == kProbeDraws)
+            {
+                double per = (double)elapsedMs() / kProbeDraws;
+                if (per < kFastLinkMs)
+                {
+                    Log("replay: %.3f ms per pipeline over %d draws - the driver is not compiling "
+                        "(pipeline libraries / fast linking), so warming buys nothing. Stopping.",
+                        per, kProbeDraws);
+                    exitedEarly = true;
+                    break;
+                }
+                Log("replay: %.2f ms per pipeline - real compilation, continuing (%zu to go)",
+                    per, drawList.size() - drawn);
+            }
+
+            if (cfg.budgetSeconds > 0 && elapsedMs() > (long long)cfg.budgetSeconds * 1000)
+            {
+                Log("replay: hit the %ds budget after %u of %zu pipelines - the most-used ones are warm",
+                    cfg.budgetSeconds, drawn, drawList.size());
+                exitedEarly = true;
+                break;
+            }
+
             workDone += kPassW;
             if ((r & 15) == 0)
                 curLabel = "pipeline " + std::to_string(r + 1) + " / " + std::to_string(replayRecs.size());
@@ -1302,8 +1614,12 @@ class ShaderPrecompiler
         for (uint32_t i = 0; i < kPSSamplers; i++) dev->SetTexture(i, nullptr);
         for (uint32_t i = 0; i < kVSSamplers; i++) dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + i, nullptr);
 
-        Log("replay: drew %u pipelines from %zu keys (skipped %u duplicate-state, %u no-shader, %u no-decl, %u no-RT)",
-            drawn, replayRecs.size(), skippedDup, skippedShader, skippedDecl, skippedRT);
+        // If we stopped early the bar must still reach 100%, or it reads as a hang.
+        if (exitedEarly) workDone = workTotal;
+
+        Log("replay: drew %u of %zu pipelines in %llds%s (skipped %u duplicate-state, %u no-shader, %u no-decl, %u no-RT)",
+            drawn, drawList.size(), (long long)(elapsedMs() / 1000), exitedEarly ? " [stopped early]" : "",
+            skippedDup, skippedShader, skippedDecl, skippedRT);
     }
 
     // -------------------------------------------------------------------
@@ -1418,6 +1734,10 @@ class ShaderPrecompiler
         dev->GetDepthStencilSurface(&saveDS);
         D3DVIEWPORT9 saveVP{}; dev->GetViewport(&saveVP);
 
+        // Full snapshot for the neutrality check at the end.
+        StateSnapshot before{};
+        CaptureSnapshot(before);
+
         CreateOverlay();
         PresentOverlay(true);
 
@@ -1458,10 +1778,14 @@ class ShaderPrecompiler
                 DummyDrawPass(db);
             }
             WaitUntilIdle();
-
-            ReleaseResources();
             fxc_free(db);
         }
+        // NB: ReleaseResources() deliberately happens AFTER the state restore below.
+        // Releasing our scratch targets and textures while they are still bound, and
+        // only then putting the game's state back, is the wrong order -- COM keeps
+        // them alive so it is survivable, but it leaves a window where the device
+        // references objects we have dropped, and it is not a window worth having
+        // while chasing a state-corruption bug.
 
         // Restore device state fully.
         dev->SetRenderTarget(0, saveRT);
@@ -1474,11 +1798,26 @@ class ShaderPrecompiler
         SAFE_RELEASE(saveDS);
         if (sb) { sb->Apply(); sb->Release(); }
 
+        // Now that the game's state is back, drop our scratch resources.
+        ReleaseResources();
+
+        // Did we actually hand the device back unchanged?
+        //
+        // A live run once produced a black sky and depth/occlusion mismatches after
+        // this pass. That was recorded as "fixed in 55e7156", but re-reading that
+        // commit shows it changed nothing about state handling on this path -- the
+        // scene probe is a no-op unless the game owns a scene, and the logs show it
+        // never does. So the corruption was never explained, only unobserved.
+        // Guessing again is worthless; compare the state we found against the state
+        // we left and name whatever differs.
+        VerifyStateRestored(before);
+
         // Re-enter the scene we suspended, so the game's own EndScene still pairs up.
         if (insideGameScene) dev->BeginScene();
 
         auto secs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tStart).count() / 1000.0;
-        Log("precompile complete in %.1fs", secs);
+        Log("precompile complete in %.1fs (%u overlay frames presented, %.1f/s)",
+            secs, overlayFrames, secs > 0.0 ? overlayFrames / secs : 0.0);
         dev->Release();
         dev = nullptr;
     }
@@ -1605,6 +1944,26 @@ class ShaderPrecompiler
             // settles it without another bisect.
             Log("probe: loadscreen render callback thread = %lu", GetCurrentThreadId());
 
+            // PumpMessages() assumes this thread owns the game window's message
+            // queue. Windows only delivers messages to the thread that CREATED the
+            // window, so if these differ, that pump has been draining the wrong
+            // queue and cannot be why the window survives a long blocking pass.
+            {
+                HWND w = gameWnd;
+                if (!w) w = FindWindowW(nullptr, L"Grand Theft Auto IV");
+                if (w)
+                {
+                    DWORD owner = GetWindowThreadProcessId(w, nullptr);
+                    Log("probe: window %p owned by thread %lu, we are %lu -> PumpMessages %s",
+                        w, owner, GetCurrentThreadId(),
+                        (owner == GetCurrentThreadId()) ? "pumps the RIGHT queue" : "pumps the WRONG queue");
+                }
+                else
+                {
+                    Log("probe: could not find the game window to check message-queue ownership");
+                }
+            }
+
             IDirect3DSurface9* rt = nullptr;
             if (SUCCEEDED(d->GetRenderTarget(0, &rt)) && rt)
             {
@@ -1686,6 +2045,8 @@ class ShaderPrecompiler
         cfg.coverPresent = ini.ReadInteger("SHADERS", "PrecompileCoverPresentModes", 1) != 0;
         cfg.flashProbe   = ini.ReadInteger("SHADERS", "PrecompileFlashProbe", 0);
         cfg.replay       = ini.ReadInteger("SHADERS", "PrecompileReplayCapturedKeys", 1) != 0;
+        cfg.adaptiveExit = ini.ReadInteger("SHADERS", "PrecompileAdaptiveExit", 1) != 0;
+        cfg.budgetSeconds = ini.ReadInteger("SHADERS", "PrecompileBudgetSeconds", 0);
     }
 
 public:

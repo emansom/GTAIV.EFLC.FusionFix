@@ -414,6 +414,9 @@ class ShaderCapture
     {
         if (!lockReady) { InitializeCriticalSection(&lock); lockReady = true; }
 
+        // Which bundle this configuration reads and writes.
+        ResolveBundle(d);
+
         // Inherit previous sessions' coverage before recording anything new.
         LoadExisting();
 
@@ -434,19 +437,47 @@ class ShaderCapture
     }
 
     // ---- output --------------------------------------------------------
-    static std::string OutPath(const char* leaf)
+    static std::string OutDir()
     {
         char path[MAX_PATH] = {};
         GetModuleFileNameA(hSelf, path, MAX_PATH);
         std::string s(path);
         auto slash = s.find_last_of("\\/");
-        s = (slash == std::string::npos) ? std::string() : s.substr(0, slash + 1);
-        return s + leaf;
+        return (slash == std::string::npos) ? std::string() : s.substr(0, slash + 1);
+    }
+
+    static std::string OutPath(const char* leaf) { return OutDir() + leaf; }
+
+    // Cache file for THIS graphics configuration. Recorded keys carry render-target
+    // formats, so one captured at another resolution or MSAA level is both useless
+    // (nothing matches) and harmful (warms pipelines this setup never uses).
+    static inline std::string bundleBin, bundleTxt;
+
+    static void ResolveBundle(IDirect3DDevice9* d)
+    {
+        uint32_t w = 1920, h = 1080, fmt = (uint32_t)D3DFMT_A8R8G8B8;
+        IDirect3DSwapChain9* sc = nullptr;
+        if (d && SUCCEEDED(d->GetSwapChain(0, &sc)) && sc)
+        {
+            D3DPRESENT_PARAMETERS pp{};
+            if (SUCCEEDED(sc->GetPresentParameters(&pp)) && pp.BackBufferWidth)
+            {
+                w = pp.BackBufferWidth; h = pp.BackBufferHeight;
+                fmt = (uint32_t)pp.BackBufferFormat;
+            }
+            sc->Release();
+        }
+        CIniReader ini("");
+        int msaa = ini.ReadInteger("EXPERIMENTAL", "ReflectionMSAAQuality", 0);
+
+        bundleBin = pipelinekeys::BundleName(w, h, fmt, msaa, "bin");
+        bundleTxt = pipelinekeys::BundleName(w, h, fmt, msaa, "txt");
+        Log("cache bundle for this configuration: %s", bundleBin.c_str());
     }
 
     static void WriteBinary()
     {
-        FILE* f = fopen(OutPath("FusionFix.pipelinekeys.bin").c_str(), "wb");
+        FILE* f = fopen((OutDir() + bundleBin).c_str(), "wb");
         if (!f) return;
 
         const uint32_t magic = pipelinekeys::kMagic;
@@ -503,7 +534,7 @@ class ShaderCapture
 
     static void WriteSummary()
     {
-        FILE* f = fopen(OutPath("FusionFix.pipelinekeys.txt").c_str(), "w");
+        FILE* f = fopen((OutDir() + bundleTxt).c_str(), "w");
         if (!f) return;
 
         fprintf(f, "FusionFix D3D9 pipeline-key capture\n");
@@ -599,8 +630,16 @@ class ShaderCapture
     // contributors: merging two players' caches is the same operation).
     static void LoadExisting()
     {
-        FILE* f = fopen(OutPath("FusionFix.pipelinekeys.bin").c_str(), "rb");
-        if (!f) { Log("no existing cache - starting a new one"); return; }
+        // Prefer this configuration's bundle; fall back to the pre-bundle file once,
+        // so an existing cache is adopted rather than orphaned. It is then written
+        // back under the bundle name.
+        FILE* f = fopen((OutDir() + bundleBin).c_str(), "rb");
+        if (!f)
+        {
+            f = fopen(OutPath(pipelinekeys::LegacyBundleName("bin")).c_str(), "rb");
+            if (f) Log("adopting the pre-bundle cache into %s", bundleBin.c_str());
+        }
+        if (!f) { Log("no existing cache for this configuration - starting a new one"); return; }
 
         uint32_t magic = 0, version = 0, numRS = 0, numSamplers = 0, declCount = 0, recCount = 0;
         if (fread(&magic, 4, 1, f) != 1 || magic != 0x4B504646u) { fclose(f); return; }

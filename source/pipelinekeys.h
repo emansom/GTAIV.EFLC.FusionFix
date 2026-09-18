@@ -14,6 +14,8 @@
 #include <cstddef>
 #include <unordered_map>
 #include <vector>
+#include <string>
+#include <cstdio>
 
 namespace pipelinekeys
 {
@@ -180,6 +182,38 @@ namespace pipelinekeys
 
     // Everything that identifies a key, excluding the bookkeeping tail.
     constexpr size_t kKeyHashBytes = offsetof(KeyRecord, count);
+
+    // Cache bundles are per graphics configuration.
+    //
+    // Recorded keys carry render-target formats, so a cache captured at one
+    // configuration both MISSES (nothing matches, no warming) and WASTES (builds
+    // pipelines that configuration never uses) when replayed under another. Naming
+    // the file after the configuration keeps them separate, lets a user accumulate
+    // one bundle per setup, and makes a shipped set of bundles selectable rather
+    // than a single file that is wrong for most people.
+    //
+    // Back-buffer size and format plus the MSAA level are what actually move the
+    // formats in the key; they are cheap to read and stable across a session.
+    inline std::string BundleName(uint32_t width, uint32_t height, uint32_t bbFormat,
+                                  int msaa, const char* ext)
+    {
+        char buf[128];
+        // Bucket the resolution: an off-by-a-few-pixels borderless size must not
+        // fragment the cache, but 1080p and 4K must not share one.
+        const char* cls = (height >= 2000) ? "4k" : (height >= 1300) ? "1440p"
+                        : (height >= 1000) ? "1080p" : (height >= 700) ? "720p" : "low";
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "FusionFix.pipelinekeys.%s-f%u-ms%d.%s",
+                    cls, bbFormat, msaa, ext);
+        (void)width;
+        return std::string(buf);
+    }
+
+    // The pre-bundle file name, kept so an existing cache is not orphaned.
+    inline const char* LegacyBundleName(const char* ext)
+    {
+        return (ext && ext[0] == 'b') ? "FusionFix.pipelinekeys.bin"
+                                      : "FusionFix.pipelinekeys.txt";
+    }
 
     inline uint64_t Fnv1a(const void* data, size_t len, uint64_t h = 1469598103934665603ull)
     {
