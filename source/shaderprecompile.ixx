@@ -360,6 +360,13 @@ class ShaderPrecompiler
     // progress
     static inline std::atomic<uint32_t> workDone{ 0 };
     static inline uint32_t workTotal = 1;
+
+    // Creating a shader object is ~100x cheaper than compiling a pass (measured:
+    // 1734 creates in <1s, 1757 passes in ~110s). Counting both as one unit made the
+    // bar jump to ~44% within a second and then sit there for the whole compile, which
+    // reads as a hang. Weight the slow phases so the bar advances in proportion to TIME.
+    static constexpr uint32_t kCreateW = 1;
+    static constexpr uint32_t kPassW = 100;
     static inline std::string curLabel;
     static inline std::chrono::steady_clock::time_point tStart;
     static inline std::chrono::steady_clock::time_point tLastPresent;
@@ -735,11 +742,24 @@ class ShaderPrecompiler
             if (font && fontBig)
             {
                 auto secs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tStart).count() / 1000.0;
-                double eta = (frac > 0.02) ? secs * (1.0 - frac) / frac : 0.0;
                 char line[256];
-                _snprintf_s(line, sizeof(line), _TRUNCATE,
-                            "Compiling shaders  %3d%%    ETA %d:%02d", (int)(frac * 100.0f),
-                            (int)eta / 60, (int)eta % 60);
+                // Only show an ETA once there is enough elapsed time AND progress for the
+                // extrapolation to mean anything. Previously it was computed from under a
+                // second of samples and displayed "ETA 0:00" next to a bar that then sat
+                // still for two minutes, which reads as a crash.
+                if (secs >= 3.0 && frac >= 0.03f)
+                {
+                    double eta = secs * (1.0 - frac) / frac;
+                    if (eta > 5999.0) eta = 5999.0;   // clamp the mm:ss field
+                    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                                "Compiling shaders  %3d%%    ETA %d:%02d", (int)(frac * 100.0f),
+                                (int)eta / 60, (int)eta % 60);
+                }
+                else
+                {
+                    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                                "Compiling shaders  %3d%%    estimating...", (int)(frac * 100.0f));
+                }
                 RECT rTitle{ (LONG)mx, (LONG)(by - 78), (LONG)(mx + barW), (LONG)(by - 40) };
                 fontBig->DrawTextA(nullptr, line, -1, &rTitle, DT_LEFT | DT_NOCLIP, HdrScale(1, 1, 1, 1));
 
@@ -748,6 +768,13 @@ class ShaderPrecompiler
                 font->DrawTextA(nullptr, sub.c_str(), -1, &rSub, DT_LEFT | DT_NOCLIP, HdrScale(0.8f, 0.85f, 0.95f, 1));
             }
             dev->EndScene();
+        }
+        else
+        {
+            // Silent failure here is what made the bar freeze at 44% while work
+            // continued. Say so once rather than presenting a stale frame forever.
+            static bool warnedScene = false;
+            if (!warnedScene) { warnedScene = true; Log("overlay BeginScene failed — progress bar cannot update"); }
         }
 
         dev->Present(nullptr, nullptr, nullptr, nullptr);
@@ -821,11 +848,11 @@ class ShaderPrecompiler
                 for (uint32_t p = 0; p < tech.pass_count; p++)
                 {
                     const fxc_pass& pass = tech.passes[p];
-                    if (pass.vs_unique == FXC_NO_SHADER || pass.vs_unique >= vsHandles.size()) { workDone++; continue; }
+                    if (pass.vs_unique == FXC_NO_SHADER || pass.vs_unique >= vsHandles.size()) { workDone += kPassW; continue; }
                     IDirect3DVertexShader9* vs = vsHandles[pass.vs_unique];
                     IDirect3DPixelShader9*  ps = (pass.ps_unique != FXC_NO_SHADER && pass.ps_unique < psHandles.size())
                                                ? psHandles[pass.ps_unique] : nullptr;
-                    if (!vs) { workDone++; continue; }
+                    if (!vs) { workDone += kPassW; continue; }
 
                     UINT stride = 12;
                     IDirect3DVertexDeclaration9* decl = DeclForVS(shaderIO[pass.vs_unique], stride);
@@ -851,7 +878,7 @@ class ShaderPrecompiler
                         }
                     }
                     SAFE_RELEASE(decl);
-                    workDone++;
+                    workDone += kPassW;
                     if (ef->name) curLabel = ef->name;
                     // Present every pass: pumps messages, advances the bar smoothly,
                     // and (on native D3D9) periodically flushes so the driver actually
@@ -884,7 +911,7 @@ class ShaderPrecompiler
                 const FormatSet* f = FindFormat(tp.fmt);
                 const BlendConfig* b = FindBlend(tp.blend);
                 if (BindFormatSet(f)) { ApplyBlend(b); IssueDraw(tp.topo, stride); }
-                workDone++;
+                workDone += kPassW;
                 curLabel = "state coverage";
                 PresentOverlay(false);
             }
@@ -900,7 +927,7 @@ class ShaderPrecompiler
                         dev->SetDepthStencilSurface(nullptr);
                         ApplyBlend(bOpaque); IssueDraw(D3DPT_TRIANGLELIST, stride);
                     }
-                    workDone++;
+                    workDone += kPassW;
                 }
             }
             SAFE_RELEASE(decl);
@@ -978,9 +1005,33 @@ class ShaderPrecompiler
         DetectBackend();
         Log("backend = %s, device = %p", backend == Backend::DXVK ? "DXVK" : "native", (void*)dev);
 
+        // We are armed on the loading-screen render, so the game is very likely already
+        // inside a BeginScene/EndScene pair. D3D9 forbids CreateStateBlock there (it
+        // returns D3DERR_INVALIDCALL) and BeginScene fails too, which previously meant:
+        //   - sb stayed null, Apply() was skipped, and NOTHING we changed was restored
+        //     -> the game resumed with our render states/textures/constants live
+        //        (black sky, depth/occlusion mismatches), and
+        //   - the overlay's BeginScene failed, so the progress bar froze after one frame.
+        // Detect the enclosing scene by probing BeginScene, leave it for the duration,
+        // and re-enter it before handing control back.
+        HRESULT hrProbe = dev->BeginScene();
+        bool insideGameScene = FAILED(hrProbe);   // INVALIDCALL => the game owns a scene
+        dev->EndScene();                          // ends ours, or leaves the game's
+        if (insideGameScene) Log("entered inside the game's scene — suspended it for the pass");
+
         // Snapshot ALL device state so the game resumes byte-identical afterwards.
         IDirect3DStateBlock9* sb = nullptr;
-        dev->CreateStateBlock(D3DSBT_ALL, &sb);
+        HRESULT hrSB = dev->CreateStateBlock(D3DSBT_ALL, &sb);
+        if (FAILED(hrSB) || !sb)
+        {
+            // Without this we cannot put the device back the way we found it. Abort
+            // rather than corrupt the frame -- a missing precompile is a perf issue,
+            // a corrupted device is a visual bug.
+            Log("CreateStateBlock failed (hr=0x%08lX) — aborting precompile to avoid corrupting device state", (unsigned long)hrSB);
+            if (insideGameScene) dev->BeginScene();
+            dev->Release(); dev = nullptr;
+            return;
+        }
         IDirect3DSurface9* saveRT = nullptr; IDirect3DSurface9* saveDS = nullptr;
         IDirect3DSurface9* saveRT1 = nullptr; IDirect3DSurface9* saveRT2 = nullptr; IDirect3DSurface9* saveRT3 = nullptr;
         dev->GetRenderTarget(0, &saveRT);
@@ -1006,7 +1057,7 @@ class ShaderPrecompiler
             //   + present-format warms. Must match every workDone++ site below.
             uint32_t passUnits = (cfg.breadth > 0) ? st.pass_count : 0;
             uint32_t tupleUnits = (cfg.breadth > 0) ? (uint32_t)kTupleCount + (cfg.coverPresent ? 2u : 0u) : 0;
-            workTotal = st.unique_total + passUnits + tupleUnits;
+            workTotal = st.unique_total * kCreateW + (passUnits + tupleUnits) * kPassW;
             if (workTotal == 0) workTotal = 1;
             workDone = 0;
 
@@ -1029,6 +1080,9 @@ class ShaderPrecompiler
         SAFE_RELEASE(saveRT); SAFE_RELEASE(saveRT1); SAFE_RELEASE(saveRT2); SAFE_RELEASE(saveRT3);
         SAFE_RELEASE(saveDS);
         if (sb) { sb->Apply(); sb->Release(); }
+
+        // Re-enter the scene we suspended, so the game's own EndScene still pairs up.
+        if (insideGameScene) dev->BeginScene();
 
         auto secs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tStart).count() / 1000.0;
         Log("precompile complete in %.1fs", secs);
