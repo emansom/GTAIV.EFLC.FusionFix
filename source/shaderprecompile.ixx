@@ -391,6 +391,8 @@ class ShaderPrecompiler
     static inline std::chrono::steady_clock::time_point tStart;
     static inline std::chrono::steady_clock::time_point tLastPresent;
     static inline uint32_t overlayFrames = 0;   // overlay frames actually presented
+    static inline unsigned presentsAtStart = 0;
+    static inline std::chrono::steady_clock::time_point tLastLabel{};
     static inline uint32_t overlayGapMin = 0xFFFFFFFFu, overlayGapMax = 0;
     static inline uint64_t overlayGapSum = 0;
     static inline uint32_t overlayGapCount = 0;
@@ -826,6 +828,44 @@ class ShaderPrecompiler
         return D3DCOLOR_ARGB(c(a), c(r), c(g), c(b));
     }
 
+    // Put the device into a state where a 2D quad is actually guaranteed to appear.
+    //
+    // THIS is why the progress bar "flashed in and out of existence". The overlay is
+    // drawn from inside the replay loop, right after an arbitrary captured key's 58
+    // render states have been applied -- and the captured data contains
+    // COLORWRITEENABLE = 0, CULLMODE = CW/CCW, ALPHATESTENABLE with ALPHAREF = 100,
+    // STENCILENABLE, and the synthetic pass leaves a 1x1 scissor. Each of those
+    // silently discards the bar's triangles. Whether the bar appeared depended on
+    // which pipeline happened to be replayed last, so it blinked.
+    //
+    // Restoring the game's state at the END of the pass was already correct and
+    // verified; what was missing is the overlay ever establishing its OWN.
+    static void SetOverlayState()
+    {
+        dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+        dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+        dev->SetRenderState(D3DRS_TWOSIDEDSTENCILMODE, FALSE);
+        dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+        dev->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
+        dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+        dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0F);
+        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+        dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+        dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+        dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        dev->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+        dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+        dev->SetRenderState(D3DRS_MULTISAMPLEANTIALIAS, FALSE);
+        RECT full{ 0, 0, (LONG)bbW, (LONG)bbH };
+        dev->SetScissorRect(&full);
+    }
+
     static void DrawOverlayQuad(float x0, float y0, float x1, float y1, D3DCOLOR col)
     {
         struct V { float x, y, z, rhw; D3DCOLOR c; };
@@ -861,11 +901,61 @@ class ShaderPrecompiler
             if (SUCCEEDED(dev->GetDisplayMode(0, &dm)) && dm.RefreshRate >= 24 && dm.RefreshRate <= 480)
                 hz = (int)dm.RefreshRate;
         }
+        // Cap at 60 fps. Above that the overlay stops being the thing you notice and
+        // starts being work queued in front of the compilation it is reporting on --
+        // every frame is a full-screen backdrop blit plus two font draws, submitted
+        // to the same CS thread that builds the pipelines.
         overlayIntervalMs = 1000 / hz;
-        if (overlayIntervalMs < 4) overlayIntervalMs = 4;    // cap at 250 fps
-        if (overlayIntervalMs > 33) overlayIntervalMs = 33;  // never slower than 30
-        Log("overlay refresh: %d Hz -> one frame per %d ms", hz, overlayIntervalMs);
+        if (overlayIntervalMs < 16) overlayIntervalMs = 16;   // 60 fps ceiling
+        if (overlayIntervalMs > 33) overlayIntervalMs = 33;   // 30 fps floor
+        Log("overlay refresh: display %d Hz -> one frame per %d ms (capped at 60 fps)",
+            hz, overlayIntervalMs);
     }
+
+    // Backdrop + text, rendered once per text change rather than once per frame.
+    static inline IDirect3DSurface9* overlayBase = nullptr;
+    static inline std::string overlayTitle, overlaySub;
+
+    static void RebuildOverlayBase()
+    {
+        if (!dev) return;
+        if (!overlayBase &&
+            FAILED(dev->CreateRenderTarget(bbW, bbH, bbFmt, D3DMULTISAMPLE_NONE, 0, FALSE, &overlayBase, nullptr)))
+        {
+            overlayBase = nullptr;
+            return;
+        }
+
+        IDirect3DSurface9* prevRT = nullptr;
+        dev->GetRenderTarget(0, &prevRT);
+        dev->SetRenderTarget(0, overlayBase);
+
+        if (backdrop) dev->StretchRect(backdrop, nullptr, overlayBase, nullptr, D3DTEXF_NONE);
+        else          dev->Clear(0, nullptr, D3DCLEAR_TARGET, HdrScale(0.02f, 0.02f, 0.03f, 1.0f), 1.0f, 0);
+
+        D3DVIEWPORT9 full{ 0, 0, bbW, bbH, 0.0f, 1.0f };
+        dev->SetViewport(&full);
+
+        if (font && fontBig && dev->BeginScene() == D3D_OK)
+        {
+            // Same reason as the bar: this runs between replayed pipelines, so the
+            // device state is whatever the last captured key set.
+            SetOverlayState();
+            float mx = bbW * 0.12f, barW = bbW * 0.76f;
+            float by = bbH * 0.86f;
+            RECT rTitle{ (LONG)mx, (LONG)(by - 78), (LONG)(mx + barW), (LONG)(by - 40) };
+            fontBig->DrawTextA(nullptr, overlayTitle.c_str(), -1, &rTitle, DT_LEFT | DT_NOCLIP, HdrScale(1, 1, 1, 1));
+
+            RECT rSub{ (LONG)mx, (LONG)(by - 34), (LONG)(mx + barW), (LONG)(by - 6) };
+            font->DrawTextA(nullptr, overlaySub.c_str(), -1, &rSub, DT_LEFT | DT_NOCLIP, HdrScale(0.8f, 0.85f, 0.95f, 1));
+            dev->EndScene();
+        }
+        overlayBaseRebuilds++;
+
+        if (prevRT) { dev->SetRenderTarget(0, prevRT); prevRT->Release(); }
+    }
+
+    static inline uint32_t overlayBaseRebuilds = 0;
 
     // Present a progress frame (throttled). frac in [0,1].
     static void PresentOverlay(bool force)
@@ -899,53 +989,67 @@ class ShaderPrecompiler
         dev->SetDepthStencilSurface(nullptr);
         for (int i = 1; i < 4; i++) dev->SetRenderTarget(i, nullptr);
 
-        // Restore the loading-screen art, else a dark backdrop.
-        if (backdrop) dev->StretchRect(backdrop, nullptr, bb, nullptr, D3DTEXF_NONE);
-        else          dev->Clear(0, nullptr, D3DCLEAR_TARGET, HdrScale(0.02f, 0.02f, 0.03f, 1.0f), 1.0f, 0);
-
         float frac = (float)workDone.load() / (float)(workTotal ? workTotal : 1);
         frac = std::clamp(frac, 0.0f, 1.0f);
+
+        // Rebuild the static layer only when its TEXT changes.
+        //
+        // ID3DXFont::DrawTextA is by far the most expensive thing here -- it updates
+        // a glyph atlas and submits its own geometry -- and it was running twice per
+        // frame while the strings change a handful of times a second. The backdrop
+        // and text now live on a persistent surface that is re-rendered only when
+        // the text actually differs; each frame just blits that and draws three
+        // quads for the bar. Everything must still be redrawn per frame because the
+        // swapchain discards, but redrawing a blit is far cheaper than re-rendering
+        // glyphs.
+        std::string title, sub;
+        {
+            auto secs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tStart).count() / 1000.0;
+            char line[256];
+            // Only show an ETA once there is enough elapsed time AND progress for the
+            // extrapolation to mean anything. Previously it was computed from under a
+            // second of samples and displayed "ETA 0:00" next to a bar that then sat
+            // still for two minutes, which reads as a crash.
+            if (secs >= 3.0 && frac >= 0.03f)
+            {
+                double eta = secs * (1.0 - frac) / frac;
+                if (eta > 5999.0) eta = 5999.0;   // clamp the mm:ss field
+                _snprintf_s(line, sizeof(line), _TRUNCATE,
+                            "Compiling shaders  %3d%%    ETA %d:%02d", (int)(frac * 100.0f),
+                            (int)eta / 60, (int)eta % 60);
+            }
+            else
+            {
+                _snprintf_s(line, sizeof(line), _TRUNCATE,
+                            "Compiling shaders  %3d%%    estimating...", (int)(frac * 100.0f));
+            }
+            title = line;
+            sub = curLabel.empty() ? std::string("Preparing shaders...") : ("Building: " + curLabel);
+        }
+        if (!overlayBase || title != overlayTitle || sub != overlaySub)
+        {
+            overlayTitle = title;
+            overlaySub = sub;
+            RebuildOverlayBase();
+        }
+
+        // Per-frame: the prepared layer, then the bar.
+        if (overlayBase) dev->StretchRect(overlayBase, nullptr, bb, nullptr, D3DTEXF_NONE);
+        else if (backdrop) dev->StretchRect(backdrop, nullptr, bb, nullptr, D3DTEXF_NONE);
+        else dev->Clear(0, nullptr, D3DCLEAR_TARGET, HdrScale(0.02f, 0.02f, 0.03f, 1.0f), 1.0f, 0);
 
         D3DVIEWPORT9 full{ 0, 0, bbW, bbH, 0.0f, 1.0f };
         dev->SetViewport(&full);
 
         if (dev->BeginScene() == D3D_OK)
         {
+            SetOverlayState();
             float mx = bbW * 0.12f, barW = bbW * 0.76f;
             float by = bbH * 0.86f, barH = 14.0f;
             // track + fill + thin frame
             DrawOverlayQuad(mx - 2, by - 2, mx + barW + 2, by + barH + 2, HdrScale(0.0f, 0.0f, 0.0f, 0.55f));
             DrawOverlayQuad(mx, by, mx + barW, by + barH, HdrScale(0.10f, 0.10f, 0.12f, 0.85f));
             DrawOverlayQuad(mx, by, mx + barW * frac, by + barH, HdrScale(0.55f, 0.78f, 1.0f, 1.0f));
-
-            if (font && fontBig)
-            {
-                auto secs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tStart).count() / 1000.0;
-                char line[256];
-                // Only show an ETA once there is enough elapsed time AND progress for the
-                // extrapolation to mean anything. Previously it was computed from under a
-                // second of samples and displayed "ETA 0:00" next to a bar that then sat
-                // still for two minutes, which reads as a crash.
-                if (secs >= 3.0 && frac >= 0.03f)
-                {
-                    double eta = secs * (1.0 - frac) / frac;
-                    if (eta > 5999.0) eta = 5999.0;   // clamp the mm:ss field
-                    _snprintf_s(line, sizeof(line), _TRUNCATE,
-                                "Compiling shaders  %3d%%    ETA %d:%02d", (int)(frac * 100.0f),
-                                (int)eta / 60, (int)eta % 60);
-                }
-                else
-                {
-                    _snprintf_s(line, sizeof(line), _TRUNCATE,
-                                "Compiling shaders  %3d%%    estimating...", (int)(frac * 100.0f));
-                }
-                RECT rTitle{ (LONG)mx, (LONG)(by - 78), (LONG)(mx + barW), (LONG)(by - 40) };
-                fontBig->DrawTextA(nullptr, line, -1, &rTitle, DT_LEFT | DT_NOCLIP, HdrScale(1, 1, 1, 1));
-
-                RECT rSub{ (LONG)mx, (LONG)(by - 34), (LONG)(mx + barW), (LONG)(by - 6) };
-                std::string sub = curLabel.empty() ? std::string("Preparing shaders...") : ("Building: " + curLabel);
-                font->DrawTextA(nullptr, sub.c_str(), -1, &rSub, DT_LEFT | DT_NOCLIP, HdrScale(0.8f, 0.85f, 0.95f, 1));
-            }
             dev->EndScene();
         }
         else
@@ -1696,7 +1800,17 @@ class ShaderPrecompiler
                 FenceChunk(fence);
                 workDone += kPassW * sinceFence;
                 sinceFence = 0;
-                curLabel = "pipeline " + std::to_string(drawn) + " / " + std::to_string(drawList.size());
+
+                // Update the label a few times a second, not once per pipeline.
+                // Re-rendering it forces a glyph pass; at one pipeline per fence that
+                // was 573 rebuilds in 886 frames, which defeats caching it at all.
+                // Nobody can read a counter changing 110 times a second anyway.
+                auto nowLbl = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(nowLbl - tLastLabel).count() >= 250)
+                {
+                    tLastLabel = nowLbl;
+                    curLabel = "pipeline " + std::to_string(drawn) + " / " + std::to_string(drawList.size());
+                }
             }
             PresentOverlay(false);
         }
@@ -1764,6 +1878,8 @@ class ShaderPrecompiler
         SAFE_RELEASE(texCube);
         SAFE_RELEASE(texVol);
         SAFE_RELEASE(backdrop);
+        SAFE_RELEASE(overlayBase);
+        overlayTitle.clear(); overlaySub.clear();
         if (font)    { font->Release();    font = nullptr; }
         if (fontBig) { fontBig->Release(); fontBig = nullptr; }
         // The created shader OBJECTS are intentionally KEPT alive: releasing them
@@ -1840,6 +1956,7 @@ class ShaderPrecompiler
         // Full snapshot for the neutrality check at the end.
         StateSnapshot before{};
         CaptureSnapshot(before);
+        presentsAtStart = pipelinekeys::DevicePresentCount();
 
         CreateOverlay();
         PresentOverlay(true);
@@ -1920,11 +2037,23 @@ class ShaderPrecompiler
 
         auto secs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tStart).count() / 1000.0;
         Log("precompile complete in %.1fs (%u overlay frames, %.1f/s; frame gap min %u ms, "
-            "avg %llu ms, max %u ms, target %d ms)",
+            "avg %llu ms, max %u ms, target %d ms; %u text rebuilds)",
             secs, overlayFrames, secs > 0.0 ? overlayFrames / secs : 0.0,
             overlayGapMin == 0xFFFFFFFFu ? 0u : overlayGapMin,
             (unsigned long long)(overlayGapCount ? overlayGapSum / overlayGapCount : 0),
-            overlayGapMax, overlayIntervalMs);
+            overlayGapMax, overlayIntervalMs, overlayBaseRebuilds);
+
+        // Every frame we present is fully redrawn, so a presented frame cannot be
+        // missing the bar. If the device presented MORE times than we did, those
+        // extra frames came from somewhere else and are what flickers.
+        unsigned devPresents = pipelinekeys::DevicePresentCount() - presentsAtStart;
+        if (devPresents > overlayFrames + 2)
+            Log("FLICKER SOURCE: device presented %u times during the pass but the overlay only "
+                "drew %u of them - %u frames came from elsewhere",
+                devPresents, overlayFrames, devPresents - overlayFrames);
+        else
+            Log("presents accounted for: %u device presents vs %u overlay frames - nothing else "
+                "is presenting during the pass", devPresents, overlayFrames);
         dev->Release();
         dev = nullptr;
     }

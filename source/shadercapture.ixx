@@ -358,6 +358,18 @@ class ShaderCapture
     static inline PFN_CreatePixelShader  origCreatePS = nullptr;
     static inline bool shaderHooksInstalled = false;
 
+    // Counted so the precompiler can tell whether anything other than its own
+    // overlay is presenting during the warming pass.
+    using PFN_Present = HRESULT(WINAPI*)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+    static inline PFN_Present origPresent = nullptr;
+
+    static HRESULT WINAPI Hook_Present(IDirect3DDevice9* self, const RECT* src, const RECT* dst,
+                                       HWND wnd, const RGNDATA* dirty)
+    {
+        pipelinekeys::DevicePresentCount()++;
+        return origPresent(self, src, dst, wnd, dirty);
+    }
+
     static HRESULT WINAPI Hook_CreateVertexShader(IDirect3DDevice9* self, const DWORD* fn, IDirect3DVertexShader9** out)
     {
         HRESULT hr = origCreateVS(self, fn, out);
@@ -387,6 +399,7 @@ class ShaderCapture
     static constexpr int kVT_DrawIndexedPrimitiveUP = 84;
     static constexpr int kVT_CreateVertexShader     = 91;
     static constexpr int kVT_CreatePixelShader      = 106;
+    static constexpr int kVT_Present                = 17;
 
     static bool PatchSlot(void** vtbl, int index, void* fn, void** outOrig)
     {
@@ -405,7 +418,8 @@ class ShaderCapture
         if (shaderHooksInstalled) return;
         auto vtbl = *reinterpret_cast<void***>(d);
         bool ok = PatchSlot(vtbl, kVT_CreateVertexShader, (void*)&Hook_CreateVertexShader, (void**)&origCreateVS)
-               && PatchSlot(vtbl, kVT_CreatePixelShader,  (void*)&Hook_CreatePixelShader,  (void**)&origCreatePS);
+               && PatchSlot(vtbl, kVT_CreatePixelShader,  (void*)&Hook_CreatePixelShader,  (void**)&origCreatePS)
+               && PatchSlot(vtbl, kVT_Present,            (void*)&Hook_Present,            (void**)&origPresent);
         shaderHooksInstalled = ok;
         Log(ok ? "shader registry armed on device %p" : "FAILED to patch the shader-creation slots on %p", d);
     }

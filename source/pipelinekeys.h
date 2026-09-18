@@ -244,6 +244,20 @@ namespace pipelinekeys
         return r;
     }
 
+    // Every Present on the device, counted at the vtable.
+    //
+    // The progress overlay redraws itself completely each frame -- full-screen
+    // backdrop blit, bar, text -- so a frame it presents cannot be missing the bar.
+    // If the bar still flickers, some OTHER present is reaching the screen between
+    // ours, showing a frame we never drew. Comparing this against the overlay's own
+    // frame count says whether that is happening, which no amount of staring at the
+    // overlay code can.
+    inline unsigned& DevicePresentCount()
+    {
+        static unsigned n = 0;
+        return n;
+    }
+
     // Hash a shader the same way the capture does: from the bytes GetFunction
     // returns, never from the caller's pointer, so the two can never disagree.
     template <typename T>
