@@ -1096,26 +1096,33 @@ public:
 
             // Fix the date going backwards when dying or getting busted between 12pm and 11pm, and respraying between 9pm and 11:59pm (https://github.com/GTAmodding/GTAIV-Issues-List/issues/164)
             {
-                auto pattern = hook::pattern("6A ? 53 55 56");
-                if (!pattern.empty())
+                // Both forms are patched in place, so the pattern MUST identify exactly one
+                // site. "6A ? 53 55 56" is five bytes with a wildcard and matches in several
+                // unrelated places in 1.2.0.59; patching match #0 corrupted live code and the
+                // game died at startup reading a bogus address. Neither existing guard catches
+                // that: empty() only asks whether a pattern matched *anywhere*, and
+                // get_first() -> count(1) is assert_err_policy, a no-op under NDEBUG. So
+                // require a unique match, and try the long unambiguous form first.
+                auto specific = hook::pattern("6A ? 56 53 55 E8 ? ? ? ? 69 FF");
+                auto generic = hook::pattern("6A ? 53 55 56");
+
+                if (specific.size() == 1)
                 {
-                    uint8_t* ptr = (uint8_t*)pattern.get_first(0);
-
-                    injector::scoped_unprotect protect{ ptr, 3 };
-
-                    ptr[0] = 0x53; // Push day register
-                    ptr[1] = 0x6A;
-                    ptr[2] = 0xFF;
-                }
-                else
-                {
-                    pattern = hook::pattern("6A ? 56 53 55 E8 ? ? ? ? 69 FF");
-
-                    uint8_t* ptr = (uint8_t*)pattern.get_first(0);
+                    uint8_t* ptr = (uint8_t*)specific.get_first(0);
 
                     injector::scoped_unprotect protect{ ptr, 3 };
 
                     ptr[0] = 0x56; // Push day register
+                    ptr[1] = 0x6A;
+                    ptr[2] = 0xFF;
+                }
+                else if (generic.size() == 1)
+                {
+                    uint8_t* ptr = (uint8_t*)generic.get_first(0);
+
+                    injector::scoped_unprotect protect{ ptr, 3 };
+
+                    ptr[0] = 0x53; // Push day register
                     ptr[1] = 0x6A;
                     ptr[2] = 0xFF;
                 }
