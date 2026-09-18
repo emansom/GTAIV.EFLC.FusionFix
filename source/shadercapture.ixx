@@ -1,0 +1,693 @@
+module;
+
+// ===========================================================================
+// shadercapture.ixx  —  D3D9 draw-call pipeline-key CAPTURE
+//
+// WHY THIS EXISTS
+//   The launch-time precompiler (shaderprecompile.ixx) issues SYNTHETIC draws:
+//   a position-only vertex declaration into its own scratch render targets with
+//   a hand-written matrix of blend/spec variants. Measured on Linux/DXVK with
+//   graphics-pipeline-library disabled, that bought nothing (59 isolated frame
+//   spikes with it ON vs 55 with it OFF) because a pipeline is keyed on the FULL
+//   state vector, and our synthetic state matches the game's in almost none of
+//   those fields. The pipelines we built were different OBJECTS from the ones
+//   gameplay needs. See re/shader-precompile/RESULTS-linux-ab.md.
+//
+//   So: stop guessing the keys, record them. This module hooks the four D3D9
+//   Draw* entry points on the REAL device — deliberately below RAGE, because
+//   this is exactly the boundary DXVK (and native D3D9) key their pipelines on —
+//   and writes every distinct key it sees to a cache file. A later replay pass
+//   rebuilds those exact states before gameplay, so the warm-up draws produce the
+//   SAME pipeline keys as the game rather than lookalikes.
+//
+// WHAT A KEY IS
+//   vertex + pixel shader bytecode hash · vertex declaration (or FVF) ·
+//   primitive topology · render-target formats 0..3 + depth format ·
+//   the pipeline-relevant render-state block · the TYPE of texture bound to
+//   each sampler (2D/CUBE/VOLUME — DXVK folds sampler dimensions into SPIR-V
+//   specialisation constants, so a mismatch there is a different pipeline).
+//
+// COST / CORRECTNESS TRADE
+//   Every field is read back from the device on every draw rather than shadowed
+//   from Set* hooks. Shadowing is much cheaper but silently drifts the moment a
+//   state block is Applied (RAGE uses them), and a wrong key here would recreate
+//   the exact failure this work exists to escape. Capture is an opt-in authoring
+//   mode, not a shipping per-frame cost, so it buys correctness with frame time.
+//
+// USAGE  (plugins/GTAIV.EFLC.FusionFix.ini)
+//   [SHADERS]
+//   CaptureDrawKeys = 1      ; record keys while you play, then quit normally
+//   Leave PrecompileShaders = 0 during a capture run, or the precompiler's own
+//   synthetic draws land in the cache as if the game had issued them.
+//
+// OUTPUT (next to the .asi)
+//   FusionFix.pipelinekeys.bin  versioned binary, for the replay pass
+//   FusionFix.pipelinekeys.txt  human-readable summary + histograms
+// ===========================================================================
+
+#include <common.hxx>
+#include <d3d9.h>
+#include <cstdarg>
+#include <cstddef>
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <chrono>
+#include <algorithm>
+
+export module shadercapture;
+
+import common;
+import comvars;
+
+// ---------------------------------------------------------------------------
+// Key layout
+// ---------------------------------------------------------------------------
+static constexpr uint32_t kMaxRT       = 4;
+static constexpr uint32_t kPSSamplers  = 16;   // s0..s15
+static constexpr uint32_t kVSSamplers  = 4;    // D3DVERTEXTEXTURESAMPLER0..3
+static constexpr uint32_t kNumSamplers = kPSSamplers + kVSSamplers;
+
+// The render states we record. `pipeline` marks the ones that (as far as we can
+// tell from DXVK's d3d9 backend) are baked into the Vulkan pipeline rather than
+// set dynamically. Everything is recorded either way — the flag only splits the
+// two histograms in the summary, so we can see how much of the key-space is real
+// pipeline variation and how much is dynamic state we could ignore.
+struct RSDef { D3DRENDERSTATETYPE rs; const char* name; bool pipeline; };
+
+static constexpr RSDef kTrackedRS[] = {
+    { D3DRS_ZENABLE,                  "ZENABLE",                  true  },
+    { D3DRS_ZWRITEENABLE,             "ZWRITEENABLE",             true  },
+    { D3DRS_ZFUNC,                    "ZFUNC",                    true  },
+    { D3DRS_ALPHATESTENABLE,          "ALPHATESTENABLE",          true  },
+    { D3DRS_ALPHAFUNC,                "ALPHAFUNC",                true  },
+    { D3DRS_ALPHAREF,                 "ALPHAREF",                 false },  // dynamic
+    { D3DRS_ALPHABLENDENABLE,         "ALPHABLENDENABLE",         true  },
+    { D3DRS_SRCBLEND,                 "SRCBLEND",                 true  },
+    { D3DRS_DESTBLEND,                "DESTBLEND",                true  },
+    { D3DRS_BLENDOP,                  "BLENDOP",                  true  },
+    { D3DRS_SEPARATEALPHABLENDENABLE, "SEPARATEALPHABLENDENABLE", true  },
+    { D3DRS_SRCBLENDALPHA,            "SRCBLENDALPHA",            true  },
+    { D3DRS_DESTBLENDALPHA,           "DESTBLENDALPHA",           true  },
+    { D3DRS_BLENDOPALPHA,             "BLENDOPALPHA",             true  },
+    { D3DRS_COLORWRITEENABLE,         "COLORWRITEENABLE",         true  },
+    { D3DRS_COLORWRITEENABLE1,        "COLORWRITEENABLE1",        true  },
+    { D3DRS_COLORWRITEENABLE2,        "COLORWRITEENABLE2",        true  },
+    { D3DRS_COLORWRITEENABLE3,        "COLORWRITEENABLE3",        true  },
+    { D3DRS_CULLMODE,                 "CULLMODE",                 true  },
+    { D3DRS_FILLMODE,                 "FILLMODE",                 true  },
+    { D3DRS_SHADEMODE,                "SHADEMODE",                true  },
+    { D3DRS_STENCILENABLE,            "STENCILENABLE",            true  },
+    { D3DRS_TWOSIDEDSTENCILMODE,      "TWOSIDEDSTENCILMODE",      true  },
+    { D3DRS_STENCILFUNC,              "STENCILFUNC",              true  },
+    { D3DRS_STENCILFAIL,              "STENCILFAIL",              true  },
+    { D3DRS_STENCILZFAIL,             "STENCILZFAIL",             true  },
+    { D3DRS_STENCILPASS,              "STENCILPASS",              true  },
+    { D3DRS_STENCILREF,               "STENCILREF",               false },  // dynamic
+    { D3DRS_STENCILMASK,              "STENCILMASK",              false },  // dynamic
+    { D3DRS_STENCILWRITEMASK,         "STENCILWRITEMASK",         false },  // dynamic
+    { D3DRS_CCW_STENCILFUNC,          "CCW_STENCILFUNC",          true  },
+    { D3DRS_CCW_STENCILFAIL,          "CCW_STENCILFAIL",          true  },
+    { D3DRS_CCW_STENCILZFAIL,         "CCW_STENCILZFAIL",         true  },
+    { D3DRS_CCW_STENCILPASS,          "CCW_STENCILPASS",          true  },
+    { D3DRS_FOGENABLE,                "FOGENABLE",                true  },
+    { D3DRS_FOGTABLEMODE,             "FOGTABLEMODE",             true  },
+    { D3DRS_FOGVERTEXMODE,            "FOGVERTEXMODE",            true  },
+    { D3DRS_RANGEFOGENABLE,           "RANGEFOGENABLE",           true  },
+    { D3DRS_CLIPPLANEENABLE,          "CLIPPLANEENABLE",          true  },
+    { D3DRS_CLIPPING,                 "CLIPPING",                 true  },
+    { D3DRS_MULTISAMPLEANTIALIAS,     "MULTISAMPLEANTIALIAS",     true  },
+    { D3DRS_MULTISAMPLEMASK,          "MULTISAMPLEMASK",          true  },
+    { D3DRS_POINTSPRITEENABLE,        "POINTSPRITEENABLE",        true  },
+    { D3DRS_POINTSCALEENABLE,         "POINTSCALEENABLE",         true  },
+    { D3DRS_LIGHTING,                 "LIGHTING",                 true  },
+    { D3DRS_COLORVERTEX,              "COLORVERTEX",              true  },
+    { D3DRS_SPECULARENABLE,           "SPECULARENABLE",           true  },
+    { D3DRS_NORMALIZENORMALS,         "NORMALIZENORMALS",         true  },
+    { D3DRS_DIFFUSEMATERIALSOURCE,    "DIFFUSEMATERIALSOURCE",    true  },
+    { D3DRS_SPECULARMATERIALSOURCE,   "SPECULARMATERIALSOURCE",   true  },
+    { D3DRS_AMBIENTMATERIALSOURCE,    "AMBIENTMATERIALSOURCE",    true  },
+    { D3DRS_EMISSIVEMATERIALSOURCE,   "EMISSIVEMATERIALSOURCE",   true  },
+    { D3DRS_VERTEXBLEND,              "VERTEXBLEND",              true  },
+    { D3DRS_INDEXEDVERTEXBLENDENABLE, "INDEXEDVERTEXBLENDENABLE", true  },
+    { D3DRS_SRGBWRITEENABLE,          "SRGBWRITEENABLE",          true  },
+    { D3DRS_DEPTHBIAS,                "DEPTHBIAS",                false },  // dynamic
+    { D3DRS_SLOPESCALEDEPTHBIAS,      "SLOPESCALEDEPTHBIAS",      false },  // dynamic
+    { D3DRS_SCISSORTESTENABLE,        "SCISSORTESTENABLE",        false },  // dynamic
+};
+static constexpr uint32_t kNumRS = (uint32_t)(sizeof(kTrackedRS) / sizeof(kTrackedRS[0]));
+
+// One recorded draw state. Fully self-describing: replay must be able to rebuild
+// the state from this alone, so nothing here is a hash except the shaders (which
+// are matched back to the .fxc database by bytecode hash) and the declaration
+// (which is stored out-of-line in a table, indexed from here).
+#pragma pack(push, 1)
+struct KeyRecord
+{
+    uint64_t vsHash;                 // FNV-1a of VS bytecode, 0 = no VS bound
+    uint64_t psHash;                 // FNV-1a of PS bytecode, 0 = no PS bound
+    uint32_t declIndex;              // index into the declaration table, 0xFFFFFFFF = FVF path
+    uint32_t fvf;                    // only meaningful when declIndex == 0xFFFFFFFF
+    uint32_t primType;               // D3DPRIMITIVETYPE
+    uint32_t upDraw;                 // 1 if this came from a Draw*PrimitiveUP
+    uint32_t rtFmt[kMaxRT];          // D3DFORMAT per bound RT, 0 = unbound
+    uint32_t dsFmt;                  // D3DFORMAT of the depth/stencil surface, 0 = none
+    uint32_t rs[kNumRS];             // values of kTrackedRS, in order
+    uint8_t  samplerType[kNumSamplers]; // 0 none, 1 = 2D, 2 = CUBE, 3 = VOLUME
+    uint32_t count;                  // how many draws hit this key
+    uint32_t firstFrame;             // frame ordinal of first sighting
+};
+#pragma pack(pop)
+
+// ---------------------------------------------------------------------------
+class ShaderCapture
+{
+    // ---- config -------------------------------------------------------
+    static inline bool enabled = false;
+    static inline int  flushSeconds = 10;
+
+    // ---- hook state ---------------------------------------------------
+    using PFN_DrawPrimitive          = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
+    using PFN_DrawIndexedPrimitive   = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+    using PFN_DrawPrimitiveUP        = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
+    using PFN_DrawIndexedPrimitiveUP = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT, UINT, const void*, D3DFORMAT, const void*, UINT);
+
+    static inline PFN_DrawPrimitive          origDP   = nullptr;
+    static inline PFN_DrawIndexedPrimitive   origDIP  = nullptr;
+    static inline PFN_DrawPrimitiveUP        origDPUP = nullptr;
+    static inline PFN_DrawIndexedPrimitiveUP origDIPUP = nullptr;
+
+    static inline IDirect3DDevice9* dev = nullptr;
+    static inline bool installed = false;
+
+    // A D3D9 device created without D3DCREATE_MULTITHREADED is not free-threaded, so
+    // the game has to serialise its own draws — but GTA IV does run a separate
+    // loading-screen thread (Ghidra: the pump at 0x008da240 has its own thread entry
+    // at 0x008da370), and a torn read of `records`/`keyIndex` would crash rather than
+    // just lose a key. An uncontended critical section costs far less than the ~60
+    // interface calls each RecordDraw already makes, so guard rather than assume.
+    static inline CRITICAL_SECTION lock{};
+    static inline bool lockReady = false;
+
+    // ---- capture state ------------------------------------------------
+    static inline std::vector<KeyRecord> records;
+    static inline std::unordered_map<uint64_t, uint32_t> keyIndex;   // strict key hash -> record index
+
+    // declaration table: each entry is the raw D3DVERTEXELEMENT9 array incl. the END marker
+    static inline std::vector<std::vector<D3DVERTEXELEMENT9>> declTable;
+    static inline std::unordered_map<uint64_t, uint32_t> declIndexByHash;
+
+    // memoised bytecode hashes. Keyed on {pointer, byte size} rather than pointer
+    // alone so a freed shader whose address is reused cannot silently inherit the
+    // previous shader's hash (sizes would have to match too).
+    static inline std::unordered_map<uint64_t, uint64_t> shaderHashCache;
+
+    static inline uint64_t totalDraws = 0;
+    static inline uint64_t frameOrdinal = 0;
+    static inline uint32_t lastReportedUnique = 0;
+    static inline bool dirty = false;
+    static inline std::chrono::steady_clock::time_point tLastFlush;
+
+    static inline HMODULE hSelf = nullptr;
+
+    // -------------------------------------------------------------------
+    static void Log(const char* fmt, ...)
+    {
+        char buf[512];
+        va_list ap; va_start(ap, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        OutputDebugStringA("[ShaderCapture] ");
+        OutputDebugStringA(buf);
+        OutputDebugStringA("\n");
+    }
+
+    static inline uint64_t fnv1a(const void* data, size_t len, uint64_t h = 1469598103934665603ull)
+    {
+        auto p = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < len; i++) { h ^= p[i]; h *= 1099511628211ull; }
+        return h;
+    }
+
+    // ---- device acquisition (same ladder the precompiler uses) --------
+    static IDirect3DDevice9* AcquireDevice()
+    {
+        if (RageDirect3DDevice9::m_pRealDevice && *RageDirect3DDevice9::m_pRealDevice)
+            return *RageDirect3DDevice9::m_pRealDevice;
+        if (rage::grcDevice::ms_pD3DDevice && *rage::grcDevice::ms_pD3DDevice)
+            return *rage::grcDevice::ms_pD3DDevice;
+        return nullptr;
+    }
+
+    // ---- bytecode / declaration identity ------------------------------
+    // Both are cached: hashing a shader means copying its whole token stream, and
+    // GTA IV re-binds the same few thousand shaders tens of thousands of times a
+    // frame. GetFunction/GetDeclaration with a null buffer only returns the size,
+    // which is a trivial read on both native D3D9 and DXVK.
+    template <typename T>
+    static uint64_t ShaderHash(T* shader)
+    {
+        if (!shader) return 0;
+
+        UINT size = 0;
+        if (FAILED(shader->GetFunction(nullptr, &size)) || size == 0) return 0;
+
+        uint64_t cacheKey = ((uint64_t)(uintptr_t)shader) ^ ((uint64_t)size << 48);
+        auto it = shaderHashCache.find(cacheKey);
+        if (it != shaderHashCache.end()) return it->second;
+
+        std::vector<uint8_t> code(size);
+        if (FAILED(shader->GetFunction(code.data(), &size))) return 0;
+
+        uint64_t h = fnv1a(code.data(), size);
+        shaderHashCache.emplace(cacheKey, h);
+        return h;
+    }
+
+    static uint32_t DeclarationIndex(IDirect3DVertexDeclaration9* decl)
+    {
+        if (!decl) return 0xFFFFFFFFu;
+
+        UINT count = 0;
+        if (FAILED(decl->GetDeclaration(nullptr, &count)) || count == 0) return 0xFFFFFFFFu;
+
+        std::vector<D3DVERTEXELEMENT9> elems(count);
+        if (FAILED(decl->GetDeclaration(elems.data(), &count))) return 0xFFFFFFFFu;
+        elems.resize(count);
+
+        uint64_t h = fnv1a(elems.data(), elems.size() * sizeof(D3DVERTEXELEMENT9));
+        auto it = declIndexByHash.find(h);
+        if (it != declIndexByHash.end()) return it->second;
+
+        uint32_t idx = (uint32_t)declTable.size();
+        declTable.push_back(std::move(elems));
+        declIndexByHash.emplace(h, idx);
+        return idx;
+    }
+
+    static uint32_t SurfaceFormat(IDirect3DSurface9* surf)
+    {
+        if (!surf) return 0;
+        D3DSURFACE_DESC d{};
+        if (FAILED(surf->GetDesc(&d))) return 0;
+        return (uint32_t)d.Format;
+    }
+
+    static uint8_t SamplerKind(DWORD stage)
+    {
+        IDirect3DBaseTexture9* tex = nullptr;
+        if (FAILED(dev->GetTexture(stage, &tex)) || !tex) return 0;
+        D3DRESOURCETYPE t = tex->GetType();
+        tex->Release();
+        switch (t)
+        {
+        case D3DRTYPE_TEXTURE:       return 1;
+        case D3DRTYPE_CUBETEXTURE:   return 2;
+        case D3DRTYPE_VOLUMETEXTURE: return 3;
+        default:                     return 0;
+        }
+    }
+
+    // ---- the actual capture -------------------------------------------
+    static void RecordDraw(D3DPRIMITIVETYPE primType, bool up)
+    {
+        if (!dev || !lockReady) return;
+
+        // Held across the whole body: the shader/declaration memo tables are mutated
+        // during key construction, not just at insert time.
+        EnterCriticalSection(&lock);
+
+        KeyRecord k{};
+        k.primType = (uint32_t)primType;
+        k.upDraw   = up ? 1u : 0u;
+
+        IDirect3DVertexShader9* vs = nullptr;
+        IDirect3DPixelShader9*  ps = nullptr;
+        if (SUCCEEDED(dev->GetVertexShader(&vs)) && vs) { k.vsHash = ShaderHash(vs); vs->Release(); }
+        if (SUCCEEDED(dev->GetPixelShader(&ps)) && ps)  { k.psHash = ShaderHash(ps); ps->Release(); }
+
+        IDirect3DVertexDeclaration9* decl = nullptr;
+        if (SUCCEEDED(dev->GetVertexDeclaration(&decl)) && decl)
+        {
+            k.declIndex = DeclarationIndex(decl);
+            decl->Release();
+        }
+        else
+        {
+            k.declIndex = 0xFFFFFFFFu;
+        }
+        if (k.declIndex == 0xFFFFFFFFu)
+            dev->GetFVF((DWORD*)&k.fvf);
+
+        for (uint32_t i = 0; i < kMaxRT; i++)
+        {
+            IDirect3DSurface9* rt = nullptr;
+            // An unbound RT index legitimately fails; that is what rtFmt == 0 means.
+            if (SUCCEEDED(dev->GetRenderTarget(i, &rt)) && rt) { k.rtFmt[i] = SurfaceFormat(rt); rt->Release(); }
+        }
+        {
+            IDirect3DSurface9* ds = nullptr;
+            if (SUCCEEDED(dev->GetDepthStencilSurface(&ds)) && ds) { k.dsFmt = SurfaceFormat(ds); ds->Release(); }
+        }
+
+        for (uint32_t i = 0; i < kNumRS; i++)
+        {
+            DWORD v = 0;
+            dev->GetRenderState(kTrackedRS[i].rs, &v);
+            k.rs[i] = (uint32_t)v;
+        }
+
+        for (uint32_t i = 0; i < kPSSamplers; i++)
+            k.samplerType[i] = SamplerKind(i);
+        for (uint32_t i = 0; i < kVSSamplers; i++)
+            k.samplerType[kPSSamplers + i] = SamplerKind(D3DVERTEXTEXTURESAMPLER0 + i);
+
+        // Hash everything except the bookkeeping tail.
+        uint64_t h = fnv1a(&k, offsetof(KeyRecord, count));
+
+        auto it = keyIndex.find(h);
+        if (it != keyIndex.end())
+        {
+            records[it->second].count++;
+        }
+        else
+        {
+            k.count = 1;
+            k.firstFrame = (uint32_t)frameOrdinal;
+            keyIndex.emplace(h, (uint32_t)records.size());
+            records.push_back(k);
+            dirty = true;
+        }
+
+        totalDraws++;
+        LeaveCriticalSection(&lock);
+    }
+
+    // ---- hooks ---------------------------------------------------------
+    static HRESULT WINAPI Hook_DrawPrimitive(IDirect3DDevice9* self, D3DPRIMITIVETYPE pt, UINT startVertex, UINT primCount)
+    {
+        RecordDraw(pt, false);
+        return origDP(self, pt, startVertex, primCount);
+    }
+
+    static HRESULT WINAPI Hook_DrawIndexedPrimitive(IDirect3DDevice9* self, D3DPRIMITIVETYPE pt, INT baseVertexIndex,
+                                                    UINT minVertexIndex, UINT numVertices, UINT startIndex, UINT primCount)
+    {
+        RecordDraw(pt, false);
+        return origDIP(self, pt, baseVertexIndex, minVertexIndex, numVertices, startIndex, primCount);
+    }
+
+    static HRESULT WINAPI Hook_DrawPrimitiveUP(IDirect3DDevice9* self, D3DPRIMITIVETYPE pt, UINT primCount,
+                                               const void* vtxData, UINT vtxStride)
+    {
+        RecordDraw(pt, true);
+        return origDPUP(self, pt, primCount, vtxData, vtxStride);
+    }
+
+    static HRESULT WINAPI Hook_DrawIndexedPrimitiveUP(IDirect3DDevice9* self, D3DPRIMITIVETYPE pt, UINT minVertexIndex,
+                                                      UINT numVertices, UINT primCount, const void* idxData,
+                                                      D3DFORMAT idxFmt, const void* vtxData, UINT vtxStride)
+    {
+        RecordDraw(pt, true);
+        return origDIPUP(self, pt, minVertexIndex, numVertices, primCount, idxData, idxFmt, vtxData, vtxStride);
+    }
+
+    // IDirect3DDevice9 vtable slots (COM layout, fixed by the interface).
+    static constexpr int kVT_DrawPrimitive          = 81;
+    static constexpr int kVT_DrawIndexedPrimitive   = 82;
+    static constexpr int kVT_DrawPrimitiveUP        = 83;
+    static constexpr int kVT_DrawIndexedPrimitiveUP = 84;
+
+    static bool PatchSlot(void** vtbl, int index, void* fn, void** outOrig)
+    {
+        DWORD prot = 0;
+        if (!VirtualProtect(&vtbl[index], sizeof(void*), PAGE_READWRITE, &prot)) return false;
+        *outOrig = vtbl[index];
+        vtbl[index] = fn;
+        VirtualProtect(&vtbl[index], sizeof(void*), prot, &prot);
+        return true;
+    }
+
+    static void Install(IDirect3DDevice9* d)
+    {
+        if (!lockReady) { InitializeCriticalSection(&lock); lockReady = true; }
+
+        auto vtbl = *reinterpret_cast<void***>(d);
+        bool ok = true;
+        ok &= PatchSlot(vtbl, kVT_DrawPrimitive,          (void*)&Hook_DrawPrimitive,          (void**)&origDP);
+        ok &= PatchSlot(vtbl, kVT_DrawIndexedPrimitive,   (void*)&Hook_DrawIndexedPrimitive,   (void**)&origDIP);
+        ok &= PatchSlot(vtbl, kVT_DrawPrimitiveUP,        (void*)&Hook_DrawPrimitiveUP,        (void**)&origDPUP);
+        ok &= PatchSlot(vtbl, kVT_DrawIndexedPrimitiveUP, (void*)&Hook_DrawIndexedPrimitiveUP, (void**)&origDIPUP);
+
+        if (!ok) { Log("FAILED to patch the Draw* vtable slots on device %p", d); return; }
+
+        dev = d;
+        installed = true;
+        tLastFlush = std::chrono::steady_clock::now();
+        Log("capturing draw keys on device %p (vtable %p), EndScene thread = %lu",
+            d, vtbl, GetCurrentThreadId());
+    }
+
+    // ---- output --------------------------------------------------------
+    static std::string OutPath(const char* leaf)
+    {
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(hSelf, path, MAX_PATH);
+        std::string s(path);
+        auto slash = s.find_last_of("\\/");
+        s = (slash == std::string::npos) ? std::string() : s.substr(0, slash + 1);
+        return s + leaf;
+    }
+
+    static void WriteBinary()
+    {
+        FILE* f = fopen(OutPath("FusionFix.pipelinekeys.bin").c_str(), "wb");
+        if (!f) return;
+
+        const uint32_t magic = 0x4B504646; // 'FFPK'
+        const uint32_t version = 1;
+        const uint32_t recCount = (uint32_t)records.size();
+        const uint32_t declCount = (uint32_t)declTable.size();
+        const uint32_t numRS = kNumRS;
+        const uint32_t numSamplers = kNumSamplers;
+
+        fwrite(&magic, 4, 1, f);
+        fwrite(&version, 4, 1, f);
+        fwrite(&numRS, 4, 1, f);
+        fwrite(&numSamplers, 4, 1, f);
+        fwrite(&declCount, 4, 1, f);
+        fwrite(&recCount, 4, 1, f);
+
+        // Which render states the records carry, so a reader never has to guess.
+        for (uint32_t i = 0; i < kNumRS; i++)
+        {
+            uint32_t rs = (uint32_t)kTrackedRS[i].rs;
+            fwrite(&rs, 4, 1, f);
+        }
+
+        for (auto& d : declTable)
+        {
+            uint32_t n = (uint32_t)d.size();
+            fwrite(&n, 4, 1, f);
+            fwrite(d.data(), sizeof(D3DVERTEXELEMENT9), n, f);
+        }
+
+        if (recCount) fwrite(records.data(), sizeof(KeyRecord), recCount, f);
+        fclose(f);
+    }
+
+    // Count distinct keys under a reduced field set, so we can tell genuine
+    // pipeline variation apart from dynamic state that inflates the strict key.
+    static uint32_t CountReducedKeys()
+    {
+        std::vector<uint64_t> hashes;
+        hashes.reserve(records.size());
+        for (auto& r : records)
+        {
+            KeyRecord t = r;
+            for (uint32_t i = 0; i < kNumRS; i++)
+                if (!kTrackedRS[i].pipeline) t.rs[i] = 0;
+            t.upDraw = 0;
+            t.count = 0; t.firstFrame = 0;
+            hashes.push_back(fnv1a(&t, offsetof(KeyRecord, count)));
+        }
+        std::sort(hashes.begin(), hashes.end());
+        hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
+        return (uint32_t)hashes.size();
+    }
+
+    static void WriteSummary()
+    {
+        FILE* f = fopen(OutPath("FusionFix.pipelinekeys.txt").c_str(), "w");
+        if (!f) return;
+
+        fprintf(f, "FusionFix D3D9 pipeline-key capture\n");
+        fprintf(f, "===================================\n\n");
+        fprintf(f, "draws recorded      : %llu\n", (unsigned long long)totalDraws);
+        fprintf(f, "frames              : %llu\n", (unsigned long long)frameOrdinal);
+        fprintf(f, "unique strict keys  : %u   (every recorded field)\n", (uint32_t)records.size());
+        fprintf(f, "unique pipeline keys: %u   (dynamic state folded out)\n", CountReducedKeys());
+        fprintf(f, "vertex declarations : %u\n", (uint32_t)declTable.size());
+
+        // distinct shader pairs, and distinct shaders
+        {
+            std::vector<uint64_t> pairs, vss, pss;
+            for (auto& r : records)
+            {
+                pairs.push_back(r.vsHash ^ (r.psHash * 1099511628211ull));
+                vss.push_back(r.vsHash);
+                pss.push_back(r.psHash);
+            }
+            auto uniq = [](std::vector<uint64_t>& v) {
+                std::sort(v.begin(), v.end());
+                v.erase(std::unique(v.begin(), v.end()), v.end());
+                return (uint32_t)v.size();
+            };
+            fprintf(f, "distinct VS         : %u\n", uniq(vss));
+            fprintf(f, "distinct PS         : %u\n", uniq(pss));
+            fprintf(f, "distinct VS/PS pairs: %u\n", uniq(pairs));
+        }
+
+        // render-target format combinations
+        {
+            std::vector<uint64_t> combos;
+            for (auto& r : records)
+            {
+                uint64_t h = fnv1a(r.rtFmt, sizeof(r.rtFmt));
+                h = fnv1a(&r.dsFmt, sizeof(r.dsFmt), h);
+                combos.push_back(h);
+            }
+            std::sort(combos.begin(), combos.end());
+            combos.erase(std::unique(combos.begin(), combos.end()), combos.end());
+            fprintf(f, "RT/depth combos     : %u\n", (uint32_t)combos.size());
+        }
+
+        fprintf(f, "\n-- how many render states actually vary --\n");
+        for (uint32_t i = 0; i < kNumRS; i++)
+        {
+            std::vector<uint32_t> vals;
+            for (auto& r : records) vals.push_back(r.rs[i]);
+            std::sort(vals.begin(), vals.end());
+            vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
+            if (vals.size() > 1)
+            {
+                fprintf(f, "  %-26s %2u values :", kTrackedRS[i].name, (uint32_t)vals.size());
+                for (size_t v = 0; v < vals.size() && v < 12; v++) fprintf(f, " %u", vals[v]);
+                if (vals.size() > 12) fprintf(f, " ...");
+                fprintf(f, "%s\n", kTrackedRS[i].pipeline ? "" : "   [dynamic]");
+            }
+        }
+
+        fprintf(f, "\n-- top 40 keys by draw count --\n");
+        std::vector<uint32_t> order(records.size());
+        for (uint32_t i = 0; i < order.size(); i++) order[i] = i;
+        std::sort(order.begin(), order.end(), [](uint32_t a, uint32_t b) { return records[a].count > records[b].count; });
+        for (size_t i = 0; i < order.size() && i < 40; i++)
+        {
+            auto& r = records[order[i]];
+            fprintf(f, "  %8u draws  vs=%016llx ps=%016llx decl=%d fvf=%u prim=%u rt0=%u ds=%u frame=%u\n",
+                    r.count, (unsigned long long)r.vsHash, (unsigned long long)r.psHash,
+                    (int)r.declIndex, r.fvf, r.primType, r.rtFmt[0], r.dsFmt, r.firstFrame);
+        }
+
+        fprintf(f, "\n-- vertex declarations --\n");
+        for (size_t i = 0; i < declTable.size(); i++)
+        {
+            fprintf(f, "  [%zu] %zu elements:", i, declTable[i].size());
+            for (auto& e : declTable[i])
+            {
+                if (e.Stream == 0xFF) { fprintf(f, " END"); break; }
+                fprintf(f, " (s%u+%u t%u u%u%u)", e.Stream, e.Offset, e.Type, e.Usage, e.UsageIndex);
+            }
+            fprintf(f, "\n");
+        }
+
+        fclose(f);
+    }
+
+    static void Flush(bool force)
+    {
+        if (!enabled || (!dirty && !force)) return;
+
+        auto now = std::chrono::steady_clock::now();
+        if (!force && std::chrono::duration_cast<std::chrono::seconds>(now - tLastFlush).count() < flushSeconds)
+            return;
+
+        // Writing walks the same tables RecordDraw mutates, and runs on a different
+        // thread (EndScene) than the loading-screen draws.
+        if (lockReady) EnterCriticalSection(&lock);
+        WriteBinary();
+        WriteSummary();
+        if (lockReady) LeaveCriticalSection(&lock);
+
+        tLastFlush = now;
+        dirty = false;
+
+        if ((uint32_t)records.size() != lastReportedUnique)
+        {
+            Log("%llu draws, %u unique keys, %u declarations",
+                (unsigned long long)totalDraws, (uint32_t)records.size(), (uint32_t)declTable.size());
+            lastReportedUnique = (uint32_t)records.size();
+        }
+    }
+
+    static void ReadConfig()
+    {
+        CIniReader ini("");
+        enabled      = ini.ReadInteger("SHADERS", "CaptureDrawKeys", 0) != 0;
+        flushSeconds = ini.ReadInteger("SHADERS", "CaptureFlushSeconds", 10);
+        if (flushSeconds < 1) flushSeconds = 1;
+    }
+
+public:
+    ShaderCapture()
+    {
+        FusionFix::onInitEvent() += []()
+        {
+            ReadConfig();
+            if (!enabled) return;
+
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)&ReadConfig, &hSelf);
+
+            records.reserve(8192);
+            Log("armed (flush every %ds) - waiting for the device", flushSeconds);
+        };
+
+        // Install lazily on the render thread: by the first EndScene the device
+        // exists and nothing is mid-draw, so swapping vtable slots is safe.
+        FusionFix::onEndScene() += []()
+        {
+            if (!enabled) return;
+
+            frameOrdinal++;
+
+            if (!installed)
+            {
+                if (auto d = AcquireDevice()) Install(d);
+                return;
+            }
+
+            // A device recreation would leave us hooked to a dead vtable. GTA IV
+            // resets rather than recreates, but check cheaply rather than assume.
+            if (auto d = AcquireDevice(); d && d != dev)
+            {
+                Log("device changed %p -> %p, re-installing", dev, d);
+                installed = false;
+                return;
+            }
+
+            Flush(false);
+        };
+
+        FusionFix::onShutdownEvent() += []()
+        {
+            if (!enabled) return;
+            Flush(true);
+            Log("final: %llu draws, %u unique keys", (unsigned long long)totalDraws, (uint32_t)records.size());
+        };
+    }
+} ShaderCapture;

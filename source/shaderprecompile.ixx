@@ -90,6 +90,7 @@ struct PrecompileConfig
     bool    overlay       = true;   // PrecompileOverlay
     bool    coverSdr      = false;  // PrecompileCoverSdr: also cover stock A8R8G8B8/A2B10G10R10 scene formats
     bool    coverPresent  = true;   // PrecompileCoverPresentModes: cover both PQ(10-bit) and scRGB(fp16) present formats
+    int     flashProbe    = 0;      // PrecompileFlashProbe: see the probe note below (0 = off, N = flash every Nth loadscreen frame)
 };
 
 // ===========================================================================
@@ -1126,10 +1127,69 @@ class ShaderPrecompiler
         return stableFrames >= kStableFramesNeeded;
     }
 
+    // ---- probe: does the game present what we draw? ---------------------
+    // The incremental stepper (831a527, reverted in ab9c958) assumed that if we
+    // draw after the game's own loadscreen render and let the GAME present, our
+    // pixels reach the screen. They never appeared. Before rebuilding the stepper
+    // on that assumption, test it directly rather than reasoning about it: clear
+    // the CURRENT render target to magenta every Nth loadscreen frame and present
+    // nothing ourselves. If the loading screen flashes, the assumption holds and
+    // the stepper's bug is in its work loop; if it never flashes, the loading
+    // screen is composited somewhere we are not drawing and the overlay needs a
+    // different target. Either answer kills a whole branch of guesswork.
+    static void FlashProbe()
+    {
+        static int  calls = 0;
+        static bool describedRT = false;
+
+        IDirect3DDevice9* d = AcquireDevice();
+        if (!d) return;
+
+        if (!describedRT)
+        {
+            describedRT = true;
+
+            // Which thread are we on? shaderprecompile.ixx's PumpMessages() assumes
+            // the loadscreen render callback runs on the thread that pumps the game
+            // window. Ghidra says otherwise: 0x008da370 is a THREAD ENTRY stub that
+            // tails into the pump loop at 0x008da240, so the callback runs on a
+            // dedicated loading-screen thread. One of those is wrong; logging the id
+            // here and in ShaderCapture (which runs on the game's EndScene thread)
+            // settles it without another bisect.
+            Log("probe: loadscreen render callback thread = %lu", GetCurrentThreadId());
+
+            IDirect3DSurface9* rt = nullptr;
+            if (SUCCEEDED(d->GetRenderTarget(0, &rt)) && rt)
+            {
+                D3DSURFACE_DESC sd{};
+                if (SUCCEEDED(rt->GetDesc(&sd)))
+                    Log("probe: RT0 after loadscreen render = %ux%u fmt=%u usage=%u pool=%u",
+                        sd.Width, sd.Height, (uint32_t)sd.Format, sd.Usage, (uint32_t)sd.Pool);
+
+                // Is RT0 the actual back buffer, or an offscreen surface the game
+                // later blits? That distinction is the whole question.
+                IDirect3DSurface9* bb = nullptr;
+                if (SUCCEEDED(d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb)
+                {
+                    Log("probe: RT0 %s the back buffer (rt=%p bb=%p)", (rt == bb) ? "IS" : "is NOT", rt, bb);
+                    bb->Release();
+                }
+                rt->Release();
+            }
+            else
+            {
+                Log("probe: no RT0 bound after the loadscreen render");
+            }
+        }
+
+        if ((calls++ % cfg.flashProbe) == 0)
+            d->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_XRGB(255, 0, 255), 1.0f, 0);
+    }
+
     // ---- injection anchor: FUN_005cc760 (render-thread loadscreen render) -----
     static void __cdecl LoadscreenRenderDetour()
     {
-        if (!finished.load() && !started.load())
+        if (cfg.enabled && !finished.load() && !started.load())
         {
             loadscreenFramesSeen++;
             if (GateReady())
@@ -1142,6 +1202,9 @@ class ShaderPrecompiler
             }
         }
         shLoadscreenRender.call<void>();
+
+        // After the original, so we overwrite what it just drew.
+        if (cfg.flashProbe > 0) FlashProbe();
     }
 
     static void ReadConfig()
@@ -1152,6 +1215,7 @@ class ShaderPrecompiler
         cfg.overlay      = ini.ReadInteger("SHADERS", "PrecompileOverlay", 1) != 0;
         cfg.coverSdr     = ini.ReadInteger("SHADERS", "PrecompileCoverSdr", 0) != 0;
         cfg.coverPresent = ini.ReadInteger("SHADERS", "PrecompileCoverPresentModes", 1) != 0;
+        cfg.flashProbe   = ini.ReadInteger("SHADERS", "PrecompileFlashProbe", 0);
     }
 
 public:
@@ -1160,7 +1224,8 @@ public:
         FusionFix::onInitEvent() += []()
         {
             ReadConfig();
-            if (!cfg.enabled) { Log("disabled via ini"); return; }
+            // The flash probe rides the same hook, so arm for either.
+            if (!cfg.enabled && cfg.flashProbe <= 0) { Log("disabled via ini"); return; }
 
             GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                (LPCWSTR)&RebaseVA, &hSelf);
