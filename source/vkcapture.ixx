@@ -617,7 +617,7 @@ class VkCapture
         { return false; }
     };
 
-    struct Totals { uint32_t files = 0, created = 0, trusted = 0, rejected = 0, failed = 0, already = 0; bool lowVA = false; };
+    struct Totals { uint32_t files = 0, created = 0, trusted = 0, rejected = 0, failed = 0, already = 0, stale = 0; bool lowVA = false; };
 
     // Free virtual address space. GTA IV is a 32-bit process that needs most of its
     // 4 GB itself; the replay must never be what runs it out.
@@ -628,13 +628,16 @@ class VkCapture
     }
     static constexpr uint64_t kMinVA = 768ull << 20;
 
+    // `part` of `parts`: parallel workers each take every parts-th pipeline entry of
+    // the same file, through their own database handle and replayer.
     static void ReplayFile(const std::string& path, VkDevice dev, Device* d, bool own,
-                           std::unordered_set<Fossilize::Hash>& done, Totals& t)
+                           std::unordered_set<Fossilize::Hash>& done, Totals& t,
+                           uint32_t part = 0, uint32_t parts = 1)
     {
         std::unique_ptr<Fossilize::DatabaseInterface> db(
             Fossilize::create_stream_archive_database(path.c_str(), Fossilize::DatabaseMode::ReadOnly));
         if (!db || !db->prepare()) { Log("replay: cannot read %s", path.c_str()); return; }
-        currentFile = path;
+        currentFile = &path;
 
         auto readAll = [&](Fossilize::ResourceTag tag, auto&& fn) {
             size_t count = 0;
@@ -662,11 +665,12 @@ class VkCapture
 
         ReplayCreator creator(dev, d);
         Fossilize::StateReplayer replayer;
-        uint32_t already = 0, parsed = 0, stale = 0;
+        uint32_t already = 0, parsed = 0, stale = 0, index = 0;
         for (auto tag : { Fossilize::RESOURCE_GRAPHICS_PIPELINE, Fossilize::RESOURCE_COMPUTE_PIPELINE })
         {
             readAll(tag, [&](Fossilize::Hash h, const uint8_t* p, size_t n) {
                 if (t.lowVA) return;
+                if ((index++ % parts) != part) return;
                 if (!done.insert(h).second) { already++; return; }
                 if (++parsed % 64 == 0)
                 {
@@ -703,10 +707,43 @@ class VkCapture
         }
 
         t.files++; t.created += creator.created; t.trusted += creator.createdTrusted;
-        t.rejected += creator.rejected; t.failed += creator.failed; t.already += already;
-        Log("replay: %s: %u pipelines created (%u trusted), %u objects rejected as not valid here, %u failed, "
-            "%u already done, %u skipped (another DXVK build/feature set)", path.c_str(), creator.created,
-            creator.createdTrusted, creator.rejected, creator.failed, already, stale);
+        t.rejected += creator.rejected; t.failed += creator.failed; t.already += already; t.stale += stale;
+        if (parts == 1)
+            Log("replay: %s: %u pipelines created (%u trusted), %u objects rejected as not valid here, %u failed, "
+                "%u already done, %u skipped (another DXVK build/feature set)", path.c_str(), creator.created,
+                creator.createdTrusted, creator.rejected, creator.failed, already, stale);
+    }
+
+    // This PC's own recording, split across a few workers. Everything in it that
+    // is replayed is trusted, so the workers share nothing but the device, and
+    // Vulkan object creation is thread-safe without a pipeline cache.
+    static void ReplayOwnParallel(const std::string& path, VkDevice dev, Device* d,
+                                  std::unordered_set<Fossilize::Hash>& done, Totals& t)
+    {
+        const uint32_t parts = (std::max)(1u, (std::min)(4u, std::thread::hardware_concurrency() / 4));
+        std::vector<Totals> part(parts);
+        std::vector<std::unordered_set<Fossilize::Hash>> seen(parts);
+        std::vector<std::thread> workers;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (uint32_t k = 0; k < parts; k++)
+            workers.emplace_back([&, k] {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                Fossilize::set_thread_log_callback(&FossilizeLog, nullptr);
+                onReplayThread = true;
+                ReplayFile(path, dev, d, true, seen[k], part[k], k, parts);
+            });
+        for (auto& w : workers) w.join();
+        uint32_t created = 0, trusted = 0, failed = 0, stale = 0;
+        for (uint32_t k = 0; k < parts; k++)
+        {
+            created += part[k].created; trusted += part[k].trusted; failed += part[k].failed; stale += part[k].stale;
+            t.lowVA |= part[k].lowVA;
+            done.insert(seen[k].begin(), seen[k].end());
+        }
+        t.files++; t.created += created; t.trusted += trusted; t.failed += failed; t.stale += stale;
+        Log("replay: %s: %u pipelines created (%u trusted) on %u threads in %.1fs, %u failed, "
+            "%u skipped (another DXVK build/feature set)", path.c_str(), created, trusted, parts,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), failed, stale);
     }
 
     // Other PCs' recordings, and this player's own Steam pre-cache buckets.
@@ -749,13 +786,13 @@ class VkCapture
     // and where it faulted, instead of the game just exiting. Only the replay thread,
     // only real errors (0xC... codes); the exception still goes on to the game's own
     // handlers unchanged.
-    static inline std::atomic<DWORD> replayTid{ 0 };
-    static inline std::atomic<Fossilize::Hash> currentEntry{ 0 };
-    static inline std::string currentFile;
+    static inline thread_local bool onReplayThread = false;
+    static inline thread_local Fossilize::Hash currentEntry = 0;
+    static inline thread_local const std::string* currentFile = nullptr;
 
     static LONG CALLBACK ReplayFaultHandler(EXCEPTION_POINTERS* ep)
     {
-        if (GetCurrentThreadId() != replayTid.load()) return EXCEPTION_CONTINUE_SEARCH;
+        if (!onReplayThread) return EXCEPTION_CONTINUE_SEARCH;
         const DWORD code = ep->ExceptionRecord->ExceptionCode;
         if ((code & 0xF0000000u) != 0xC0000000u) return EXCEPTION_CONTINUE_SEARCH;
         static std::atomic<int> reported{ 0 };
@@ -771,7 +808,7 @@ class VkCapture
         Log("replay thread FAULT %08lx at %p (%s+0x%lx) while replaying entry %016llx of %s",
             (unsigned long)code, addr, base ? base + 1 : name,
             mod ? (unsigned long)(reinterpret_cast<const char*>(addr) - reinterpret_cast<const char*>(mod)) : 0ul,
-            (unsigned long long)currentEntry.load(), currentFile.c_str());
+            (unsigned long long)currentEntry, currentFile ? currentFile->c_str() : "?");
 
         // How the replay got there: walk the frame-pointer chain (x86) and name each
         // return address by module + offset. Stops at the first frame outside
@@ -819,7 +856,7 @@ class VkCapture
     {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
         Fossilize::set_thread_log_callback(&FossilizeLog, nullptr);
-        replayTid = GetCurrentThreadId();
+        onReplayThread = true;
         AddVectoredExceptionHandler(1, &ReplayFaultHandler);
         const auto t0 = std::chrono::steady_clock::now();
         std::unordered_set<Fossilize::Hash> done;
@@ -828,7 +865,7 @@ class VkCapture
 
         const std::string own = PluginsDir() + "FusionFix.vkpipelines.foz";
         if (GetFileAttributesA(own.c_str()) != INVALID_FILE_ATTRIBUTES)
-            ReplayFile(own, dev, d, true, done, t);
+            ReplayOwnParallel(own, dev, d, done, t);
 
         // Foreign entries are judged against what is known to be valid here, so let
         // DXVK show enough of that first: the trusted replay above usually already
