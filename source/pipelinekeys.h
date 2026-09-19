@@ -324,7 +324,7 @@ namespace pipelinekeys
     {
         kMetaShaderDir = 0,   // "win32_30", "win32_30_nv8", ... or "unknown"
         kMetaAdapter   = 1,   // D3DADAPTER_IDENTIFIER9::Description
-        kMetaDriver    = 2,   // driver version, or the DXVK version when known
+        kMetaDriver    = 2,   // under DXVK the Vulkan driver ("radv Mesa 25.2.3"), else the D3D9 driver version
         kMetaOS        = 3,   // "windows" / "wine <version>"
         kMetaStringCount = 4,
     };

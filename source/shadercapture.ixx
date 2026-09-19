@@ -60,6 +60,7 @@ module;
 #include <unordered_map>
 #include <chrono>
 #include <algorithm>
+#include "dxvk_d3d9_interfaces.h"
 #include "pipelinekeys.h"
 
 export module shadercapture;
@@ -533,27 +534,21 @@ class ShaderCapture
         }
         // DXVK is the backend that makes one shared cache plausible (it answers the
         // depth-format probe itself instead of the vendor driver), so record which one
-        // produced this capture rather than assuming.
-        metaBackend = GetModuleHandleW(L"dxvk_d3d9.dll") ? 1 : 0;
-        if (!metaBackend)
-        {
-            // DXVK usually ships as d3d9.dll; its version resource names it.
-            if (HMODULE m = GetModuleHandleW(L"d3d9.dll"))
-            {
-                char path[MAX_PATH]{};
-                if (GetModuleFileNameA(m, path, MAX_PATH))
-                    metaBackend = (strstr(path, "dxvk") || strstr(path, "DXVK")) ? 1 : 0;
-            }
-        }
+        // produced this capture rather than assuming. Ask the device itself: DLL names
+        // differ per install (vulkan.dll behind FusionFix's forwarder, d3d9.dll under
+        // Proton) and misreported every Windows capture.
+        FusionFixDxvkInfo dxvk;
+        metaBackend = FusionFixQueryDxvk(d, &dxvk) ? 1 : 0;
+        // Under DXVK the D3D9 driver version is a constant DXVK makes up, so replace it
+        // with the Vulkan driver that actually compiles the pipelines.
+        if (dxvk.haveDriver)
+            metaDriver = std::string(dxvk.driverName) + " " + dxvk.driverInfo;
         metaOS = "windows";
         if (HMODULE nt = GetModuleHandleW(L"ntdll.dll"))
         {
             using PFN_WineVer = const char* (__cdecl*)(void);
             if (auto wv = (PFN_WineVer)GetProcAddress(nt, "wine_get_version"))
-            {
                 metaOS = std::string("wine ") + (wv() ? wv() : "?");
-                metaBackend = 1;   // d3d9 under wine is DXVK in every supported setup
-            }
         }
         Log("provenance: %s / %s / driver %s / backend %s",
             metaOS.c_str(), metaAdapter.c_str(), metaDriver.c_str(),

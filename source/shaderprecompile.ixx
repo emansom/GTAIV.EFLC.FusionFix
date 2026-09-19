@@ -577,28 +577,18 @@ class ShaderPrecompiler
     {
         backend = Backend::Native;
         if (!dev) return;
-        // A DXVK device answers QueryInterface for ID3D9VkExtInterface.
-        IUnknown* p = nullptr;
-        if (SUCCEEDED(dev->QueryInterface(FusionFix_IID_ID3D9VkExtInterface, (void**)&p)) && p)
+        // A DXVK device answers QueryInterface for ID3D9VkInteropDevice. The adapter
+        // name is not a substitute: it said "RADV" on Linux and nothing DXVK-specific on
+        // Windows, where this used to report "native" while running on DXVK.
+        FusionFixDxvkInfo dxvk;
+        if (FusionFixQueryDxvk(dev, &dxvk))
         {
             backend = Backend::DXVK;
-            p->Release();
-            return;
-        }
-        // Cross-check the adapter description.
-        IDirect3D9* d3d = nullptr;
-        if (SUCCEEDED(dev->GetDirect3D(&d3d)) && d3d)
-        {
-            D3DDEVICE_CREATION_PARAMETERS cp{};
-            D3DADAPTER_IDENTIFIER9 ai{};
-            if (SUCCEEDED(dev->GetCreationParameters(&cp)) &&
-                SUCCEEDED(d3d->GetAdapterIdentifier(cp.AdapterOrdinal, 0, &ai)))
-            {
-                if (strstr(ai.Description, "DXVK") || strstr(ai.Description, "RADV") ||
-                    strstr(ai.Description, "llvmpipe") || strstr(ai.Driver, "dxvk"))
-                    backend = Backend::DXVK;
-            }
-            d3d->Release();
+            if (dxvk.haveDriver)
+                Log("vulkan driver: %s %s (api %u.%u.%u)", dxvk.driverName, dxvk.driverInfo,
+                    (dxvk.apiVersion >> 22) & 0x7F, (dxvk.apiVersion >> 12) & 0x3FF, dxvk.apiVersion & 0xFFF);
+            else
+                Log("vulkan driver: unknown (DXVK's Vulkan library could not be queried)");
         }
     }
 
