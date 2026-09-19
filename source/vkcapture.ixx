@@ -7,6 +7,8 @@ module;
 #include "layer/utils.hpp"          // Fossilize's LOG* macros, which fossilize_errors.hpp requires
 #include "fossilize_errors.hpp"     // set_thread_log_callback
 #include "cli/fossilize_feature_filter.hpp"
+#define RAPIDJSON_HAS_STDSTRING 1       // as fossilize.cpp includes it
+#include "rapidjson/document.h"
 #include "pipelinekeys.h"
 #include <tlhelp32.h>
 #include <algorithm>
@@ -145,8 +147,9 @@ import comvars;
 //  GAMEPLAY METRICS (whenever DXVK creates its device, whatever the settings)
 //    Every DXVK pipeline creation is timed, and every vkQueuePresentKHR on its device
 //    makes a frame time. Gameplay is while no loading screen has been up for 2 s,
-//    once the first one has gone and the loading-screen pass (if one runs) is done
-//    (InGameplay). Reported every 15 s of gameplay and once more at exit; the lines
+//    once the first one has gone and the loading-screen pass (if one runs) is done;
+//    what DXVK creates in those 2 s counts as gameplay too, unless a loading screen
+//    comes back (PhaseAt). Reported every 15 s of gameplay and once more at exit; the lines
 //    are described at ReportGameplay. Costs a clock read per creation and per
 //    present: it stays on with everything else off, to measure the unwarmed game
 //    against.
@@ -245,6 +248,17 @@ class VkCapture
         std::atomic<bool> stop{ false };
 
         std::atomic<uint32_t> graphics{ 0 }, compute{ 0 }, modules{ 0 }, other{ 0 }, failed{ 0 };
+
+        // DestroyDevice joins both threads first. The only other way a Device goes is
+        // with `devices` at process exit, as DXVK rarely destroys its device: the
+        // threads are gone by then, and a std::thread still joinable when destroyed
+        // calls std::terminate -- a fail-fast crash on every quit, before the C
+        // runtime has flushed the recording.
+        ~Device()
+        {
+            if (replay.joinable()) replay.detach();
+            if (metrics.joinable()) metrics.detach();
+        }
     };
     static inline std::shared_mutex devLock;
     static inline std::unordered_map<VkDevice, std::unique_ptr<Device>> devices;
@@ -436,29 +450,40 @@ class VkCapture
 
     // Gameplay: the first loading screen has come and gone, none has been up for the
     // last kClearUs, and the loading-screen pass is done (or none is coming).
-    // Everything else -- startup screens, loading, the pass and its hold, the first
-    // moments after a loading screen -- is loading. The wait matters: GTA IV's
-    // loading goes through phases, and between two of them a present can find no
-    // loading screen up (seen once, 15 s before the game was playable). The flags
-    // are only looked at here, on presents and creations.
+    // Everything else -- startup screens, loading, the pass and its hold -- is
+    // loading, and the kClearUs after a loading screen are SETTLING. The wait
+    // matters: GTA IV's loading goes through phases, and between two of them a
+    // present can find no loading screen up (seen once, 15 s before the game was
+    // playable). But what DXVK compiles while the world fades in after a load is
+    // exactly the stutter this work is about, so creations there are held back
+    // (Settle) until it is known which it was: gameplay, if no loading screen comes
+    // back within kClearUs, else loading. Frames there are counted as neither. The
+    // flags are only looked at here, on presents and creations.
     static inline std::atomic<bool> seenLoading{ false };
     static inline std::atomic<int64_t> clearSinceUs{ 0 };   // first seen with no loading screen up, 0 = one is up
     static constexpr int64_t kClearUs = 2000000;
 
-    static bool InGameplay(int64_t now)
+    enum class Phase { Loading, Settling, Gameplay };
+
+    static Phase PhaseAt(int64_t now)
     {
         auto& vr = pipelinekeys::VulkanReplay();
         if ((CMenuManager::bLoadscreenShown && *CMenuManager::bLoadscreenShown) || bLoadingShown)
         {
             seenLoading = true;
             clearSinceUs = 0;
-            return false;
+            Settled(false);
+            return Phase::Loading;
         }
-        if (!seenLoading || vr.holding || (vr.passPlanned && !vr.passDone)) return false;
+        if (!seenLoading || vr.holding || (vr.passPlanned && !vr.passDone)) return Phase::Loading;
         int64_t since = clearSinceUs.load();
         if (!since && clearSinceUs.compare_exchange_strong(since, now)) since = now;
-        return now - since >= kClearUs;
+        if (now - since < kClearUs) return Phase::Settling;
+        Settled(true);
+        return Phase::Gameplay;
     }
+
+    static bool InGameplay(int64_t now) { return PhaseAt(now) == Phase::Gameplay; }
 
     // One of DXVK's creations in flight (see VulkanReplayState). The finish is
     // stamped before the count drops, so whoever sees nothing in flight also sees
@@ -532,8 +557,8 @@ class VkCapture
         return sum;
     }
 
-    // How long DXVK's own pipeline creations take, split at the start of gameplay
-    // (InGameplay). A driver-cache hit costs well under a millisecond, a compile
+    // How long DXVK's own pipeline creations take, split by phase (PhaseAt). A
+    // driver-cache hit costs well under a millisecond, a compile
     // several to tens. Whatever still compiles once gameplay has started is what the
     // warming missed: the number that says whether it worked, and what stutters.
     struct CreateTimes
@@ -552,6 +577,15 @@ class VkCapture
             uint64_t w = worstUs.load();
             while (us > w && !worstUs.compare_exchange_weak(w, us)) {}
         }
+        void Merge(const CreateTimes& o)
+        {
+            n += o.n.load(); libraries += o.libraries.load(); linked += o.linked.load(); over1 += o.over1.load();
+            over5 += o.over5.load(); over20 += o.over20.load(); slowLibraries += o.slowLibraries.load();
+            uint64_t w = worstUs.load();
+            const uint64_t us = o.worstUs.load();
+            while (us > w && !worstUs.compare_exchange_weak(w, us)) {}
+        }
+        void Reset() { n = 0; libraries = 0; linked = 0; over1 = 0; over5 = 0; over20 = 0; slowLibraries = 0; worstUs = 0; }
         std::string Describe() const
         {
             char buf[256];
@@ -561,11 +595,49 @@ class VkCapture
             return buf;
         }
     };
-    static inline CreateTimes loadingTimes, gameplayTimes;
+    // Before gameplay first starts, and on every loading screen after that.
+    static inline CreateTimes loadingTimes, laterLoadingTimes, gameplayTimes;
     static inline std::atomic<uint32_t> slowLogged{ 0 };
     // Lines logged per kind of gameplay event (slow creation, long frame); the counts
     // in the 15 s reports go on past it.
     static constexpr uint32_t kDetailLines = 2000;
+
+    static CreateTimes& LoadingTimes() { return frameTimes.startUs.load() ? laterLoadingTimes : loadingTimes; }
+
+    // One "gameplay compile" line: every gameplay creation of 20 ms or more.
+    static void LogSlow(int64_t t0, uint64_t us, const char* what, bool settling)
+    {
+        const uint32_t k = slowLogged++;
+        if (k < kDetailLines)
+            Log("gameplay compile t=%.3f: DXVK spent %.1f ms creating a %s%s", pipelinekeys::VulkanReplay().Seconds(t0),
+                us / 1000.0, what, settling ? " (just after a loading screen)" : "");
+        else if (k == kDetailLines)
+            Log("gameplay compile: more than %u - no more of these lines, the reports still count them", kDetailLines);
+    }
+
+    // Creations while settling (see PhaseAt), until Settled says where they belong.
+    struct Settle
+    {
+        std::mutex m;
+        std::atomic<bool> any{ false };
+        CreateTimes times;
+        struct Slow { int64_t t0; uint64_t us; const char* what; };
+        std::vector<Slow> slow;
+    };
+    static inline Settle settle;
+
+    static void Settled(bool gameplay)
+    {
+        if (!settle.any.load()) return;
+        std::lock_guard lock(settle.m);
+        if (!settle.any.load()) return;
+        (gameplay ? gameplayTimes : LoadingTimes()).Merge(settle.times);
+        if (gameplay)
+            for (const auto& s : settle.slow) LogSlow(s.t0, s.us, s.what, true);
+        settle.times.Reset();
+        settle.slow.clear();
+        settle.any = false;
+    }
 
     // t0 is when the creation started (ClockUs), which is also the t= of its line,
     // so it can be laid against the frame it landed in.
@@ -576,15 +648,18 @@ class VkCapture
         const bool library = (flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) != 0;
         auto* libs = static_cast<const VkPipelineLibraryCreateInfoKHR*>(FindPNext(pNext, VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR));
         const bool link = libs && libs->libraryCount;
-        const bool gameplay = InGameplay(now);
-        (gameplay ? gameplayTimes : loadingTimes).Add(us, library, link);
-        if (!gameplay || us < 20000) return;
-        const uint32_t k = slowLogged++;
-        if (k < kDetailLines)
-            Log("gameplay compile t=%.3f: DXVK spent %.1f ms creating a %s", pipelinekeys::VulkanReplay().Seconds(t0),
-                us / 1000.0, library ? "pipeline library" : link ? "linked pipeline" : "pipeline");
-        else if (k == kDetailLines)
-            Log("gameplay compile: more than %u - no more of these lines, the reports still count them", kDetailLines);
+        const char* what = library ? "pipeline library" : link ? "linked pipeline" : "pipeline";
+        const Phase phase = PhaseAt(now);
+        if (phase == Phase::Settling)
+        {
+            std::lock_guard lock(settle.m);
+            settle.times.Add(us, library, link);
+            if (us >= 20000) settle.slow.push_back({ t0, us, what });
+            settle.any = true;
+            return;
+        }
+        (phase == Phase::Gameplay ? gameplayTimes : LoadingTimes()).Add(us, library, link);
+        if (phase == Phase::Gameplay && us >= 20000) LogSlow(t0, us, what, false);
     }
 
     // Gameplay frame times: the gap between two vkQueuePresentKHR calls on DXVK's
@@ -689,12 +764,16 @@ class VkCapture
     //   gameplay frames[ final] t=<s> play=<s>s: frames <n>, avg <fps> fps, p50 <ms> ms,
     //     p95 <ms> ms, p99 <ms> ms, max <ms> ms, spikes <n>, >50 ms <n>
     //   created by DXVK in gameplay so far: <CreateTimes::Describe>   ("in gameplay:" at exit)
+    //   created by DXVK on later loading screens so far: <CreateTimes::Describe>
     // t is the session clock (seconds since the ASI loaded), play the time since
     // gameplay's first present. Every figure covers the whole of gameplay so far, not
     // just the last 15 s: frames and fps (frames / their summed time), percentiles
     // (nearest rank, the upper edge of a 0.1 ms bin), the longest frame, spikes and
     // frames over 50 ms as defined at CountFrame. Frames under a later loading screen,
-    // or in the kClearUs after one, are not gameplay and not counted.
+    // or in the kClearUs after one, are not gameplay and not counted; creations in
+    // those kClearUs count as gameplay unless another loading screen follows (see
+    // PhaseAt), and the ones on a loading screen after gameplay first started go to
+    // the second line.
     static void ReportGameplay(bool final)
     {
         auto& f = frameTimes;
@@ -707,6 +786,8 @@ class VkCapture
             f.PercentileMs(95), f.PercentileMs(99), f.maxUs.load() / 1000.0, f.spikes.load(), f.over50.load());
         Log(final ? "created by DXVK in gameplay: %s" : "created by DXVK in gameplay so far: %s",
             gameplayTimes.Describe().c_str());
+        Log(final ? "created by DXVK on later loading screens: %s" : "created by DXVK on later loading screens so far: %s",
+            laterLoadingTimes.Describe().c_str());
     }
 
     // Runs as long as the device: the 15 s gameplay reports. The final one comes from
@@ -773,11 +854,14 @@ class VkCapture
         if (count) TimeCreate(t0, PipelineFlags(infos[0].pNext, infos[0].flags), infos[0].pNext);
         // Recorded only on success: a VK_PIPELINE_COMPILE_REQUIRED probe creates
         // nothing, and DXVK records the pipeline when it then compiles it for real.
+        // Nor while the D3D9 pass warms other PCs' keys (VulkanReplayState::recordPaused).
         if (res != VK_SUCCESS) return res;
+        const bool paused = pipelinekeys::VulkanReplay().recordPaused;
+        if (paused && d->recorder) pipelinekeys::VulkanReplay().notRecorded += count;
         for (uint32_t i = 0; i < count; i++)
         {
             if (replayEnabled) Learn(CollectGraphics(infos[i]), true);
-            if (!d->recorder) continue;
+            if (!d->recorder || paused) continue;
             if (d->recorder->record_graphics_pipeline(out[i], infos[i], out, count, 0, device,
                     d->usesIdentifiers ? d->GetShaderModuleCreateInfoIdentifierEXT : nullptr))
                 d->graphics++;
@@ -799,10 +883,12 @@ class VkCapture
         }
         if (count) TimeCreate(t0, PipelineFlags(infos[0].pNext, infos[0].flags), infos[0].pNext);
         if (res != VK_SUCCESS) return res;
+        const bool paused = pipelinekeys::VulkanReplay().recordPaused;
+        if (paused && d->recorder) pipelinekeys::VulkanReplay().notRecorded += count;
         for (uint32_t i = 0; i < count; i++)
         {
             if (replayEnabled) Learn(CollectCompute(infos[i]), true);
-            if (!d->recorder) continue;
+            if (!d->recorder || paused) continue;
             if (d->recorder->record_compute_pipeline(out[i], infos[i], out, count, 0, device,
                     d->usesIdentifiers ? d->GetShaderModuleCreateInfoIdentifierEXT : nullptr))
                 d->compute++;
@@ -1178,24 +1264,27 @@ class VkCapture
     struct Totals
     {
         uint32_t files = 0, pipelines = 0, created = 0, trusted = 0, irrelevant = 0, unsupported = 0, incomplete = 0,
-                 failed = 0, already = 0, stale = 0;
+                 failed = 0, already = 0, stale = 0, refused = 0;
         bool lowVA = false;
 
         void Add(const Totals& o)
         {
             files += o.files; pipelines += o.pipelines; created += o.created; trusted += o.trusted;
             irrelevant += o.irrelevant; unsupported += o.unsupported; incomplete += o.incomplete; failed += o.failed;
-            already += o.already; stale += o.stale; lowVA |= o.lowVA;
+            already += o.already; stale += o.stale; refused += o.refused; lowVA |= o.lowVA;
         }
-        // What was created and why the rest was not, for the log.
+        // What was created and why the rest was not, for the log. `refused`: reads
+        // CheckedDatabase turned down, the entries depending on them are incomplete.
         std::string Outcome() const
         {
-            char buf[384];
+            char buf[448];
             snprintf(buf, sizeof(buf), "%u entries created (%u trusted, %u pipelines in all); skipped: %u not relevant "
                      "(another DXVK build or configuration), %u not supported by this device, %u incomplete (a dependency "
                      "missing or skipped), %u failed; %u already done", created, trusted, pipelines, irrelevant, unsupported,
                      incomplete, failed, already);
-            return buf;
+            std::string s = buf;
+            if (refused) s += "; " + std::to_string(refused) + " damaged entries not read";
+            return s;
         }
         std::string Stale() const
         {
@@ -1216,17 +1305,95 @@ class VkCapture
     // Pipeline entries in a database, for the loading screen's bar.
     static uint32_t CountPipelines(const std::string& path)
     {
-        std::unique_ptr<Fossilize::DatabaseInterface> db(
-            Fossilize::create_stream_archive_database(path.c_str(), Fossilize::DatabaseMode::ReadOnly));
-        if (!db || !db->prepare()) return 0;
-        size_t sum = 0;
-        for (auto tag : { Fossilize::RESOURCE_GRAPHICS_PIPELINE, Fossilize::RESOURCE_COMPUTE_PIPELINE })
+        try
+        {
+            std::unique_ptr<Fossilize::DatabaseInterface> db(
+                Fossilize::create_stream_archive_database(path.c_str(), Fossilize::DatabaseMode::ReadOnly));
+            if (!db || !db->prepare()) return 0;
+            size_t sum = 0;
+            for (auto tag : { Fossilize::RESOURCE_GRAPHICS_PIPELINE, Fossilize::RESOURCE_COMPUTE_PIPELINE })
+            {
+                size_t n = 0;
+                if (db->get_hash_list_for_resource_tag(tag, &n, nullptr)) sum += n;
+            }
+            return (uint32_t)sum;
+        }
+        catch (const std::exception&) { return 0; }   // ReplayFile then says it is damaged
+    }
+
+    // Every read the replay makes from a database goes through this: its own, and the
+    // replayer's, which resolves what a pipeline needs through the database it is
+    // given. Fossilize trusts what it reads. An entry header's size is not covered by
+    // the checksum and sizes a buffer as it is, so one damaged byte there ended the
+    // process (std::length_error, never caught); a shader module's codeSize sizes the
+    // buffer its SPIR-V is decoded into, and a crafted one wraps that size and writes
+    // past it. So an entry larger than kMaxEntryBytes is not there, and neither is a
+    // shader module whose sizes do not fit the entry (ModuleOk). What else a crafted
+    // entry's JSON may do inside Fossilize's parser is not checked here.
+    static constexpr size_t kMaxEntryBytes = 16u << 20;
+
+    // `{"version":N,"shaderModules":{"<hash>":{"flags":F,"codeSize":S,
+    // "varintOffset":O,"varintSize":V}}}`, a NUL, then the varint-coded SPIR-V: only
+    // that form (what Fossilize has written for years, and what the recorder here
+    // writes), with every number inside the entry. The older base64 form is decoded
+    // without checking the string against codeSize, so it is not accepted.
+    static bool ModuleOk(const uint8_t* p, size_t n)
+    {
+        const auto* nul = static_cast<const uint8_t*>(memchr(p, 0, n));
+        if (!nul) return false;
+        const size_t json = (size_t)(nul - p), varint = n - json - 1;
+        rapidjson::Document doc;
+        doc.Parse(reinterpret_cast<const char*>(p), json);
+        if (doc.HasParseError() || !doc.IsObject()) return false;
+        const auto mods = doc.FindMember("shaderModules");
+        if (mods == doc.MemberEnd()) return true;
+        if (!mods->value.IsObject()) return false;
+        for (auto m = mods->value.MemberBegin(); m != mods->value.MemberEnd(); ++m)
+        {
+            const auto& o = m->value;
+            if (!o.IsObject()) return false;
+            const auto code = o.FindMember("codeSize"), at = o.FindMember("varintOffset"), size = o.FindMember("varintSize");
+            if (code == o.MemberEnd() || at == o.MemberEnd() || size == o.MemberEnd() ||
+                !code->value.IsUint64() || !at->value.IsUint64() || !size->value.IsUint64())
+                return false;
+            const uint64_t c = code->value.GetUint64(), a = at->value.GetUint64(), s = size->value.GetUint64();
+            if (!c || (c & 3) || c > kMaxEntryBytes || a > varint || s > varint - a) return false;
+        }
+        return true;
+    }
+
+    struct CheckedDatabase : Fossilize::DatabaseInterface
+    {
+        Fossilize::DatabaseInterface& db;
+        std::atomic<uint32_t> refused{ 0 };
+        explicit CheckedDatabase(Fossilize::DatabaseInterface& inner)
+            : Fossilize::DatabaseInterface(Fossilize::DatabaseMode::ReadOnly), db(inner) {}
+
+        bool prepare() override { return true; }   // the inner one is prepared already
+        bool read_entry(Fossilize::ResourceTag tag, Fossilize::Hash hash, size_t* size, void* buffer,
+                        Fossilize::PayloadReadFlags flags) override
         {
             size_t n = 0;
-            if (db->get_hash_list_for_resource_tag(tag, &n, nullptr)) sum += n;
+            if (!size || !db.read_entry(tag, hash, &n, nullptr, flags)) return false;
+            if (n > kMaxEntryBytes) { refused++; return false; }
+            if (!buffer) { *size = n; return true; }
+            if (!db.read_entry(tag, hash, size, buffer, flags)) return false;
+            if (tag == Fossilize::RESOURCE_SHADER_MODULE && !ModuleOk(static_cast<const uint8_t*>(buffer), *size))
+            {
+                refused++;
+                return false;
+            }
+            return true;
         }
-        return (uint32_t)sum;
-    }
+        bool write_entry(Fossilize::ResourceTag, Fossilize::Hash, const void*, size_t, Fossilize::PayloadWriteFlags) override
+        { return false; }
+        bool has_entry(Fossilize::ResourceTag tag, Fossilize::Hash hash) override { return db.has_entry(tag, hash); }
+        bool get_hash_list_for_resource_tag(Fossilize::ResourceTag tag, size_t* count, Fossilize::Hash* hashes) override
+        { return db.get_hash_list_for_resource_tag(tag, count, hashes); }
+        void flush() override {}
+        const char* get_db_path_for_hash(Fossilize::ResourceTag tag, Fossilize::Hash hash) override
+        { return db.get_db_path_for_hash(tag, hash); }
+    };
 
     // `part` of `parts`: parallel workers each take every parts-th pipeline entry of
     // the same file, through their own database handle and replayer. `prior` holds
@@ -1234,12 +1401,14 @@ class VkCapture
     // collects this worker's.
     static void ReplayFile(const std::string& path, VkDevice dev, Device* d, bool own,
                            const std::unordered_set<Fossilize::Hash>& prior, std::unordered_set<Fossilize::Hash>& seen,
-                           Totals& t, uint32_t part, uint32_t parts)
+                           Totals& t, uint32_t part, uint32_t parts, const std::atomic<bool>& damaged)
     {
         auto& vr = pipelinekeys::VulkanReplay();
-        std::unique_ptr<Fossilize::DatabaseInterface> db(
+        std::unique_ptr<Fossilize::DatabaseInterface> raw(
             Fossilize::create_stream_archive_database(path.c_str(), Fossilize::DatabaseMode::ReadOnly));
-        if (!db || !db->prepare()) { Log("replay: cannot read %s", path.c_str()); return; }
+        if (!raw || !raw->prepare()) { if (part == 0) Log("replay: cannot read %s", path.c_str()); return; }
+        CheckedDatabase checked(*raw);
+        Fossilize::DatabaseInterface* db = &checked;
         currentFile = &path;
 
         auto readAll = [&](Fossilize::ResourceTag tag, auto&& fn) {
@@ -1250,7 +1419,7 @@ class VkCapture
             std::vector<uint8_t> buf;
             for (auto h : hashes)
             {
-                if (d->stop) return;
+                if (d->stop || damaged) return;
                 size_t size = 0;
                 if (!db->read_entry(tag, h, &size, nullptr, Fossilize::PAYLOAD_READ_NO_FLAGS) || !size) continue;
                 buf.resize(size);
@@ -1263,7 +1432,7 @@ class VkCapture
         {
             Fossilize::StateReplayer lr;
             readAll(Fossilize::RESOURCE_APPLICATION_BLOB_LINK,
-                    [&](Fossilize::Hash, const uint8_t* p, size_t n) { (void)lr.parse(links, db.get(), p, n); });
+                    [&](Fossilize::Hash, const uint8_t* p, size_t n) { (void)lr.parse(links, db, p, n); });
         }
 
         ReplayCreator creator(dev, d);
@@ -1308,7 +1477,7 @@ class VkCapture
                 creator.entry = h;
                 creator.entryCreated = false;
                 creator.entrySkip = Skip::None;
-                creator.Settle(replayer.parse(creator, db.get(), p, n));
+                creator.Settle(replayer.parse(creator, db, p, n));
                 // The parsed create-infos are dead once created; keep memory flat
                 // in a 32-bit process, as fossilize-replay does between batches.
                 replayer.get_allocator().reset();
@@ -1319,6 +1488,7 @@ class VkCapture
         f.files = 1; f.pipelines = creator.pipelines; f.created = creator.created; f.trusted = creator.createdTrusted;
         f.irrelevant = creator.irrelevant; f.unsupported = creator.unsupported; f.incomplete = creator.incomplete;
         f.failed = creator.failed; f.already = already + creator.earlier; f.stale = stale;
+        f.refused = checked.refused;
         t.Add(f);
     }
 
@@ -1331,6 +1501,10 @@ class VkCapture
         std::vector<Totals> part(parts);
         std::vector<std::unordered_set<Fossilize::Hash>> seen(parts);
         std::vector<std::thread> workers;
+        // Anything Fossilize throws on a damaged file ends that file, with a line in
+        // the log, and never the game: an exception leaving a std::thread is
+        // std::terminate. The other workers on the file stop at their next entry.
+        std::atomic<bool> damaged{ false };
         const auto t0 = std::chrono::steady_clock::now();
         for (uint32_t k = 0; k < parts; k++)
             workers.emplace_back([&, k] {
@@ -1338,7 +1512,12 @@ class VkCapture
                                   pipelinekeys::VulkanReplay().holding ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_LOWEST);
                 Fossilize::set_thread_log_callback(&FossilizeLog, nullptr);
                 onReplayThread = true;
-                ReplayFile(path, dev, d, own, done, seen[k], part[k], k, parts);
+                try { ReplayFile(path, dev, d, own, done, seen[k], part[k], k, parts, damaged); }
+                catch (const std::exception& e)
+                {
+                    if (!damaged.exchange(true))
+                        Log("replay: %s is damaged (%s) - the rest of it is skipped", path.c_str(), e.what());
+                }
             });
         for (auto& w : workers) w.join();
         Totals sum;
@@ -1358,19 +1537,20 @@ class VkCapture
 
     static std::string PipelineCacheDir() { return PluginsDir() + "pipelinecache\\"; }
 
-    // 64-bit FNV-1a over every byte of a file: the <h> in its shared name, and what
-    // tells two inputs apart. False if it cannot be read to the end.
+    // The content hash of a file (pipelinekeys::ContentHash, the same one the D3D9
+    // side names its files with): the <h> in its shared name, and what tells two
+    // inputs apart. False if it cannot be read to the end.
     static bool HashFile(const std::string& path, uint64_t& out)
     {
         HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
         if (f == INVALID_HANDLE_VALUE) return false;
         std::vector<uint8_t> buf(1u << 20);
-        uint64_t h = 0xcbf29ce484222325ull;
+        uint64_t h = pipelinekeys::ContentHash(nullptr, 0);
         DWORD n = 0;
         BOOL ok;
         while ((ok = ReadFile(f, buf.data(), (DWORD)buf.size(), &n, nullptr)) && n)
-            for (DWORD i = 0; i < n; i++) { h ^= buf[i]; h *= 0x100000001b3ull; }
+            h = pipelinekeys::ContentHash(buf.data(), n, h);
         CloseHandle(f);
         if (ok) out = h;
         return ok != FALSE;
@@ -1393,10 +1573,13 @@ class VkCapture
     }
 
     // Once per launch, before the recorder opens the file for appending: copy this
-    // PC's recording to plugins\pipelinecache\FusionFix.<h>.foz, through a temporary
-    // name, unless that name is there already. Once it is in place, delete the copies
-    // earlier launches wrote -- the names FusionFix.pipelinecache.state lists, nothing
-    // else -- and remember the new one.
+    // PC's recording to plugins\pipelinecache\FusionFix.<h>.foz, unless that name is
+    // there already. Once it is in place, delete the copies earlier launches wrote --
+    // the names FusionFix.pipelinecache.state lists, nothing else -- and remember the
+    // new one. The copy is made beside the ASI and renamed into the folder, so a
+    // crash never leaves a stray temporary in the folder players copy around, and the
+    // state file names it BEFORE the rename: a crash or a failed update can never
+    // leave a copy of ours that nothing remembers, and so nothing ever deletes.
     static void ShareOwnRecording(const std::string& own)
     {
         WIN32_FILE_ATTRIBUTE_DATA fa{};
@@ -1423,14 +1606,34 @@ class VkCapture
             }
             fclose(f);
         }
+        // The state file's new contents, or no file for none.
+        auto writeState = [&](const std::string& text) {
+            if (text.empty()) return DeleteFileA(state.c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND;
+            const std::string tmp = state + ".tmp";
+            FILE* f = fopen(tmp.c_str(), "w");
+            if (!f) return false;
+            const bool ok = fputs(text.c_str(), f) >= 0;
+            return fclose(f) == 0 && ok && MoveFileExA(tmp.c_str(), state.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+        };
+
         bool ours = std::find(wrote.begin(), wrote.end(), name) != wrote.end();
+        std::string listed = before;
         if (GetFileAttributesA(target.c_str()) != INVALID_FILE_ATTRIBUTES)
             Log(ours ? "share: %s%s is there since an earlier launch - the recording has not changed"
                      : "share: %s%s is there already - the same content, not written by this PC", dir.c_str(), name);
         else
         {
+            if (!ours)
+            {
+                listed += std::string(name) + "\n";
+                if (!writeState(listed))
+                {
+                    Log("share: could not update %s - %s not written, the earlier copies stay", state.c_str(), name);
+                    return;
+                }
+            }
             CreateDirectoryA(dir.c_str(), nullptr);
-            const std::string tmp = target + ".tmp";
+            const std::string tmp = PluginsDir() + "FusionFix.pipelinecache.tmp";
             if (!CopyFileA(own.c_str(), tmp.c_str(), FALSE) || !MoveFileExA(tmp.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH))
             {
                 Log("share: could not write %s%s (error %lu) - the earlier copies stay", dir.c_str(), name, GetLastError());
@@ -1452,13 +1655,7 @@ class VkCapture
                 after += n + "\n";   // try again next launch
         }
         if (ours) after += std::string(name) + "\n";
-        if (after == before) return;
-        if (after.empty()) { DeleteFileA(state.c_str()); return; }
-        const std::string tmp = state + ".tmp";
-        FILE* f = fopen(tmp.c_str(), "w");
-        if (f && fputs(after.c_str(), f) >= 0 && fclose(f) == 0 && MoveFileExA(tmp.c_str(), state.c_str(), MOVEFILE_REPLACE_EXISTING))
-            return;
-        Log("share: could not update %s", state.c_str());
+        if (after != listed && !writeState(after)) Log("share: could not update %s", state.c_str());
     }
 
     // Other PCs' recordings, and this player's own Steam pre-cache buckets.
@@ -1473,25 +1670,36 @@ class VkCapture
         namespace fs = std::filesystem;
         std::vector<std::string> out;
         std::error_code ec;
-        uint32_t folders = 0, bins = 0, unnamed = 0;
+        uint32_t folders = 0, unnamed = 0;
+        // A file in the wrong folder of the two gets one line, from whichever of this
+        // and the D3D9 replay finds it first (pipelinekeys::HintMisplaced).
+        struct Wrong { uint32_t n = 0; std::string first; } bins, foz;
+        auto lower = [](fs::path p) { std::wstring e = p.extension().wstring(); for (auto& c : e) c = towlower(c); return e; };
+        auto note = [](Wrong& w, const fs::path& p) {
+            if (w.n++) return;
+            try { w.first = p.filename().string(); } catch (const std::exception&) { w.first = "?"; }
+        };
         for (fs::directory_iterator it(fs::path(PipelineCacheDir()), ec), end; !ec && it != end; it.increment(ec))
         {
             std::error_code fec;
             if (it->is_directory(fec)) { folders++; continue; }
             if (!it->is_regular_file(fec)) continue;
-            std::wstring ext = it->path().extension().wstring();
-            for (auto& c : ext) c = towlower(c);
-            if (ext == L".bin") bins++;
+            const std::wstring ext = lower(it->path());
+            if (ext == L".bin") note(bins, it->path());
             if (ext != L".foz") continue;
             try { out.push_back(it->path().string()); }
             catch (const std::exception&) { unnamed++; }   // a name the ANSI code page cannot hold
         }
+        for (fs::directory_iterator it(fs::path(PluginsDir() + "d3d9cache\\"), ec), end; !ec && it != end; it.increment(ec))
+        {
+            std::error_code fec;
+            if (it->is_regular_file(fec) && lower(it->path()) == L".foz") note(foz, it->path());
+        }
         if (folders)
             Log("replay: %u folder(s) in plugins\\pipelinecache\\ not read - put .foz files directly in "
                 "plugins\\pipelinecache\\, not in folders inside it", folders);
-        if (bins)
-            Log("replay: %u .bin file(s) in plugins\\pipelinecache\\ not loaded - that folder is for Vulkan .foz files, "
-                "D3D9 cache files (.bin) go in plugins\\d3d9cache\\", bins);
+        pipelinekeys::HintMisplaced("[VkCapture] ", pipelinekeys::kBinInPipelineCache, bins.n, bins.first);
+        pipelinekeys::HintMisplaced("[VkCapture] ", pipelinekeys::kFozInD3d9Cache, foz.n, foz.first);
         if (unnamed)
             Log("replay: %u .foz file(s) in plugins\\pipelinecache\\ not read - rename them to plain ASCII names", unnamed);
         std::sort(out.begin(), out.end());
@@ -1612,7 +1820,8 @@ class VkCapture
 
     static void ReplayThread(VkDevice dev, Device* d)
     {
-        ReplayAll(dev, d);
+        try { ReplayAll(dev, d); }
+        catch (const std::exception& e) { Log("replay: stopped (%s)", e.what()); }
         pipelinekeys::VulkanReplay().running = false;
     }
 

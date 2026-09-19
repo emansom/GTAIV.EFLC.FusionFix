@@ -1453,18 +1453,20 @@ class ShaderPrecompiler
     // Dedup state shared by every file merged into the replay set.
     static inline std::unordered_map<uint64_t, uint32_t> replayDeclByHash;
     static inline std::unordered_map<uint64_t, uint32_t> replayKeyIndex;
-    // Bytecode carried by the same container as the keys, merged across every cache
-    // file we load (local capture, the shipped baseline, drop-ins).
+    // Bytecode carried by the same container as the keys, merged across this PC's own
+    // capture and the shipped baseline -- never from drop-ins (see MergeKeyFile).
     static inline pipelinekeys::ShaderBlobMap replayBlobs;
     static inline size_t replayBlobBytes = 0;
 
     // Where each replayed key came from. A file's line at load says whether it was
     // read; this is what it then warmed, which is the number that says whether
     // dropping it in was worth anything -- and, for a file from another install or
-    // configuration, how much of it this one cannot use.
+    // configuration, how much of it this one cannot use. A key several files hold is
+    // counted for the first one merged: the capture, then the baseline, then drop-ins.
     struct ReplaySource
     {
         std::string label;
+        bool dropIn = false;
         uint32_t added = 0, drawn = 0, samePipeline = 0, noShader = 0, noDecl = 0, noRT = 0;
     };
     static inline std::vector<ReplaySource> replaySources;
@@ -1473,7 +1475,7 @@ class ShaderPrecompiler
     // What all files together may add, whatever they claim: the reader bounds each
     // file, this bounds the sum. A real capture is ~15,000 keys and ~50 KB of bytecode.
     static constexpr size_t kMaxReplayKeys      = 200000;     // ~65 MB of records
-    static constexpr size_t kMaxReplayBlobBytes = 16u << 20;
+    static constexpr size_t kMaxReplayBlobBytes = 4u << 20;
 
     static void LogStr(const std::string& s) { pipelinekeys::LogLine("[ShaderPrecompile] ", s.c_str()); }
 
@@ -1520,14 +1522,11 @@ class ShaderPrecompiler
             LogStr("replay: d3d9cache\\ holds " + std::to_string(drop.subdirs) + " folder(s) (e.g. '" +
                    d3d9cache::Utf8(drop.firstSubdir) + "') - they are not read; put the .bin files directly "
                    "in plugins\\d3d9cache\\");
-        if (drop.foz)
-            LogStr("replay: d3d9cache\\ holds " + std::to_string(drop.foz) + " .foz file(s) (e.g. '" +
-                   d3d9cache::Utf8(drop.firstFoz) + "') - not loaded: Vulkan pipeline databases belong in "
-                   "plugins\\pipelinecache\\");
-        if (drop.misplacedBins)
-            LogStr("replay: pipelinecache\\ holds " + std::to_string(drop.misplacedBins) + " .bin file(s) (e.g. '" +
-                   d3d9cache::Utf8(drop.firstMisplaced) + "') - not loaded: D3D9 cache files belong in "
-                   "plugins\\d3d9cache\\, pipelinecache\\ is for Vulkan .foz files");
+        // Once per launch, whichever of this and vkcapture finds them first.
+        pipelinekeys::HintMisplaced("[ShaderPrecompile] ", pipelinekeys::kFozInD3d9Cache, drop.foz,
+                                    d3d9cache::Utf8(drop.firstFoz));
+        pipelinekeys::HintMisplaced("[ShaderPrecompile] ", pipelinekeys::kBinInPipelineCache, drop.misplacedBins,
+                                    d3d9cache::Utf8(drop.firstMisplaced));
         for (const auto& name : drop.other)
             LogStr("replay: d3d9cache\\" + d3d9cache::Utf8(name) + ": skipped - not a .bin cache file");
         for (const auto& path : drop.files)
@@ -1568,7 +1567,7 @@ class ShaderPrecompiler
 
         const size_t recsBefore = replayRecs.size();
         const uint32_t src = (uint32_t)replaySources.size();
-        replaySources.push_back({ what });
+        replaySources.push_back({ what, dropIn });
 
         // File-local declaration index -> our index.
         std::vector<uint32_t> remap(c.decls.size(), 0);
@@ -1615,10 +1614,21 @@ class ShaderPrecompiler
 
         // The bytecode arrives in the same file as the keys that name it, so a key set
         // can never be loaded without the shaders needed to replay it.
+        //
+        // Except from a drop-in. The reader checks bytecode as far as a token walk can
+        // (d3d9cache::CheckBytecode), but what DXVK's shader converter accepts is far
+        // more than that -- register types per opcode, balanced control flow, and much
+        // else -- and a shader it throws on kills one of its threads: the loading
+        // screen then hangs, on every launch, for as long as the file is there. So a
+        // shader is only ever created from bytecode this PC recorded itself or that
+        // FusionFix shipped. A drop-in's keys still name the game's .fxc shaders
+        // (resolved from this install), FusionFix's own embedded ones, and whatever
+        // the capture and baseline carry; a key naming anything else is counted as a
+        // shader this install lacks, and is warmed once this PC has drawn it.
         uint32_t newShaders = 0;
         for (auto& [hash, blob] : c.shaders)
         {
-            if (replayBlobs.count(hash) || replayBlobBytes + blob.code.size() > kMaxReplayBlobBytes) continue;
+            if (dropIn || replayBlobs.count(hash) || replayBlobBytes + blob.code.size() > kMaxReplayBlobBytes) continue;
             replayBlobBytes += blob.code.size();
             replayBlobs.emplace(hash, blob);
             newShaders++;
@@ -1632,7 +1642,9 @@ class ShaderPrecompiler
 
         replaySources[src].added = (uint32_t)(replayRecs.size() - recsBefore);
         line += "; " + std::to_string(replaySources[src].added) + " keys new to the replay set (" +
-                std::to_string(merged) + " already known), " + std::to_string(newShaders) + " new shaders";
+                std::to_string(merged) + " already known), " +
+                (dropIn ? std::to_string(c.shaders.size()) + " shaders not used (bytecode from other PCs is never run)"
+                        : std::to_string(newShaders) + " new shaders");
         if (full)
             line += "; " + std::to_string(full) + " more not taken, the replay set is full (" +
                     std::to_string(kMaxReplayKeys) + " keys)";
@@ -1777,9 +1789,15 @@ class ShaderPrecompiler
     {
         if (replayBlobs.empty()) { Log("replay: the cache carried no shader bytecode"); return; }
 
-        uint32_t madeVS = 0, madePS = 0, failed = 0;
+        // Only what a key names: each shader created here lives as long as the
+        // process, and GTA IV is a 32-bit one.
+        std::unordered_set<uint64_t> named;
+        for (const auto& k : replayRecs) { named.insert(k.vsHash); named.insert(k.psHash); }
+
+        uint32_t madeVS = 0, madePS = 0, failed = 0, unnamed = 0;
         for (auto& [hash, blob] : replayBlobs)
         {
+            if (!named.count(hash)) { unnamed++; continue; }
             const DWORD* fn = reinterpret_cast<const DWORD*>(blob.code.data());
             if (blob.stage == pipelinekeys::kStageVS)
             {
@@ -1813,8 +1831,8 @@ class ShaderPrecompiler
             }
         }
 
-        Log("replay: created %u VS + %u PS from the cache's bytecode (%zu stored, %u failed)",
-            madeVS, madePS, replayBlobs.size(), failed);
+        Log("replay: created %u VS + %u PS from the cache's bytecode (%zu stored, %u named by no key, %u failed)",
+            madeVS, madePS, replayBlobs.size(), unnamed, failed);
     }
 
     // ---- FusionFix's OWN embedded shaders ------------------------------------
@@ -2102,13 +2120,25 @@ class ShaderPrecompiler
             drawList.resize(replayBaseCount);
         }
 
+        // This PC's own keys and the baseline's first, then the ones only other PCs'
+        // files name, each part in the order above. The part from other PCs is drawn
+        // after a wait until DXVK is quiet and with vkcapture's recording paused
+        // (VulkanReplayState::recordPaused): those pipelines are warmed every launch
+        // from the files themselves, but they are not this PC's and must not end up
+        // in its own Vulkan recording. And a PrecompileBudgetSeconds cut can then never
+        // spend the budget on another PC's configuration before this PC's own.
+        const size_t foreignAt = (size_t)(std::stable_partition(drawList.begin(), drawList.end(), [](uint32_t r) {
+            return !replaySources[replaySrc[r]].dropIn;
+        }) - drawList.begin());
+
         // workDone currently holds the create-pass units; everything left is drawing.
         workTotal = workDone + (uint32_t)drawList.size() * kPassW;
         if (workTotal == 0) workTotal = 1;
         Log("replay: %zu unique pipelines to build from %zu keys: %u base identities first "
-            "(shaders + vertex input + output state), then %zu spec-constant variants; %u instanced",
+            "(shaders + vertex input + output state), then %zu spec-constant variants; %u instanced; "
+            "%zu named only by other PCs' files, last",
             drawList.size(), replayRecs.size(), replayBaseCount,
-            drawList.size() - replayBaseCount, instanced);
+            drawList.size() - replayBaseCount, instanced, drawList.size() - foreignAt);
 
         // Adaptive exit: if pipelines are not actually being COMPILED, there is
         // nothing to win and the whole pass is a pure loading-time regression.
@@ -2143,8 +2173,22 @@ class ShaderPrecompiler
         IDirect3DQuery9* fence = nullptr;
         dev->CreateQuery(D3DQUERYTYPE_EVENT, &fence);
 
+        size_t at = 0;
         for (uint32_t r : drawList)
         {
+            if (at++ == foreignAt)
+            {
+                // Everything so far built and DXVK quiet, then no recording (see above).
+                // The wait has a bar of its own; this one carries on where it was.
+                if (sinceFence) { FenceChunk(fence); workDone += kPassW * sinceFence; sinceFence = 0; }
+                const uint32_t total = workTotal, done = workDone;
+                const auto phase = tPhase;
+                WaitUntilIdle("this PC's own keys");
+                workTotal = total; workDone = done; tPhase = phase;
+                pipelinekeys::VulkanReplay().recordPaused = true;
+                Log("replay: Vulkan recording paused for the %zu pipelines only other PCs' files name, t=%.3f",
+                    drawList.size() - foreignAt, pipelinekeys::VulkanReplay().Seconds());
+            }
             const KeyRecord& k = replayRecs[r];
             ReplaySource& from = replaySources[replaySrc[r]];
 
@@ -2678,6 +2722,10 @@ class ShaderPrecompiler
                 DummyDrawPass(db);
             }
             WaitUntilIdle("the D3D9 pass");
+            // Everything the other PCs' keys started is built: record again.
+            if (pipelinekeys::VulkanReplay().recordPaused.exchange(false))
+                Log("replay: Vulkan recording resumed, t=%.3f - %u pipelines DXVK created meanwhile were not recorded",
+                    pipelinekeys::VulkanReplay().Seconds(), pipelinekeys::VulkanReplay().notRecorded.load());
             fxc_free(db);
         }
         if (HoldForVulkanReplay())
@@ -2947,8 +2995,13 @@ class ShaderPrecompiler
                 __try { RunBlocking(); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { Log("precompile faulted - continuing to game"); }
                 pipelinekeys::PassThread() = 0;
-                // However the pass ended, the Vulkan replay must not wait for it any longer.
-                pipelinekeys::VulkanReplay().passDone = true;
+                // However the pass ended, the Vulkan replay must not wait for it any
+                // longer, the loading screen is no longer held for it, and vkcapture
+                // records again.
+                auto& vr = pipelinekeys::VulkanReplay();
+                vr.passDone = true;
+                vr.holding = false;
+                vr.recordPaused = false;
                 finished = true;
                 Log("gate: ran after %d loadscreen frames at %ux%u", loadscreenFramesSeen, gateW, gateH);
             }
@@ -2982,9 +3035,6 @@ public:
         FusionFix::onInitEvent() += []()
         {
             ReadConfig();
-            // The whole Vulkan replay waits for this pass, and then runs with the loading
-            // screen held; without the pass it runs in the background from the start.
-            pipelinekeys::VulkanReplay().passPlanned = cfg.enabled;
             // The flash probe rides the same hook, so arm for either.
             if (!cfg.enabled && cfg.flashProbe <= 0) { Log("disabled via ini"); return; }
 
@@ -3003,6 +3053,10 @@ public:
                 Log("armed at loadscreen render %p (breadth=%d, overlay=%d, gate=%d frames)", target, cfg.breadth, cfg.overlay, kStableFramesNeeded);
             else
                 Log("FAILED to hook loadscreen render at %p", target);
+            // The whole Vulkan replay waits for this pass, and then runs with the loading
+            // screen held; without the pass -- off, or no hook to run it from -- it runs
+            // in the background from the start.
+            pipelinekeys::VulkanReplay().passPlanned = cfg.enabled && shLoadscreenRender;
         };
     }
 } ShaderPrecompiler;

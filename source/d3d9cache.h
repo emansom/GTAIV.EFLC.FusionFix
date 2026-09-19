@@ -11,7 +11,10 @@
 //     enum a replay passes to D3D9, every vertex declaration, and every shader's
 //     bytecode (its hash, and a token walk that keeps DXVK's reader inside the
 //     buffer). Damage to the container rejects the file; a bad key, declaration or
-//     shader drops only that item, and the rest of the file is still used.
+//     shader drops only that item, and the rest of the file is still used. (A token
+//     walk cannot vouch for everything DXVK's shader converter demands, so the
+//     replay never creates a shader from a drop-in's bytecode at all: see its
+//     MergeKeyFile.)
 //
 //   * FIND the drop-ins: plugins\d3d9cache\, top level, any .bin name. Nothing in
 //     that folder is ever written, moved or renamed, except this PC's own snapshot.
@@ -44,22 +47,20 @@ namespace d3d9cache
     constexpr uint32_t kMaxDeclElements = MAXD3DDECLLENGTH + 1;   // incl. D3DDECL_END
     constexpr uint32_t kOldestVersion   = 1;
 
+    // What this PC's own capture may grow to, so that it always reads back -- here
+    // and on the PCs it is shared with -- under kMaxFileBytes: keys up to that less
+    // 2 MB, and at most 1 MB of carried bytecode, which leaves ~1 MB for everything
+    // else (a real capture has 29 declarations and ~50 KB of bytecode). ~44,000 keys;
+    // a capture that has seen ~3.5 million draws holds 14,500.
+    constexpr size_t kMaxCaptureKeys        = (kMaxFileBytes - (2u << 20)) / sizeof(KeyRecord);
+    constexpr size_t kMaxCaptureShaderBytes = 1u << 20;
+
     // Container v1 is v2 without KeyRecord::streamFreq; everything else is the same.
     constexpr size_t kRecordV1 = offsetof(KeyRecord, streamFreq) + 2 * sizeof(uint32_t);
 
     // ---- names ---------------------------------------------------------------
-    // The content hash that names and de-duplicates files: 64-bit FNV-1a with the
-    // standard offset basis, over the whole file. NOT pipelinekeys::Fnv1a, whose
-    // basis is 1469598103934665603 -- the standard one with its last digit lost --
-    // and which cannot be fixed, because every shader and key hash in every cache
-    // file is computed with it. The Vulkan side names its files with this one too.
-    inline uint64_t ContentHash(const void* data, size_t len)
-    {
-        auto p = static_cast<const uint8_t*>(data);
-        uint64_t h = 0xcbf29ce484222325ull;
-        for (size_t i = 0; i < len; i++) { h ^= p[i]; h *= 0x100000001b3ull; }
-        return h;
-    }
+    // The content hash that names and de-duplicates files (see pipelinekeys.h).
+    using pipelinekeys::ContentHash;
 
     // FusionFix.<16 lowercase hex digits of ContentHash>.bin
     inline std::string ContentName(uint64_t h)
@@ -791,11 +792,29 @@ namespace d3d9cache
         return false;
     }
 
+    // The state file's new contents: one name per line, or no file at all.
+    inline bool WriteState(const std::vector<std::string>& names)
+    {
+        if (names.empty())
+            return DeleteFileW(StatePath().c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND;
+        std::string text;
+        for (const auto& n : names) text += n + "\r\n";
+        return WriteViaTemp(StatePath(), text.data(), text.size(), true);
+    }
+
     // Once per launch, before capture writes anything: copy each of this PC's own
     // capture files (FusionFix.pipelinecache.f<fmt>-ms<msaa>.bin) into
     // plugins\d3d9cache\ as FusionFix.<h>.bin, skip names that already exist, and
     // delete the snapshots this PC wrote before that are no longer current. A file
     // is only shared if it reads back as valid here. `log` gets one line per action.
+    //
+    // The earlier snapshots are only deleted once every own file is accounted for:
+    // written, or there already. If one could not be read, did not read back as
+    // valid or could not be written -- or there is no own file at all -- they stay,
+    // because the last snapshot may then be the only intact copy of what this PC
+    // captured (the capture itself falls back to it: see its LoadBundle). A new
+    // snapshot is entered in the state file BEFORE it is written, so a crash in
+    // between can never leave one of ours that nothing remembers.
     template <typename LogFn>
     inline void SnapshotOwnCaptures(LogFn log)
     {
@@ -821,8 +840,8 @@ namespace d3d9cache
         std::sort(own.begin(), own.end());
 
         const std::vector<std::string> previous = ReadState();
-        std::vector<std::string> current;
-        bool failed = false;
+        std::vector<std::string> current, listed = previous;
+        bool failed = own.empty();
         for (const auto& name : own)
         {
             std::vector<uint8_t> bytes;
@@ -830,6 +849,7 @@ namespace d3d9cache
             bool absent = false;
             if (!ReadFileBytes(plugins + name, bytes, kMaxFileBytes, why, absent))
             {
+                failed = true;
                 log(("snapshot: " + Utf8(name) + " " + why + " - not shared").c_str());
                 continue;
             }
@@ -839,6 +859,7 @@ namespace d3d9cache
             ParseResult p = Parse(bytes.data(), bytes.size(), c);
             if (p.verdict != Verdict::Accepted)
             {
+                failed = true;
                 log(("snapshot: " + Utf8(name) + " does not read back as valid (" + p.reason + ") - not shared").c_str());
                 continue;
             }
@@ -849,6 +870,19 @@ namespace d3d9cache
             {
                 log(("snapshot: " + Utf8(name) + " is already in d3d9cache\\ as " + snap).c_str());
                 continue;
+            }
+            // Remembered first, written second (see above).
+            if (std::find(listed.begin(), listed.end(), snap) == listed.end())
+            {
+                listed.push_back(snap);
+                if (!WriteState(listed))
+                {
+                    failed = true;
+                    listed.pop_back();
+                    current.pop_back();
+                    log(("snapshot: could not write FusionFix.d3d9cache.state - " + snap + " not written").c_str());
+                    continue;
+                }
             }
             CreateDirectoryW(dir.c_str(), nullptr);
             if (WriteViaTemp(target, bytes.data(), bytes.size(), false))
@@ -862,8 +896,8 @@ namespace d3d9cache
             }
         }
 
-        // Retire this PC's earlier snapshots. If a write failed, keep them: the old
-        // one is still the best this PC has to share.
+        // Retire this PC's earlier snapshots -- unless an own file is not accounted
+        // for, and the old one may be the best this PC has (see above).
         std::vector<std::string> keep = current;
         for (const auto& old : previous)
         {
@@ -875,15 +909,29 @@ namespace d3d9cache
             else if (GetLastError() != ERROR_FILE_NOT_FOUND)
                 keep.push_back(old);
         }
+        if (keep != listed && !WriteState(keep))
+            log("snapshot: could not write FusionFix.d3d9cache.state");
+    }
 
-        if (keep != previous)
+    // This PC's own snapshot of the capture recorded at back-buffer format `fmt` and
+    // MSAA level `msaa` -- the one with the most keys, if the state file lists more
+    // than one -- for a capture that no longer reads back. `name` gets its file name.
+    inline bool LoadOwnSnapshot(uint32_t fmt, int32_t msaa, const std::string& shaderDir, CacheContents& out,
+                                std::string& name)
+    {
+        bool found = false;
+        for (const auto& n : ReadState())
         {
-            std::string text;
-            for (const auto& n : keep) text += n + "\r\n";
-            if (keep.empty()) DeleteFileW(StatePath().c_str());
-            else if (!WriteViaTemp(StatePath(), text.data(), text.size(), true))
-                log("snapshot: could not write FusionFix.d3d9cache.state");
+            std::unordered_map<uint64_t, std::string> seen;
+            CacheContents c;
+            const FileResult f = LoadFile(DropInDir() + Wide(n), n, shaderDir, seen, c);
+            if (f.verdict != Verdict::Accepted || c.meta.bbFormat != fmt || c.meta.msaa != msaa) continue;
+            if (found && c.keys.size() <= out.keys.size()) continue;
+            out = std::move(c);
+            name = n;
+            found = true;
         }
+        return found;
     }
 
     // ---- the running game ----------------------------------------------------------

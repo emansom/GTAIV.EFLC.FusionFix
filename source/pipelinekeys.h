@@ -229,28 +229,44 @@ namespace pipelinekeys
         fclose(f);
     }
 
-    // plugins\pipelinecache\, beside the ASI: where a player drops cache files from
-    // their OTHER devices. Capture merges them into this device's file and the replay
-    // warms them (see the capture's LoadImports). Empty if the ASI path is unknown.
-    inline std::string ImportDir()
-    {
-        char buf[MAX_PATH] = {};
-        HMODULE self = nullptr;
-        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCWSTR>(&ImportDir), &self);
-        if (!GetModuleFileNameA(self, buf, MAX_PATH)) return std::string();
-        std::string s(buf);
-        auto slash = s.find_last_of("\\/");
-        if (slash == std::string::npos) return std::string();
-        return s.substr(0, slash + 1) + "pipelinecache\\";
-    }
-
     inline uint64_t Fnv1a(const void* data, size_t len, uint64_t h = 1469598103934665603ull)
     {
         auto p = static_cast<const uint8_t*>(data);
         for (size_t i = 0; i < len; i++) { h ^= p[i]; h *= 1099511628211ull; }
         return h;
+    }
+
+    // The content hash that names and de-duplicates the files players share between
+    // PCs (FusionFix.<h>.bin in plugins\d3d9cache\, FusionFix.<h>.foz in
+    // plugins\pipelinecache\): 64-bit FNV-1a with the standard offset basis, over the
+    // whole file. NOT Fnv1a above, whose basis is 1469598103934665603 -- the standard
+    // one with its last digit lost -- and which cannot be fixed, because every shader
+    // and key hash in every cache file is computed with it. Pass the previous result
+    // as `h` to hash a file in pieces.
+    inline uint64_t ContentHash(const void* data, size_t len, uint64_t h = 0xcbf29ce484222325ull)
+    {
+        auto p = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < len; i++) { h ^= p[i]; h *= 0x100000001b3ull; }
+        return h;
+    }
+
+    // A file in the wrong one of the two shared folders gets ONE line in the log,
+    // however many of the readers (the D3D9 replay, vkcapture) come across it.
+    enum Misplaced : uint32_t
+    {
+        kBinInPipelineCache = 1,   // a D3D9 cache file (.bin) in the Vulkan folder
+        kFozInD3d9Cache     = 2,   // a Vulkan pipeline database (.foz) in the D3D9 folder
+    };
+    inline void HintMisplaced(const char* tag, Misplaced what, uint32_t n, const std::string& example)
+    {
+        static std::atomic<uint32_t> given{ 0 };
+        if (!n || (given.fetch_or(what) & what)) return;
+        const std::string line = what == kBinInPipelineCache
+            ? "replay: pipelinecache\\ holds " + std::to_string(n) + " .bin file(s) (e.g. '" + example +
+              "') - not loaded: D3D9 cache files belong in plugins\\d3d9cache\\, pipelinecache\\ is for Vulkan .foz files"
+            : "replay: d3d9cache\\ holds " + std::to_string(n) + " .foz file(s) (e.g. '" + example +
+              "') - not loaded: Vulkan pipeline databases belong in plugins\\pipelinecache\\";
+        LogLine(tag, line.c_str());
     }
 
     // Every shader the PROCESS creates, indexed by the same bytecode hash the
@@ -438,6 +454,12 @@ namespace pipelinekeys
     //     csUs, if asked for, gets the CS thread's ("dxvk-cs") CPU time: busy at
     //     every draw, so a reading that stays 0 there means this cannot be measured
     //     here at all, rather than that the compilers were idle.
+    //   * recordPaused / notRecorded: while set, vkcapture records no pipelines, and
+    //     counts the ones it leaves out. The D3D9 pass sets it for the keys only other
+    //     PCs' files name (drawn last, after a wait until DXVK is quiet) and clears it
+    //     once DXVK is quiet again: their pipelines are warmed every launch, but they
+    //     are not this PC's, and must not end up in its own Vulkan recording -- nor,
+    //     through its shared copy, on the other PCs.
     //   * epochUs / epochLocal: the session clock every "t=" in the log counts from
     //     (vkcapture touches this state when the ASI loads).
     // Quiet cannot see a driver compiling in threads of its own after the create call
@@ -464,6 +486,8 @@ namespace pipelinekeys
         std::atomic<uint32_t> creations{ 0 };
         std::atomic<int64_t> lastActivityUs{ 0 };
         uint64_t (*compilerCpuUs)(uint32_t* threads, uint64_t* csUs) = nullptr;
+        std::atomic<bool> recordPaused{ false };
+        std::atomic<uint32_t> notRecorded{ 0 };   // pipelines DXVK created meanwhile
 
         const int64_t epochUs = ClockUs();
         const SYSTEMTIME epochLocal = [] { SYSTEMTIME st{}; GetLocalTime(&st); return st; }();
@@ -685,8 +709,10 @@ namespace pipelinekeys
 
         fseek(f, tableAt, SEEK_SET);
         fwrite(secs, sizeof(CacheSection), nsec, f);
-        fclose(f);
-        return true;
+        // A full disk shows up here and nowhere else: fwrite and fclose both report it,
+        // and a half-written file must never replace a whole one.
+        const bool ok = !ferror(f);
+        return fclose(f) == 0 && ok;
     }
 
 

@@ -140,6 +140,7 @@ class ShaderCapture
     static inline uint64_t frameOrdinal = 0;
     static inline uint32_t lastReportedUnique = 0;
     static inline bool dirty = false;
+    static inline bool full = false;         // d3d9cache::kMaxCaptureKeys reached
     static inline std::chrono::steady_clock::time_point tLastFlush;
 
     static inline HMODULE hSelf = nullptr;
@@ -357,6 +358,17 @@ class ShaderCapture
         if (it != keyIndex.end())
         {
             records[it->second].count++;
+        }
+        else if (records.size() >= d3d9cache::kMaxCaptureKeys)
+        {
+            // Full: the file must still read back, here and on the PCs it is shared
+            // with (d3d9cache::kMaxFileBytes). Known keys keep counting.
+            if (!full)
+            {
+                full = true;
+                Log("capture is full (%zu keys, the most one cache file holds) - new keys are no longer recorded",
+                    records.size());
+            }
         }
         else
         {
@@ -643,33 +655,38 @@ class ShaderCapture
         // resolves every .fxc shader by hash from the install (see
         // pipelinekeys::InstalledFxcHashes). Keys are kept either way, so nothing
         // that was captured stops being warmed.
-        size_t leftOut = 0;
+        // At most d3d9cache::kMaxCaptureShaderBytes of it, so the file stays readable
+        // (see RecordDraw); a real capture carries ~50 KB.
+        size_t leftOut = 0, carried = 0, overCap = 0;
         for (auto& [h, b] : shaderBlobs)
         {
-            if (pipelinekeys::CarryBytecode(h)) c.shaders.emplace(h, b);
-            else leftOut++;
+            if (!pipelinekeys::CarryBytecode(h)) { leftOut++; continue; }
+            if (carried + b.code.size() > d3d9cache::kMaxCaptureShaderBytes) { overCap++; continue; }
+            carried += b.code.size();
+            c.shaders.emplace(h, b);
         }
         static bool reported = false;
         if (!reported)
         {
             reported = true;
             Log("cache carries bytecode for %zu shaders; %zu more are resolved from the install's "
-                ".fxc files by hash (%zu known there)", c.shaders.size(), leftOut,
-                pipelinekeys::InstalledFxcHashes().size());
+                ".fxc files by hash (%zu known there)%s", c.shaders.size(), leftOut,
+                pipelinekeys::InstalledFxcHashes().size(), overCap ? "; some left out, over 1 MB of bytecode" : "");
         }
 
-        // Write beside the target and rename, so a crash mid-write cannot leave a
-        // contributor with a half-file that still has a valid header.
+        // Write beside the target and swap it in in one step, so a crash or a full
+        // disk mid-write can neither leave a contributor with a half-file that still
+        // has a valid header nor leave no file at all.
         const std::string finalPath = OutDir() + bundleBin;
         const std::string tmpPath   = finalPath + ".tmp";
         if (!pipelinekeys::WriteCache(tmpPath, c))
         {
-            Log("could not write %s", tmpPath.c_str());
+            Log("could not write %s - the previous file stays", tmpPath.c_str());
+            remove(tmpPath.c_str());
             return;
         }
-        remove(finalPath.c_str());
-        if (rename(tmpPath.c_str(), finalPath.c_str()) != 0)
-            Log("could not replace %s", finalPath.c_str());
+        if (!MoveFileExA(tmpPath.c_str(), finalPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            Log("could not replace %s (error %lu)", finalPath.c_str(), GetLastError());
     }
 
     // Shader bytecode lives in the same container as the keys that name it. Only
@@ -741,12 +758,26 @@ class ShaderCapture
         const std::string aside = path + ".unmerged";
         remove(aside.c_str());
         if (rename(path.c_str(), aside.c_str()) == 0)
-            Log("existing cache could not be merged (the reason above) - kept it as %s.unmerged and "
-                "started a new one", bundleBin.c_str());
+            Log("existing cache could not be merged (the reason above) - kept it as %s.unmerged", bundleBin.c_str());
         else
             Log("existing cache could not be merged NOR moved aside - capture disabled so it is "
                 "not overwritten");
-        if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) enabled = false;
+        if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) { enabled = false; return; }
+
+        // Carry on from this PC's last snapshot of it in plugins\d3d9cache\, which is
+        // the same capture as of an earlier launch -- that is why the snapshot stays
+        // while the file does not read back (d3d9cache::SnapshotOwnCaptures).
+        std::string snap;
+        pipelinekeys::CacheContents s;
+        if (d3d9cache::LoadOwnSnapshot(bundleFmt, bundleMsaa, metaShaderDir, s, snap))
+        {
+            MergeBundle(s);
+            dirty = true;
+            Log("carried on from this PC's snapshot d3d9cache\\%s: %zu keys, %zu declarations",
+                snap.c_str(), records.size(), declTable.size());
+        }
+        else
+            Log("no snapshot of it in plugins\\d3d9cache\\ to carry on from - started a new one");
     }
 
     static void LoadExisting()
