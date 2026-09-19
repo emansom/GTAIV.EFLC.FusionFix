@@ -408,9 +408,7 @@ class ShaderPrecompiler
         va_list ap; va_start(ap, fmt);
         vsnprintf(buf, sizeof(buf), fmt, ap);
         va_end(ap);
-        OutputDebugStringA("[ShaderPrecompile] ");
-        OutputDebugStringA(buf);
-        OutputDebugStringA("\n");
+        pipelinekeys::LogLine("[ShaderPrecompile] ", buf);
     }
 
     // Drain the message queue so Windows keeps the window "responsive" while the

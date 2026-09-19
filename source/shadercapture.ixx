@@ -143,9 +143,7 @@ class ShaderCapture
         va_list ap; va_start(ap, fmt);
         vsnprintf(buf, sizeof(buf), fmt, ap);
         va_end(ap);
-        OutputDebugStringA("[ShaderCapture] ");
-        OutputDebugStringA(buf);
-        OutputDebugStringA("\n");
+        pipelinekeys::LogLine("[ShaderCapture] ", buf);
     }
 
     static inline uint64_t fnv1a(const void* data, size_t len, uint64_t h = 1469598103934665603ull)

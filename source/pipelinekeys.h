@@ -171,6 +171,47 @@ namespace pipelinekeys
         return std::string(buf);
     }
 
+    // Log to a FILE as well as OutputDebugString.
+    //
+    // On Linux the debug strings are readable because Wine funnels them into its own
+    // debug channel, which the harness greps. On WINDOWS nothing captures
+    // OutputDebugString without a debugger attached, so a contributor could never see
+    // this log at all -- and the crowd-test harness's Verify-Precompiler step hunts
+    // for a log file the ASI never wrote, which is why it could never pass there.
+    //
+    // It also has to be a file for the log to survive a reboot: when the only way to
+    // get results off a Windows install is to mount the partition from the other OS,
+    // anything that lived only in a debug channel is gone.
+    inline void LogLine(const char* tag, const char* msg)
+    {
+        OutputDebugStringA(tag);
+        OutputDebugStringA(msg);
+        OutputDebugStringA("\n");
+
+        static std::string path = []() -> std::string {
+            char buf[MAX_PATH] = {};
+            HMODULE self = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&LogLine), &self);
+            if (!GetModuleFileNameA(self, buf, MAX_PATH)) return std::string();
+            std::string s(buf);
+            auto slash = s.find_last_of("\\/");
+            if (slash == std::string::npos) return std::string();
+            return s.substr(0, slash + 1) + "FusionFix.shaders.log";
+        }();
+        if (path.empty()) return;
+
+        // Truncate once per process so the file is this run's log, not an unbounded
+        // accumulation a contributor would have to figure out how to read.
+        static bool opened = false;
+        FILE* f = fopen(path.c_str(), opened ? "a" : "w");
+        if (!f) return;
+        opened = true;
+        fprintf(f, "%s%s\n", tag, msg);
+        fclose(f);
+    }
+
     inline uint64_t Fnv1a(const void* data, size_t len, uint64_t h = 1469598103934665603ull)
     {
         auto p = static_cast<const uint8_t*>(data);
