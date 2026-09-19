@@ -13,9 +13,13 @@
 #include <cstdint>
 #include <cstddef>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <string>
 #include <cstdio>
+#include <mutex>
+#include <filesystem>
+#include "fxc_parse.h"
 
 namespace pipelinekeys
 {
@@ -223,6 +227,23 @@ namespace pipelinekeys
         fclose(f);
     }
 
+    // plugins\pipelinecache\, beside the ASI: where a player drops cache files from
+    // their OTHER devices. Capture merges them into this device's file and the replay
+    // warms them (see the capture's LoadImports). Empty if the ASI path is unknown.
+    inline std::string ImportDir()
+    {
+        char buf[MAX_PATH] = {};
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&ImportDir), &self);
+        if (!GetModuleFileNameA(self, buf, MAX_PATH)) return std::string();
+        std::string s(buf);
+        auto slash = s.find_last_of("\\/");
+        if (slash == std::string::npos) return std::string();
+        return s.substr(0, slash + 1) + "pipelinecache\\";
+    }
+
     inline uint64_t Fnv1a(const void* data, size_t len, uint64_t h = 1469598103934665603ull)
     {
         auto p = static_cast<const uint8_t*>(data);
@@ -250,6 +271,59 @@ namespace pipelinekeys
     {
         static ShaderRegistry r;
         return r;
+    }
+
+    // The .fxc directory the replay loads: <gameroot>/update/common/shaders/win32_30,
+    // the effective installed set (update/ overrides common/), else the base one.
+    // One definition, so what cache files leave out and what the replay can resolve
+    // are always the same set.
+    inline std::filesystem::path InstalledShaderDir()
+    {
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        auto root = std::filesystem::path(exe).parent_path();
+        auto upd = root / "update" / "common" / "shaders" / "win32_30";
+        std::error_code ec;
+        if (std::filesystem::exists(upd, ec)) return upd;
+        return root / "common" / "shaders" / "win32_30";
+    }
+
+    // Every shader in the install's own .fxc files, by the bytecode hash the capture
+    // records.
+    //
+    // Cache files carry bytecode only for shaders the install CANNOT supply. The
+    // replay resolves .fxc shaders by hash from the install itself
+    // (IndexShadersByHash), so their bytecode in a file warms nothing extra: where
+    // the install has the shader it is found there, and where it does not, the
+    // pipeline would never be drawn on that install anyway. Storing it only put
+    // Rockstar-derived bytecode -- and other mods' shaders, e.g. Liberty City Plates
+    // -- into every file a player shares. What still needs carrying is what FusionFix
+    // compiles at runtime (SMAA, FXAA, ...), which no .fxc holds.
+    //
+    // Parsed once, on first use, from whichever thread gets there first. Empty if the
+    // directory cannot be parsed, which falls back to carrying all bytecode.
+    inline const std::unordered_set<uint64_t>& InstalledFxcHashes()
+    {
+        static std::once_flag once;
+        static std::unordered_set<uint64_t> hashes;
+        std::call_once(once, [] {
+            fxc_db* db = fxc_load_all(InstalledShaderDir().string().c_str());
+            if (!db) return;
+            for (uint32_t i = 0, n = fxc_unique_count(db); i < n; i++)
+            {
+                const fxc_shader* s = fxc_unique_shader(db, i);
+                if (s && s->bytecode && s->size) hashes.insert(Fnv1a(s->bytecode, s->size));
+            }
+            fxc_free(db);
+        });
+        return hashes;
+    }
+
+    // The bytecode worth writing to a cache file: everything the install cannot
+    // supply itself (see InstalledFxcHashes).
+    inline bool CarryBytecode(uint64_t hash)
+    {
+        return InstalledFxcHashes().count(hash) == 0;
     }
 
     // Every Present on the device, counted at the vtable.

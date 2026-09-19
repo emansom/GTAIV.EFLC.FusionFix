@@ -1465,6 +1465,24 @@ class ShaderPrecompiler
         bool any = MergeKeyFile(KeyFilePath(), "capture");
         any |= MergeKeyFile(BaselinePath(), "baseline");
 
+        // Caches from the player's other devices (plugins\pipelinecache\). Capture
+        // merges them into the local file too, but only writes that out after its
+        // first flush, which can be after this pass -- so read them directly here as
+        // well, and the first launch after dropping a file in is already warm.
+        const std::string importDir = pipelinekeys::ImportDir();
+        WIN32_FIND_DATAA fd{};
+        HANDLE fh = importDir.empty() ? INVALID_HANDLE_VALUE
+                                      : FindFirstFileA((importDir + "*.bin").c_str(), &fd);
+        if (fh != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                any |= MergeKeyFile(importDir + fd.cFileName, "import");
+            } while (FindNextFileA(fh, &fd));
+            FindClose(fh);
+        }
+
         Log("replay: loaded %zu keys, %zu declarations", replayRecs.size(), replayDecls.size());
         return any && !replayRecs.empty();
     }
@@ -1610,10 +1628,12 @@ class ShaderPrecompiler
             needed.insert(k.psHash);
         }
 
-        // Ship only the bytecode these keys actually name. A baseline that carries the
-        // whole sidecar would be mostly shaders no shipped key references.
+        // Ship only the bytecode these keys actually name, and of that only what an
+        // install cannot supply itself: .fxc shaders are resolved by hash from the
+        // player's own files (pipelinekeys::CarryBytecode), so the baseline carries
+        // FusionFix's runtime-built shaders and no Rockstar-derived bytecode.
         for (uint64_t hash : needed)
-            if (auto it = replayBlobs.find(hash); it != replayBlobs.end())
+            if (auto it = replayBlobs.find(hash); it != replayBlobs.end() && pipelinekeys::CarryBytecode(hash))
                 c.shaders.emplace(hash, it->second);
 
         if (!WriteCache(path, c)) { Log("baseline: cannot write %s", path.c_str()); return; }
@@ -2304,17 +2324,11 @@ class ShaderPrecompiler
     // -------------------------------------------------------------------
     //  Orchestration — the whole blocking pass, on the render thread.
     // -------------------------------------------------------------------
+    // The same directory cache files are trimmed against (pipelinekeys.h), so every
+    // shader whose bytecode a file leaves out is one this database can resolve.
     static std::string ResolveShaderDir()
     {
-        // <gameroot>/update/common/shaders/win32_30 (the effective, installed set;
-        // update/ overrides common/). Derive gameroot from GTAIV.exe.
-        auto exe = GetModulePath<std::filesystem::path>(GetModuleHandleW(nullptr));
-        auto root = exe.parent_path();
-        auto upd = root / "update" / "common" / "shaders" / "win32_30";
-        std::error_code ec;
-        if (std::filesystem::exists(upd, ec)) return upd.string();
-        auto base = root / "common" / "shaders" / "win32_30";
-        return base.string();
+        return pipelinekeys::InstalledShaderDir().string();
     }
 
     static void RunBlocking()

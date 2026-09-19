@@ -635,7 +635,24 @@ class ShaderCapture
 
         c.decls = declTable;
         c.keys  = records;
-        c.shaders = shaderBlobs;
+        // Bytecode only for what an install cannot supply itself; the replay
+        // resolves every .fxc shader by hash from the install (see
+        // pipelinekeys::InstalledFxcHashes). Keys are kept either way, so nothing
+        // that was captured stops being warmed.
+        size_t leftOut = 0;
+        for (auto& [h, b] : shaderBlobs)
+        {
+            if (pipelinekeys::CarryBytecode(h)) c.shaders.emplace(h, b);
+            else leftOut++;
+        }
+        static bool reported = false;
+        if (!reported)
+        {
+            reported = true;
+            Log("cache carries bytecode for %zu shaders; %zu more are resolved from the install's "
+                ".fxc files by hash (%zu known there)", c.shaders.size(), leftOut,
+                pipelinekeys::InstalledFxcHashes().size());
+        }
 
         // Write beside the target and rename, so a crash mid-write cannot leave a
         // contributor with a half-file that still has a valid header.
@@ -651,11 +668,12 @@ class ShaderCapture
             Log("could not replace %s", finalPath.c_str());
     }
 
-    // Shader bytecode now lives in the same container as the keys that name it. Only
+    // Shader bytecode lives in the same container as the keys that name it. Only
     // shaders that actually appear in a DRAW are stored: a shader nobody draws with has
     // no key referencing it, so its bytecode would be dead weight -- which matters
     // here because the precompiler creates RAGE's whole 1734-shader database through
-    // this same device, and capture is normally left on while it does.
+    // this same device, and capture is normally left on while it does. Of those, only
+    // the ones no .fxc supplies are written out (WriteCacheFile).
 
 
     // There used to be a .txt summary written alongside the cache. A contribution has
@@ -686,10 +704,10 @@ class ShaderCapture
     // Capture writes to this same path on its first flush, so "refuse and start
     // fresh" used to mean "refuse and then overwrite": every format bump silently
     // destroyed the accumulated capture it had just declined to read.
-    static void LoadExisting()
+    static void LoadBundle()
     {
         const std::string path = OutDir() + bundleBin;
-        if (MergeBundleFile(path, bundleBin.c_str()))
+        if (MergeBundleFile(path, bundleBin.c_str(), MergeCounts::Sum))
         {
             Log("merged %u keys from the existing cache (%zu unique, %zu declarations)",
                 mergedIn, records.size(), declTable.size());
@@ -711,8 +729,55 @@ class ShaderCapture
         if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) enabled = false;
     }
 
+    // Caches from the player's OTHER devices, dropped into plugins\pipelinecache\.
+    //
+    // Each device's capture only knows what was played on it. Merging the others in
+    // makes this file the union -- the player's own "golden" cache -- and copying it
+    // on to the next device carries everything along, so a place visited on any one
+    // machine is warm on all of them. Keys travel as hashes plus the bytecode of
+    // shaders no .fxc supplies; each install resolves its own .fxc shaders, so a
+    // device whose install differs simply skips what it could never draw, and the
+    // keys stay in this file for the devices that can.
+    //
+    // Counts merge as the MAX, not the sum: files go back and forth between devices
+    // and stay in the folder across launches, and summing would re-add the same
+    // history every time -- the compounding that once took this file to 41.5e9
+    // counted draws. Imported files are only read, never moved or rewritten.
+    static void LoadImports()
+    {
+        const std::string dir = pipelinekeys::ImportDir();
+        if (dir.empty()) return;
+        WIN32_FIND_DATAA fd{};
+        HANDLE h = FindFirstFileA((dir + "*.bin").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        uint32_t files = 0;
+        const size_t before = records.size();
+        do
+        {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (MergeBundleFile(dir + fd.cFileName, fd.cFileName, MergeCounts::Max)) files++;
+            else Log("  import %s: not usable here (see above, or not format v%u) - skipped",
+                     fd.cFileName, pipelinekeys::kCacheVersion);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+        if (files)
+        {
+            Log("imported %u cache file(s) from pipelinecache\\: %zu keys new to this device",
+                files, records.size() - before);
+            dirty = true;   // write the union back, so this file carries it on
+        }
+    }
+
+    static void LoadExisting()
+    {
+        LoadBundle();
+        if (enabled) LoadImports();
+    }
+
+    enum class MergeCounts { Sum, Max };
+
     // Merge one cache file. Returns false if it is absent or unusable.
-    static bool MergeBundleFile(const std::string& path, const char* label)
+    static bool MergeBundleFile(const std::string& path, const char* label, MergeCounts mode)
     {
         pipelinekeys::CacheContents c;
         if (!pipelinekeys::ReadCache(path, c)) return false;
@@ -783,8 +848,11 @@ class ShaderCapture
                 // from re-merging files that share history: `count` drives the
                 // warm-most-used-first ordering, and re-adding an already-accumulated
                 // file compounds it -- that is how this cache reached 41.5e9 counted
-                // draws against 5,073,509 actually recorded.
-                records[it->second].count += k.count;
+                // draws against 5,073,509 actually recorded. Imports from the player's
+                // other devices DO share history, so they take the max (LoadImports).
+                records[it->second].count = (mode == MergeCounts::Max)
+                    ? std::max(records[it->second].count, k.count)
+                    : records[it->second].count + k.count;
             else
             {
                 keyIndex.emplace(h, (uint32_t)records.size());
