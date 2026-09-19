@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <mutex>
 #include <filesystem>
+#include <algorithm>
 #include "fxc_parse.h"
 
 namespace pipelinekeys
@@ -302,17 +303,68 @@ namespace pipelinekeys
     //
     // Parsed once, on first use, from whichever thread gets there first. Empty if the
     // directory cannot be parsed, which falls back to carrying all bytecode.
+    //
+    // The whole set goes to the log: a summary line with a digest of the sorted
+    // hashes -- two installs with the same digest resolve exactly the same shaders --
+    // then one line per effect naming its shaders, so a difference between two
+    // installs (a mod's .fxc, a newer FusionFix build of one effect) can be traced to
+    // the file it came from.
     inline const std::unordered_set<uint64_t>& InstalledFxcHashes()
     {
         static std::once_flag once;
         static std::unordered_set<uint64_t> hashes;
         std::call_once(once, [] {
-            fxc_db* db = fxc_load_all(InstalledShaderDir().string().c_str());
-            if (!db) return;
-            for (uint32_t i = 0, n = fxc_unique_count(db); i < n; i++)
+            const std::string dir = InstalledShaderDir().string();
+            fxc_db* db = fxc_load_all(dir.c_str());
+            if (!db)
+            {
+                LogLine("[FxcHashes] ", (dir + ": could not be parsed - cache files will carry all bytecode").c_str());
+                return;
+            }
+            const uint32_t n = fxc_unique_count(db);
+            std::vector<uint64_t> byIndex(n, 0);
+            uint32_t vs = 0, ps = 0;
+            for (uint32_t i = 0; i < n; i++)
             {
                 const fxc_shader* s = fxc_unique_shader(db, i);
-                if (s && s->bytecode && s->size) hashes.insert(Fnv1a(s->bytecode, s->size));
+                if (!s || !s->bytecode || !s->size) continue;
+                byIndex[i] = Fnv1a(s->bytecode, s->size);
+                hashes.insert(byIndex[i]);
+                (s->stage == FXC_STAGE_VS ? vs : ps)++;
+            }
+
+            std::vector<uint64_t> sorted(hashes.begin(), hashes.end());
+            std::sort(sorted.begin(), sorted.end());
+            const uint64_t digest = sorted.empty() ? 0 : Fnv1a(sorted.data(), sorted.size() * sizeof(uint64_t));
+            char line[512];
+            _snprintf_s(line, sizeof(line), _TRUNCATE,
+                        "%s: %u effects, %zu unique shaders (%u vs, %u ps), set digest %016llx",
+                        dir.c_str(), fxc_effect_count(db), hashes.size(), vs, ps,
+                        (unsigned long long)digest);
+            LogLine("[FxcHashes] ", line);
+
+            for (uint32_t e = 0, ne = fxc_effect_count(db); e < ne; e++)
+            {
+                const fxc_effect* fx = fxc_get_effect(db, e);
+                if (!fx) continue;
+                std::string out = std::string("  ") + (fx->name ? fx->name : "?") + ".fxc";
+                auto list = [&](const char* label, const uint32_t* map, uint32_t count) {
+                    std::vector<uint64_t> hs;
+                    for (uint32_t i = 0; i < count; i++)
+                        if (map[i] < n && byIndex[map[i]]) hs.push_back(byIndex[map[i]]);
+                    std::sort(hs.begin(), hs.end());
+                    hs.erase(std::unique(hs.begin(), hs.end()), hs.end());
+                    out += std::string(" ") + label + "[" + std::to_string(hs.size()) + "]";
+                    for (uint64_t h : hs)
+                    {
+                        char b[20];
+                        _snprintf_s(b, sizeof(b), _TRUNCATE, " %016llx", (unsigned long long)h);
+                        out += b;
+                    }
+                };
+                list("vs", fx->vs_local_to_unique, fx->vs_count);
+                list("ps", fx->ps_local_to_unique, fx->ps_count);
+                LogLine("[FxcHashes] ", out.c_str());
             }
             fxc_free(db);
         });

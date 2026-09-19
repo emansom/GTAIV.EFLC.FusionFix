@@ -2394,6 +2394,10 @@ class ShaderPrecompiler
             fxc_stats st{}; fxc_get_stats(db, &st);
             Log("parsed %u effects, %u unique shaders, %u passes (errors %u)",
                 st.effect_count, st.unique_total, st.pass_count, st.parse_errors);
+            // Log the install's .fxc hash set now, so it is in every log -- capture
+            // would otherwise only compute it at its first flush, and not at all
+            // when capture is off.
+            (void)pipelinekeys::InstalledFxcHashes();
 
             // Prefer replaying REAL captured keys over the synthetic coverage set:
             // the synthetic pass measured as buying nothing (59 isolated spikes ON
