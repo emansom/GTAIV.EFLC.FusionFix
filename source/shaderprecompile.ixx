@@ -397,6 +397,7 @@ class ShaderPrecompiler
     static constexpr uint32_t kPassW = 100;
     static inline std::string curLabel;
     static inline std::chrono::steady_clock::time_point tStart;
+    static inline std::chrono::steady_clock::time_point tPhase;   // what the bar's ETA extrapolates from
     static inline std::chrono::steady_clock::time_point tLastPresent;
     static inline uint32_t overlayFrames = 0;   // overlay frames actually presented
     static inline unsigned presentsAtStart = 0;
@@ -1010,7 +1011,7 @@ class ShaderPrecompiler
         // glyphs.
         std::string title, sub;
         {
-            auto secs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tStart).count() / 1000.0;
+            auto secs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tPhase).count() / 1000.0;
             char line[256];
             // Only show an ETA once there is enough elapsed time AND progress for the
             // extrapolation to mean anything. Previously it was computed from under a
@@ -2291,6 +2292,53 @@ class ShaderPrecompiler
         for (int i = 0; i < 6; i++) { PresentOverlay(true); }
     }
 
+    // Keep the loading screen up until the Vulkan replay (vkcapture) is done. It
+    // starts on everything that is not this PC's own recording -- other PCs' files,
+    // the player's Steam pre-cache -- the moment this pass says it is done, and
+    // while held it runs on most of the cores. A pipeline it has not warmed yet is
+    // one gameplay would compile itself, and that is a stutter; the time spent here
+    // is not. PrecompileBudgetSeconds, if set, still bounds the whole load: past it
+    // the replay carries on in the background.
+    static void HoldForVulkanReplay()
+    {
+        auto& vr = pipelinekeys::VulkanReplay();
+        if (!vr.running) { vr.passDone = true; return; }
+        vr.holding = true;
+        vr.passDone = true;
+
+        const auto h0 = std::chrono::steady_clock::now();
+        tPhase = h0;
+        workDone = 0;
+        bool budgetHit = false;
+        auto labelAt = h0 - std::chrono::seconds(1);
+        while (vr.running)
+        {
+            if (cfg.budgetSeconds > 0 && std::chrono::steady_clock::now() - tStart > std::chrono::seconds(cfg.budgetSeconds))
+            {
+                budgetHit = true;
+                break;
+            }
+            const uint32_t total = (std::max)(1u, vr.total.load());
+            workTotal = total;
+            workDone = (std::min)(vr.done.load(), total);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - labelAt > std::chrono::milliseconds(250))
+            {
+                labelAt = now;
+                char label[128];
+                _snprintf_s(label, sizeof(label), _TRUNCATE, "Vulkan pipelines, %u of %u", workDone.load(), total);
+                curLabel = label;
+            }
+            PresentOverlay(false);
+            Sleep(5);
+        }
+        vr.holding = false;
+        Log("held the loading screen %.1fs for the Vulkan replay (%u of %u entries)%s",
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - h0).count(), vr.done.load(), vr.total.load(),
+            budgetHit ? " - PrecompileBudgetSeconds reached, it carries on in the background" : "");
+        PresentOverlay(true);
+    }
+
     static void ReleaseResources()
     {
         for (auto& s : scratchColor) SAFE_RELEASE(s.surf);
@@ -2334,6 +2382,7 @@ class ShaderPrecompiler
     static void RunBlocking()
     {
         tStart = std::chrono::steady_clock::now();
+        tPhase = tStart;
         tLastPresent = tStart - std::chrono::milliseconds(1000);
 
         dev = AcquireDevice();
@@ -2432,6 +2481,7 @@ class ShaderPrecompiler
             WaitUntilIdle();
             fxc_free(db);
         }
+        HoldForVulkanReplay();
         // NB: ReleaseResources() deliberately happens AFTER the state restore below.
         // Releasing our scratch targets and textures while they are still bound, and
         // only then putting the game's state back, is the wrong order -- COM keeps
@@ -2693,6 +2743,8 @@ class ShaderPrecompiler
                 started = true;   // guard against any re-entry
                 __try { RunBlocking(); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { Log("precompile faulted - continuing to game"); }
+                // However the pass ended, the Vulkan replay must not wait for it any longer.
+                pipelinekeys::VulkanReplay().passDone = true;
                 finished = true;
                 Log("gate: ran after %d loadscreen frames at %ux%u", loadscreenFramesSeen, gateW, gateH);
             }
@@ -2726,6 +2778,8 @@ public:
         FusionFix::onInitEvent() += []()
         {
             ReadConfig();
+            // The Vulkan replay waits for this pass before judging foreign entries.
+            pipelinekeys::VulkanReplay().passPlanned = cfg.enabled;
             // The flash probe rides the same hook, so arm for either.
             if (!cfg.enabled && cfg.flashProbe <= 0) { Log("disabled via ini"); return; }
 

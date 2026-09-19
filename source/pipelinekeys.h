@@ -18,6 +18,7 @@
 #include <string>
 #include <cstdio>
 #include <mutex>
+#include <atomic>
 #include <filesystem>
 #include <algorithm>
 #include "fxc_parse.h"
@@ -390,6 +391,29 @@ namespace pipelinekeys
     {
         static unsigned n = 0;
         return n;
+    }
+
+    // ---- the Vulkan replay and the loading-screen pass -----------------------
+    //
+    // vkcapture replays Fossilize databases on DXVK's device from threads of its own;
+    // shaderprecompile owns the loading screen. They meet here.
+    //   * passPlanned / passDone: the loading-screen pass will run / has run. The
+    //     foreign replay waits for it: foreign entries are judged against what DXVK
+    //     has used on this device, and that pass is where DXVK shows most of it.
+    //   * holding: the loading screen is held until the replay is done, so the
+    //     replay may use most of the cores instead of one background thread. An
+    //     unwarmed pipeline is a stutter in gameplay; a longer load is not.
+    //   * running, done / total: whether the replay is still going, and how many of
+    //     the pipeline entries it has found it has been through, for the bar.
+    struct VulkanReplayState
+    {
+        std::atomic<bool> passPlanned{ false }, passDone{ false }, holding{ false }, running{ false };
+        std::atomic<uint32_t> done{ 0 }, total{ 0 };
+    };
+    inline VulkanReplayState& VulkanReplay()
+    {
+        static VulkanReplayState s;
+        return s;
     }
 
     // ---- shader bytecode sidecar --------------------------------------------
