@@ -63,6 +63,7 @@ module;
 #include "fxc_parse.h"
 #include "dxvk_d3d9_interfaces.h"
 #include "pipelinekeys.h"
+#include "d3d9cache.h"
 
 export module shaderprecompile;
 
@@ -1447,8 +1448,28 @@ class ShaderPrecompiler
     static inline std::unordered_map<uint64_t, uint32_t> replayDeclByHash;
     static inline std::unordered_map<uint64_t, uint32_t> replayKeyIndex;
     // Bytecode carried by the same container as the keys, merged across every cache
-    // file we load (local capture, then the shipped baseline).
+    // file we load (local capture, the shipped baseline, drop-ins).
     static inline pipelinekeys::ShaderBlobMap replayBlobs;
+    static inline size_t replayBlobBytes = 0;
+
+    // Where each replayed key came from. A file's line at load says whether it was
+    // read; this is what it then warmed, which is the number that says whether
+    // dropping it in was worth anything -- and, for a file from another install or
+    // configuration, how much of it this one cannot use.
+    struct ReplaySource
+    {
+        std::string label;
+        uint32_t added = 0, drawn = 0, samePipeline = 0, noShader = 0, noDecl = 0, noRT = 0;
+    };
+    static inline std::vector<ReplaySource> replaySources;
+    static inline std::vector<uint32_t> replaySrc;   // parallel to replayRecs
+
+    // What all files together may add, whatever they claim: the reader bounds each
+    // file, this bounds the sum. A real capture is ~15,000 keys and ~50 KB of bytecode.
+    static constexpr size_t kMaxReplayKeys      = 200000;     // ~65 MB of records
+    static constexpr size_t kMaxReplayBlobBytes = 16u << 20;
+
+    static void LogStr(const std::string& s) { pipelinekeys::LogLine("[ShaderPrecompile] ", s.c_str()); }
 
     // Returns false (and leaves replayRecs empty) for any malformed or absent file,
     // so the caller can fall back to the synthetic pass rather than doing nothing.
@@ -1459,69 +1480,89 @@ class ShaderPrecompiler
         replayDeclByHash.clear();
         replayKeyIndex.clear();
         replayBlobs.clear();
+        replayBlobBytes = 0;
+        replaySources.clear();
+        replaySrc.clear();
+
+        // Every file is read through d3d9cache::LoadFile: whole, bounded, validated,
+        // and de-duplicated by content hash, so the same file under two names (this
+        // PC's snapshot, a copy from another PC) is used once.
+        std::unordered_map<uint64_t, std::string> seen;
+        const std::string shaderDir = d3d9cache::ActiveShaderDir();
 
         // The user's own capture first: it is the one recorded at THIS graphics
         // configuration, and merging it first means its draw counts drive the
         // most-used-first ordering rather than a stranger's.
-        bool any = MergeKeyFile(KeyFilePath(), "capture");
-        any |= MergeKeyFile(BaselinePath(), "baseline");
-
-        // Caches from the player's other devices (plugins\pipelinecache\). Capture
-        // merges them into the local file too, but only writes that out after its
-        // first flush, which can be after this pass -- so read them directly here as
-        // well, and the first launch after dropping a file in is already warm.
-        const std::string importDir = pipelinekeys::ImportDir();
-        WIN32_FIND_DATAA fd{};
-        HANDLE fh = importDir.empty() ? INVALID_HANDLE_VALUE
-                                      : FindFirstFileA((importDir + "*.bin").c_str(), &fd);
-        if (fh != INVALID_HANDLE_VALUE)
+        const std::string capture = KeyFilePath();
+        bool any = MergeKeyFile(d3d9cache::Wide(capture), "capture", shaderDir, seen, false);
+        // Its snapshot in d3d9cache\ holds it as it was at launch. If capture has
+        // flushed since, the file differs, but the snapshot is still this file.
+        if (any)
         {
-            do
-            {
-                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                any |= MergeKeyFile(importDir + fd.cFileName, "import");
-            } while (FindNextFileA(fh, &fd));
-            FindClose(fh);
+            const std::wstring leaf = d3d9cache::Lower(d3d9cache::Wide(capture.substr(capture.find_last_of("\\/") + 1)));
+            if (auto it = d3d9cache::OwnLaunchHashes().find(leaf); it != d3d9cache::OwnLaunchHashes().end())
+                seen.emplace(it->second, "capture");
         }
+        any |= MergeKeyFile(d3d9cache::Wide(BaselinePath()), "baseline", shaderDir, seen, false);
 
-        Log("replay: loaded %zu keys, %zu declarations", replayRecs.size(), replayDecls.size());
+        // Cache files from the player's other PCs: plugins\d3d9cache\, top level, any
+        // name ending in .bin. Read where they are, never moved or written, and never
+        // merged into this PC's own capture. Keys recorded at another configuration
+        // are warmed too, where this device can build them (see ReplayPass).
+        const d3d9cache::DropIns drop = d3d9cache::FindDropIns();
+        if (drop.subdirs)
+            LogStr("replay: d3d9cache\\ holds " + std::to_string(drop.subdirs) + " folder(s) (e.g. '" +
+                   d3d9cache::Utf8(drop.firstSubdir) + "') - they are not read; put the .bin files directly "
+                   "in plugins\\d3d9cache\\");
+        if (drop.foz)
+            LogStr("replay: d3d9cache\\ holds " + std::to_string(drop.foz) + " .foz file(s) (e.g. '" +
+                   d3d9cache::Utf8(drop.firstFoz) + "') - not loaded: Vulkan pipeline databases belong in "
+                   "plugins\\pipelinecache\\");
+        if (drop.misplacedBins)
+            LogStr("replay: pipelinecache\\ holds " + std::to_string(drop.misplacedBins) + " .bin file(s) (e.g. '" +
+                   d3d9cache::Utf8(drop.firstMisplaced) + "') - not loaded: D3D9 cache files belong in "
+                   "plugins\\d3d9cache\\, pipelinecache\\ is for Vulkan .foz files");
+        for (const auto& name : drop.other)
+            LogStr("replay: d3d9cache\\" + d3d9cache::Utf8(name) + ": skipped - not a .bin cache file");
+        for (const auto& path : drop.files)
+            any |= MergeKeyFile(path, "d3d9cache\\" + d3d9cache::Utf8(path.substr(path.find_last_of(L"\\/") + 1)),
+                                shaderDir, seen, true);
+
+        Log("replay: loaded %zu keys, %zu declarations from %zu file(s)", replayRecs.size(), replayDecls.size(),
+            replaySources.size());
         return any && !replayRecs.empty();
     }
 
-    // Merge one key file into the replay set. Declaration indices are file-local so
-    // they are remapped; a key present in both files is folded into one record with
-    // the draw counts summed, which keeps "warm the most-used first" meaningful
-    // across a shipped baseline and a local capture.
-    static bool MergeKeyFile(const std::string& path, const char* what)
+    // Merge one cache file into the replay set, after d3d9cache::LoadFile has
+    // validated it: one line per file, whatever happens to it. Declaration indices
+    // are file-local so they are remapped. A key the capture and the baseline share
+    // is folded into one record with the draw counts summed, which keeps "warm the
+    // most-used first" meaningful across the two; a drop-in's counts fold in as the
+    // MAX, because drop-ins overlap each other and this PC's own capture (they go
+    // back and forth between PCs), and summing would count that history again for
+    // every copy.
+    static bool MergeKeyFile(const std::wstring& path, const std::string& what, const std::string& shaderDir,
+                             std::unordered_map<uint64_t, std::string>& seen, bool dropIn)
     {
         using namespace pipelinekeys;
 
         CacheContents c;
-        if (!ReadCache(path, c))
+        const d3d9cache::FileResult f = d3d9cache::LoadFile(path, what, shaderDir, seen, c);
+        if (f.verdict == d3d9cache::Verdict::Absent)
         {
-            Log("replay: no usable %s cache at %s (absent, or not format v%u)", what, path.c_str(), kCacheVersion);
+            LogStr("replay: " + what + ": none at " + d3d9cache::Utf8(path));
+            return false;
+        }
+        std::string line = "replay: " + what + ": " + d3d9cache::Describe(f, c);
+        if (f.verdict != d3d9cache::Verdict::Accepted)
+        {
+            LogStr(line);
             return false;
         }
 
         const size_t recsBefore = replayRecs.size();
-
-        // A file written by a build tracking a different state set cannot be
-        // replayed field-for-field, and guessing would be worse than not trying.
-        // No migration path by design (see kCacheVersion): reject rather than misread.
-        if (c.meta.numRS != kNumRS || c.meta.numSamplers != kNumSamplers ||
-            c.rsTypes.size() != kNumRS)
-        {
-            Log("replay: %s tracks %u states / %u samplers, this build expects %u / %u",
-                what, c.meta.numRS, c.meta.numSamplers, kNumRS, kNumSamplers);
-            return false;
-        }
-        for (uint32_t i = 0; i < kNumRS; i++)
-            if (c.rsTypes[i] != (uint32_t)kTrackedRS[i].rs)
-            {
-                Log("replay: state %u is %u in the file but %u here - refusing",
-                    i, c.rsTypes[i], (uint32_t)kTrackedRS[i].rs);
-                return false;
-            }
+        const uint32_t src = (uint32_t)replaySources.size();
+        replaySources.push_back({ what });
 
         // File-local declaration index -> our index.
         std::vector<uint32_t> remap(c.decls.size(), 0);
@@ -1540,26 +1581,29 @@ class ShaderPrecompiler
             }
         }
 
-        size_t merged = 0;
+        size_t merged = 0, full = 0;
         for (auto& rec : c.keys)
         {
             KeyRecord k = rec;
             if (k.declIndex != kDeclNone)
-            {
-                if (k.declIndex >= remap.size()) continue;   // corrupt index: drop the key, keep the file
-                k.declIndex = remap[k.declIndex];
-            }
+                k.declIndex = remap[k.declIndex];   // in range: the reader checked it
 
             uint64_t kh = Fnv1a(&k, kKeyHashBytes);
             if (auto it = replayKeyIndex.find(kh); it != replayKeyIndex.end())
             {
-                replayRecs[it->second].count += k.count;
+                uint32_t& n = replayRecs[it->second].count;
+                n = dropIn ? (std::max)(n, k.count) : n + k.count;
                 merged++;
+            }
+            else if (replayRecs.size() >= kMaxReplayKeys)
+            {
+                full++;
             }
             else
             {
                 replayKeyIndex.emplace(kh, (uint32_t)replayRecs.size());
                 replayRecs.push_back(k);
+                replaySrc.push_back(src);
             }
         }
 
@@ -1567,9 +1611,12 @@ class ShaderPrecompiler
         // can never be loaded without the shaders needed to replay it.
         uint32_t newShaders = 0;
         for (auto& [hash, blob] : c.shaders)
-            if (replayBlobs.emplace(hash, blob).second) newShaders++;
-        if (newShaders)
-            Log("replay: %s carried %u shader blobs", what, newShaders);
+        {
+            if (replayBlobs.count(hash) || replayBlobBytes + blob.code.size() > kMaxReplayBlobBytes) continue;
+            replayBlobBytes += blob.code.size();
+            replayBlobs.emplace(hash, blob);
+            newShaders++;
+        }
         if (!c.strings[kMetaShaderDir].empty() && c.strings[kMetaShaderDir] != "unknown")
         {
             exportShaderDir = c.strings[kMetaShaderDir];
@@ -1577,8 +1624,13 @@ class ShaderPrecompiler
             for (uint32_t i = 0; i < kMetaStringCount; i++) exportStrings[i] = c.strings[i];
         }
 
-        Log("replay: %s contributed %zu new keys (%zu already known) from %zu records",
-            what, replayRecs.size() - recsBefore, merged, c.keys.size());
+        replaySources[src].added = (uint32_t)(replayRecs.size() - recsBefore);
+        line += "; " + std::to_string(replaySources[src].added) + " keys new to the replay set (" +
+                std::to_string(merged) + " already known), " + std::to_string(newShaders) + " new shaders";
+        if (full)
+            line += "; " + std::to_string(full) + " more not taken, the replay set is full (" +
+                    std::to_string(kMaxReplayKeys) + " keys)";
+        LogStr(line);
         return !c.keys.empty();
     }
 
@@ -1890,15 +1942,6 @@ class ShaderPrecompiler
         return obj;
     }
 
-    // Depth surface matching the RECORDED format. The synthetic pass always
-    // preferred INTZ; here the format is part of the key, so honour it.
-    static IDirect3DSurface9* ReplayDepthFor(uint32_t fmt)
-    {
-        if (fmt == 0) return nullptr;
-        if (fmt == (uint32_t)FOURCC_INTZ) return scratchDepthINTZ ? scratchDepthINTZ : scratchDepthD24S8;
-        return scratchDepthD24S8 ? scratchDepthD24S8 : scratchDepthINTZ;
-    }
-
     // Multisampled scratch targets, cached per {format, type, quality}. Vulkan bakes
     // the sample count into the pipeline, so replaying an MSAA key against a
     // single-sampled target would build a pipeline gameplay never asks for. Only
@@ -1906,8 +1949,6 @@ class ShaderPrecompiler
     // stays on the plain ScratchFor cache.
     struct ScratchMS { D3DFORMAT fmt; uint32_t type; uint32_t quality; IDirect3DSurface9* surf; };
     static inline std::vector<ScratchMS> scratchMS;
-    static inline IDirect3DSurface9* scratchDepthMS = nullptr;
-    static inline uint32_t scratchDepthMSType = 0;
 
     static IDirect3DSurface9* ScratchForMS(D3DFORMAT fmt, uint32_t type, uint32_t quality)
     {
@@ -1923,20 +1964,38 @@ class ShaderPrecompiler
         return surf;
     }
 
-    // A multisampled colour target needs a depth surface with the SAME sample count.
+    // Depth surface in the RECORDED format and sample count, cached per {format, type,
+    // quality}: the depth format is baked into the pipeline too, so a key from a PC
+    // or configuration that used another one is only warmed right with that one.
+    // nullptr if this device cannot create it (the key is then skipped). The
+    // readable-depth FOURCCs (INTZ, DF24, ...) exist only as single-sampled textures;
+    // a multisampled key names the MSAA depth surface the game drew with, D24S8.
+    struct ScratchDS { uint32_t fmt, type, quality; IDirect3DTexture9* tex; IDirect3DSurface9* surf; };
+    static inline std::vector<ScratchDS> scratchDS;
+
     static IDirect3DSurface9* ReplayDepthForMS(uint32_t fmt, uint32_t type, uint32_t quality)
     {
         if (fmt == 0) return nullptr;
-        if (type == 0) return ReplayDepthFor(fmt);
-        if (scratchDepthMS && scratchDepthMSType == type) return scratchDepthMS;
-        SAFE_RELEASE(scratchDepthMS);
-        if (SUCCEEDED(dev->CreateDepthStencilSurface(kRTdim, kRTdim, D3DFMT_D24S8,
-                                                     (D3DMULTISAMPLE_TYPE)type, quality,
-                                                     FALSE, &scratchDepthMS, nullptr)))
-            scratchDepthMSType = type;
-        else
-            scratchDepthMS = nullptr;
-        return scratchDepthMS;
+        if (type && d3d9cache::IsFourCCDepth(fmt)) fmt = (uint32_t)D3DFMT_D24S8;
+        if (!type && fmt == (uint32_t)FOURCC_INTZ && scratchDepthINTZ) return scratchDepthINTZ;
+        if (!type && fmt == (uint32_t)D3DFMT_D24S8 && scratchDepthD24S8) return scratchDepthD24S8;
+        for (auto& s : scratchDS)
+            if (s.fmt == fmt && s.type == type && s.quality == quality) return s.surf;
+
+        ScratchDS s{ fmt, type, quality, nullptr, nullptr };
+        if (d3d9cache::IsFourCCDepth(fmt))
+        {
+            if (SUCCEEDED(dev->CreateTexture(kRTdim, kRTdim, 1, D3DUSAGE_DEPTHSTENCIL, (D3DFORMAT)fmt,
+                                             D3DPOOL_DEFAULT, &s.tex, nullptr)) && s.tex)
+                s.tex->GetSurfaceLevel(0, &s.surf);
+        }
+        else if (FAILED(dev->CreateDepthStencilSurface(kRTdim, kRTdim, (D3DFORMAT)fmt, (D3DMULTISAMPLE_TYPE)type,
+                                                       quality, FALSE, &s.surf, nullptr)))
+        {
+            s.surf = nullptr;
+        }
+        scratchDS.push_back(s);
+        return s.surf;
     }
 
     // Wait for everything submitted so far to complete, presenting the overlay while
@@ -1990,7 +2049,10 @@ class ShaderPrecompiler
             if (seenPipeline.insert(ReplayPipelineKey(replayRecs[r])).second)
                 drawList.push_back((uint32_t)r);
             else
+            {
                 skippedDup++;
+                replaySources[replaySrc[r]].samePipeline++;
+            }
         }
         // Warm the pipelines the game uses MOST first. If a budget or an early exit
         // cuts the pass short, what got built is then the part that matters, not an
@@ -2078,21 +2140,39 @@ class ShaderPrecompiler
         for (uint32_t r : drawList)
         {
             const KeyRecord& k = replayRecs[r];
+            ReplaySource& from = replaySources[replaySrc[r]];
 
             // Shaders. A miss means the capture saw a shader this .fxc database does
             // not contain (a different episode, or a mod) -- skip rather than draw
             // with the wrong one, which would warm a pipeline nothing will use.
             IDirect3DVertexShader9* vs = nullptr;
             IDirect3DPixelShader9*  ps = nullptr;
-            if (k.vsHash) { auto it = vsByHash.find(k.vsHash); if (it == vsByHash.end()) { missingVS[k.vsHash]++; skippedShader++; workDone += kPassW; continue; } vs = it->second; }
-            if (k.psHash) { auto it = psByHash.find(k.psHash); if (it == psByHash.end()) { missingPS[k.psHash]++; skippedShader++; workDone += kPassW; continue; } ps = it->second; }
+            if (k.vsHash) { auto it = vsByHash.find(k.vsHash); if (it == vsByHash.end()) { missingVS[k.vsHash]++; skippedShader++; from.noShader++; workDone += kPassW; continue; } vs = it->second; }
+            if (k.psHash) { auto it = psByHash.find(k.psHash); if (it == psByHash.end()) { missingPS[k.psHash]++; skippedShader++; from.noShader++; workDone += kPassW; continue; } ps = it->second; }
+
+            // Render targets and depth, in the recorded formats and sample count --
+            // the field the synthetic pass got most wrong; MRT count, formats and
+            // samples are all part of the pipeline. A key from another configuration
+            // or PC is warmed as long as this device can create every one of them;
+            // if it cannot, a substitute would warm a pipeline nothing here uses.
+            IDirect3DSurface9* rts[kMaxRT] = {};
+            bool unsupported = false;
+            for (uint32_t i = 0; i < kMaxRT; i++)
+                if (k.rtFmt[i])
+                {
+                    rts[i] = ScratchForMS((D3DFORMAT)k.rtFmt[i], k.msType, k.msQuality);
+                    unsupported |= !rts[i];
+                }
+            IDirect3DSurface9* ds = ReplayDepthForMS(k.dsFmt, k.msType, k.msQuality);
+            unsupported |= k.dsFmt && !ds;
+            if (!rts[0] || unsupported) { skippedRT++; from.noRT++; workDone += kPassW; continue; }
 
             // Vertex layout.
             UINT stride[4] = { 0, 0, 0, 0 };
             if (k.declIndex != kDeclNone)
             {
                 auto decl = ReplayDecl(k.declIndex);
-                if (!decl) { skippedDecl++; workDone += kPassW; continue; }
+                if (!decl) { skippedDecl++; from.noDecl++; workDone += kPassW; continue; }
                 dev->SetVertexDeclaration(decl);
 
                 for (auto& e : replayDecls[k.declIndex])
@@ -2127,19 +2207,9 @@ class ShaderPrecompiler
             dev->SetVertexShader(vs);
             dev->SetPixelShader(ps);
 
-            // Render targets, in the recorded formats -- this is the field the
-            // synthetic pass got most wrong, and MRT count is part of the key.
-            IDirect3DSurface9* rt0 = nullptr;
             for (uint32_t i = 0; i < kMaxRT; i++)
-            {
-                IDirect3DSurface9* surf = k.rtFmt[i]
-                    ? ScratchForMS((D3DFORMAT)k.rtFmt[i], k.msType, k.msQuality)
-                    : nullptr;
-                if (i == 0) rt0 = surf;
-                dev->SetRenderTarget(i, surf);
-            }
-            if (!rt0) { skippedRT++; workDone += kPassW; continue; }
-            dev->SetDepthStencilSurface(ReplayDepthForMS(k.dsFmt, k.msType, k.msQuality));
+                dev->SetRenderTarget(i, rts[i]);
+            dev->SetDepthStencilSurface(ds);
 
             D3DVIEWPORT9 vp{ 0, 0, kRTdim, kRTdim, 0.0f, 1.0f };
             dev->SetViewport(&vp);
@@ -2178,6 +2248,7 @@ class ShaderPrecompiler
             // rasterised, but the pipeline is created -- which is the whole point.
             dev->DrawIndexedPrimitive((D3DPRIMITIVETYPE)k.primType, 0, 0, 3, 0, 1);
             drawn++;
+            from.drawn++;
 
             if (cfg.adaptiveExit && drawn == kProbeDraws)
             {
@@ -2269,6 +2340,22 @@ class ShaderPrecompiler
             worst(missingVS, 'V');
             worst(missingPS, 'P');
         }
+
+        // What each file's own keys came to. A file from another install names
+        // shaders this one lacks (other mods, another FusionFix build); one from
+        // another configuration may need targets this device cannot create. Both are
+        // counted here, never drawn with a substitute.
+        for (const auto& s : replaySources)
+        {
+            if (!s.added) continue;
+            char buf[256];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        ": of its %u new keys, %u warmed, %u the same pipeline as another key, %u name a shader "
+                        "this install lacks, %u render targets or depth this device cannot create, %u no declaration%s",
+                        s.added, s.drawn, s.samePipeline, s.noShader, s.noRT, s.noDecl,
+                        (exitedEarly || !cfg.specVariants) ? " (the pass did not reach all of them)" : "");
+            LogStr("replay:   " + s.label + buf);
+        }
     }
 
     // -------------------------------------------------------------------
@@ -2350,8 +2437,8 @@ class ShaderPrecompiler
         replayDeclObjs.clear();
         for (auto& s : scratchMS) SAFE_RELEASE(s.surf);
         scratchMS.clear();
-        SAFE_RELEASE(scratchDepthMS);
-        scratchDepthMSType = 0;
+        for (auto& s : scratchDS) { SAFE_RELEASE(s.surf); SAFE_RELEASE(s.tex); }
+        scratchDS.clear();
         SAFE_RELEASE(dummyVB);
         SAFE_RELEASE(dummyIB);
         SAFE_RELEASE(tex2D);
@@ -2741,8 +2828,11 @@ class ShaderPrecompiler
             if (GateReady())
             {
                 started = true;   // guard against any re-entry
+                // Our own draws from here on are not the game's: capture skips them.
+                pipelinekeys::PassThread() = GetCurrentThreadId();
                 __try { RunBlocking(); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { Log("precompile faulted - continuing to game"); }
+                pipelinekeys::PassThread() = 0;
                 // However the pass ended, the Vulkan replay must not wait for it any longer.
                 pipelinekeys::VulkanReplay().passDone = true;
                 finished = true;

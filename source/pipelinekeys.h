@@ -275,6 +275,17 @@ namespace pipelinekeys
         return r;
     }
 
+    // The thread the loading-screen pass is running on, 0 when it is not running.
+    // The capture ignores draws from it: they are the replay's and the overlay's,
+    // not the game's. Recording them put every key the replay warms -- the shipped
+    // baseline and other PCs' drop-ins included -- into this PC's own capture as if
+    // this PC had drawn them, and from there into the snapshot it shares.
+    inline std::atomic<unsigned long>& PassThread()
+    {
+        static std::atomic<unsigned long> id{ 0 };
+        return id;
+    }
+
     // The .fxc directory the replay loads: <gameroot>/update/common/shaders/win32_30,
     // the effective installed set (update/ overrides common/), else the base one.
     // One definition, so what cache files leave out and what the replay can resolve
@@ -470,13 +481,11 @@ namespace pipelinekeys
     //  resolved and let the merge tool bucket on it, rather than assuming convergence.
     constexpr uint32_t kCacheMagic   = 0x43504646;   // 'FFPC'
 
-    // The version exists purely so a stale or foreign file is REJECTED rather than
-    // misread -- there is deliberately no migration path in the ASI. This feature is
-    // not upstream yet, so no user has a cache worth preserving, and carrying readers
-    // for formats nobody has costs more than re-capturing does. Bump this on any
-    // layout change; add migration only once upstream ships a release whose caches
-    // must survive. (A rejected file is moved aside, never overwritten: see the
-    // capture's LoadExisting.)
+    // The version exists so a stale or foreign file is never MISREAD. Bump this on
+    // any layout change. The reader (d3d9cache.h) widens v1 in memory -- a player's
+    // other PC may run an older build -- and skips anything newer than it knows.
+    // Files are only ever written in this version. (A local capture that cannot be
+    // read is moved aside, never overwritten: see the capture's LoadBundle.)
     //
     //   v1  first single-file container
     //   v2  KeyRecord::streamFreq -- instanced streams are a different pipeline
@@ -556,14 +565,6 @@ namespace pipelinekeys
         ShaderBlobMap            shaders;
     };
 
-    inline bool ReadStr(FILE* f, std::string& out)
-    {
-        uint32_t n = 0;
-        if (fread(&n, 4, 1, f) != 1 || n > (1u << 16)) return false;
-        out.assign(n, '\0');
-        return n == 0 || fread(&out[0], 1, n, f) == n;
-    }
-
     inline void WriteStr(FILE* f, const std::string& s)
     {
         uint32_t n = (uint32_t)s.size();
@@ -571,82 +572,9 @@ namespace pipelinekeys
         if (n) fwrite(s.data(), 1, n, f);
     }
 
-    // `want` selects sections, so the merge tool can read a thousand files' metadata
-    // without touching their key tables. Sections absent from the file are simply
-    // left empty -- a reader asks for what it needs and checks what it got.
-    inline bool ReadCache(const std::string& path, CacheContents& out, uint32_t wantMask = ~0u)
-    {
-        FILE* f = fopen(path.c_str(), "rb");
-        if (!f) return false;
-
-        CacheHeader h{};
-        if (fread(&h, sizeof(h), 1, f) != 1 || h.magic != kCacheMagic ||
-            h.version != kCacheVersion || h.sectionCount == 0 || h.sectionCount > 32)
-        {
-            fclose(f);
-            return false;
-        }
-
-        std::vector<CacheSection> secs(h.sectionCount);
-        if (fread(secs.data(), sizeof(CacheSection), h.sectionCount, f) != h.sectionCount)
-        {
-            fclose(f);
-            return false;
-        }
-
-        bool ok = true;
-        for (auto& s : secs)
-        {
-            if (!(wantMask & (1u << s.id))) continue;
-            if (fseek(f, (long)s.offset, SEEK_SET) != 0) { ok = false; break; }
-
-            if (s.id == kSecMeta)
-            {
-                if (fread(&out.meta, sizeof(CacheMeta), 1, f) != 1) { ok = false; break; }
-                for (uint32_t i = 0; i < out.meta.stringCount && i < kMetaStringCount; i++)
-                    if (!ReadStr(f, out.strings[i])) { ok = false; break; }
-            }
-            else if (s.id == kSecRSTypes)
-            {
-                out.rsTypes.resize(s.count);
-                if (s.count && fread(out.rsTypes.data(), 4, s.count, f) != s.count) { ok = false; break; }
-            }
-            else if (s.id == kSecDecls)
-            {
-                out.decls.resize(s.count);
-                for (uint32_t i = 0; i < s.count; i++)
-                {
-                    uint32_t n = 0;
-                    if (fread(&n, 4, 1, f) != 1 || n == 0 || n > MAXD3DDECLLENGTH + 1) { ok = false; break; }
-                    out.decls[i].resize(n);
-                    if (fread(out.decls[i].data(), sizeof(D3DVERTEXELEMENT9), n, f) != n) { ok = false; break; }
-                }
-            }
-            else if (s.id == kSecKeys)
-            {
-                out.keys.resize(s.count);
-                if (s.count && fread(out.keys.data(), sizeof(KeyRecord), s.count, f) != s.count)
-                {
-                    out.keys.clear();
-                    ok = false;
-                    break;
-                }
-            }
-            else if (s.id == kSecShaders)
-            {
-                for (uint32_t i = 0; i < s.count; i++)
-                {
-                    ShaderBlobHeader bh{};
-                    if (fread(&bh, sizeof(bh), 1, f) != 1 || bh.size == 0 || bh.size > (1u << 20)) { ok = false; break; }
-                    ShaderBlob b{ bh.stage, std::vector<uint8_t>(bh.size) };
-                    if (fread(b.code.data(), 1, bh.size, f) != bh.size) { ok = false; break; }
-                    out.shaders.emplace(bh.hash, std::move(b));
-                }
-            }
-        }
-        fclose(f);
-        return ok;
-    }
+    // Reading is in d3d9cache.h (d3d9cache::LoadFile / Parse): every file is read
+    // whole, bounded, and validated field by field before anything uses it, because
+    // a cache file may come from another PC, another build, or a damaged copy.
 
     inline bool WriteCache(const std::string& path, const CacheContents& in)
     {

@@ -37,8 +37,14 @@ module;
 // USAGE  (plugins/GTAIV.EFLC.FusionFix.ini)
 //   [SHADERS]
 //   CaptureDrawKeys = 1      ; record keys while you play, then quit normally
-//   Leave PrecompileShaders = 0 during a capture run, or the precompiler's own
-//   synthetic draws land in the cache as if the game had issued them.
+//   Draws issued by the loading-screen pass (its replay and overlay) are not
+//   recorded: the file holds what this PC's game drew, nothing else.
+//
+// SHARING
+//   Once per launch, before anything is recorded, each capture file is copied into
+//   plugins\d3d9cache\ as FusionFix.<content hash>.bin (d3d9cache.h). That folder
+//   is what a player copies to their other PCs; the replay reads it there. Files in
+//   it are never merged into this capture.
 //
 // OUTPUT (next to the .asi)
 //   FusionFix.pipelinekeys.<config>.bin  versioned binary, for the replay pass
@@ -62,6 +68,7 @@ module;
 #include <algorithm>
 #include "dxvk_d3d9_interfaces.h"
 #include "pipelinekeys.h"
+#include "d3d9cache.h"
 
 export module shadercapture;
 
@@ -261,6 +268,8 @@ class ShaderCapture
     static void RecordDraw(D3DPRIMITIVETYPE primType, bool up)
     {
         if (!dev || !lockReady) return;
+        // The loading-screen pass's own draws are not the game's (see PassThread).
+        if (pipelinekeys::PassThread().load(std::memory_order_relaxed) == GetCurrentThreadId()) return;
 
         // Held across the whole body: the shader/declaration memo tables are mutated
         // during key construction, not just at insert time.
@@ -520,21 +529,12 @@ class ShaderCapture
     static inline std::string metaShaderDir = "unknown", metaAdapter, metaDriver, metaOS, metaDxvk;
     static inline uint32_t metaVendorId = 0, metaDeviceId = 0, metaBackend = 0;
 
-    // GTA IV stores the shader directory it resolved (win32_30, win32_30_nv8, ...) in
-    // a char* global, chosen by probing depth formats. Read it defensively: a wrong
-    // build would give a wild pointer, and recording "unknown" is far better than
-    // recording a plausible-looking lie that a merge tool would bucket on.
+    // The shader directory GTA IV resolved (win32_30, win32_30_nv8, ...): what a
+    // merge tool buckets on, and what the replay compares drop-ins against.
+    // "unknown" rather than a plausible-looking lie if it cannot be read.
     static void ResolveShaderDir()
     {
-        const uintptr_t kShaderDirPtr = 0x01633800;   // GTA IV 1.2.0.59
-        __try
-        {
-            auto base = (uintptr_t)GetModuleHandleW(nullptr);
-            const char* s = *(const char* const*)(base + (kShaderDirPtr - 0x400000));
-            if (s && !IsBadStringPtrA(s, 64) && strncmp(s, "win32_", 6) == 0)
-                metaShaderDir = s;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        metaShaderDir = d3d9cache::ActiveShaderDir();
         Log("shader directory in use: %s", metaShaderDir.c_str());
     }
 
@@ -703,118 +703,60 @@ class ShaderCapture
     // run -- which is exactly how this file's draw counts reached 41.5e9 against
     // 5,073,509 draws actually recorded. One bundle per (format, MSAA), nothing else.
     //
-    // A file that exists but cannot be merged -- an older format version, another
-    // state set, another shader directory -- is MOVED ASIDE, never left in place.
-    // Capture writes to this same path on its first flush, so "refuse and start
-    // fresh" used to mean "refuse and then overwrite": every format bump silently
-    // destroyed the accumulated capture it had just declined to read.
+    // A file that exists but cannot be merged -- a newer format, another state set,
+    // another shader directory, a damaged container -- is MOVED ASIDE, never left in
+    // place. Capture writes to this same path on its first flush, so "refuse and
+    // start fresh" used to mean "refuse and then overwrite": every format bump
+    // silently destroyed the accumulated capture it had just declined to read.
+    //
+    // It is read through the same validating reader as a drop-in (d3d9cache.h). A
+    // key, declaration or shader that fails validation is dropped and the rest is
+    // kept; the next flush writes the file without them. A v1 file is widened in
+    // memory and carried on as v2.
+    //
+    // Drop-ins from the player's other PCs (plugins\d3d9cache\) are NOT merged in:
+    // the replay reads them where they are, and this file stays this PC's own record
+    // -- which is also what its snapshot in that folder shares.
     static void LoadBundle()
     {
         const std::string path = OutDir() + bundleBin;
-        if (MergeBundleFile(path, bundleBin.c_str(), MergeCounts::Sum))
-        {
-            Log("merged %u keys from the existing cache (%zu unique, %zu declarations)",
-                mergedIn, records.size(), declTable.size());
-            return;
-        }
-        if (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+        pipelinekeys::CacheContents c;
+        std::unordered_map<uint64_t, std::string> seen;
+        const d3d9cache::FileResult f = d3d9cache::LoadFile(d3d9cache::Wide(path), bundleBin, metaShaderDir, seen, c);
+        if (f.verdict == d3d9cache::Verdict::Absent)
         {
             Log("no existing cache for this configuration - starting a new one");
+            return;
+        }
+        pipelinekeys::LogLine("[ShaderCapture] ", ("existing cache " + bundleBin + ": " + d3d9cache::Describe(f, c)).c_str());
+        if (f.verdict == d3d9cache::Verdict::Accepted)
+        {
+            MergeBundle(c);
+            if (f.parse.badKeys || f.parse.badDecls || f.parse.badShaders || f.parse.version != pipelinekeys::kCacheVersion)
+                dirty = true;   // write it back clean, and in the current version
+            Log("merged %u keys from the existing cache (%zu unique, %zu declarations)",
+                mergedIn, records.size(), declTable.size());
             return;
         }
         const std::string aside = path + ".unmerged";
         remove(aside.c_str());
         if (rename(path.c_str(), aside.c_str()) == 0)
-            Log("existing cache could not be merged (not format v%u, or the reason above) - kept it "
-                "as %s.unmerged and started a new one", pipelinekeys::kCacheVersion, bundleBin.c_str());
+            Log("existing cache could not be merged (the reason above) - kept it as %s.unmerged and "
+                "started a new one", bundleBin.c_str());
         else
             Log("existing cache could not be merged NOR moved aside - capture disabled so it is "
                 "not overwritten");
         if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) enabled = false;
     }
 
-    // Caches from the player's OTHER devices, dropped into plugins\pipelinecache\.
-    //
-    // Each device's capture only knows what was played on it. Merging the others in
-    // makes this file the union -- the player's own "golden" cache -- and copying it
-    // on to the next device carries everything along, so a place visited on any one
-    // machine is warm on all of them. Keys travel as hashes plus the bytecode of
-    // shaders no .fxc supplies; each install resolves its own .fxc shaders, so a
-    // device whose install differs simply skips what it could never draw, and the
-    // keys stay in this file for the devices that can.
-    //
-    // Counts merge as the MAX, not the sum: files go back and forth between devices
-    // and stay in the folder across launches, and summing would re-add the same
-    // history every time -- the compounding that once took this file to 41.5e9
-    // counted draws. Imported files are only read, never moved or rewritten.
-    static void LoadImports()
-    {
-        const std::string dir = pipelinekeys::ImportDir();
-        if (dir.empty()) return;
-        WIN32_FIND_DATAA fd{};
-        HANDLE h = FindFirstFileA((dir + "*.bin").c_str(), &fd);
-        if (h == INVALID_HANDLE_VALUE) return;
-        uint32_t files = 0;
-        const size_t before = records.size();
-        do
-        {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            if (MergeBundleFile(dir + fd.cFileName, fd.cFileName, MergeCounts::Max)) files++;
-            else Log("  import %s: not usable here (see above, or not format v%u) - skipped",
-                     fd.cFileName, pipelinekeys::kCacheVersion);
-        } while (FindNextFileA(h, &fd));
-        FindClose(h);
-        if (files)
-        {
-            Log("imported %u cache file(s) from pipelinecache\\: %zu keys new to this device",
-                files, records.size() - before);
-            dirty = true;   // write the union back, so this file carries it on
-        }
-    }
-
     static void LoadExisting()
     {
         LoadBundle();
-        if (enabled) LoadImports();
     }
 
-    enum class MergeCounts { Sum, Max };
-
-    // Merge one cache file. Returns false if it is absent or unusable.
-    static bool MergeBundleFile(const std::string& path, const char* label, MergeCounts mode)
+    // Merge one validated cache into the capture.
+    static void MergeBundle(const pipelinekeys::CacheContents& c)
     {
-        pipelinekeys::CacheContents c;
-        if (!pipelinekeys::ReadCache(path, c)) return false;
-
-        // Records READ and keys the file actually ADDED are different numbers, and
-        // only the second says whether a file was worth merging: the pre-bundle
-        // contributed 11234 records and zero new keys, being a strict subset.
-        const size_t uniqueBefore = records.size();
-
-        // A cache recorded against a different state set cannot be merged field for
-        // field. Keep it rather than silently corrupting it: bail and start fresh
-        // (LoadExisting moves the file aside). No migration path (see kCacheVersion).
-        if (c.meta.numRS != kNumRS || c.meta.numSamplers != kNumSamplers ||
-            c.rsTypes.size() != kNumRS)
-        {
-            Log("%s tracks %u states / %u samplers (this build: %u / %u) - not merging",
-                label, c.meta.numRS, c.meta.numSamplers, kNumRS, kNumSamplers);
-            return false;
-        }
-        for (uint32_t i = 0; i < kNumRS; i++)
-            if (c.rsTypes[i] != (uint32_t)kTrackedRS[i].rs) return false;
-
-        // A capture from a different shader directory names shaders this install will
-        // never create, so its keys are noise here. This is the check that keeps a
-        // pooled cache honest; see the container comment in pipelinekeys.h.
-        if (!c.strings[pipelinekeys::kMetaShaderDir].empty() &&
-            c.strings[pipelinekeys::kMetaShaderDir] != metaShaderDir)
-        {
-            Log("%s was captured against shader dir '%s', this install uses '%s' - not merging",
-                label, c.strings[pipelinekeys::kMetaShaderDir].c_str(), metaShaderDir.c_str());
-            return false;
-        }
-
         // Declaration indices are file-local, so they must be remapped into our
         // table before a record's key is hashed -- declIndex is part of the key.
         std::vector<uint32_t> remap(c.decls.size(), 0);
@@ -838,25 +780,17 @@ class ShaderCapture
         {
             KeyRecord k = rec;
             if (k.declIndex != 0xFFFFFFFFu)
-            {
-                if (k.declIndex >= remap.size()) continue;
-                k.declIndex = remap[k.declIndex];
-            }
+                k.declIndex = remap[k.declIndex];   // in range: the reader checked it
 
             uint64_t h = fnv1a(&k, offsetof(KeyRecord, count));
             auto it = keyIndex.find(h);
             if (it != keyIndex.end())
-                // Only reachable if a single file holds the same key twice, or if a
-                // second cache is ever merged in deliberately (two players pooling
-                // coverage), where summing is what you want. It must NOT be reachable
-                // from re-merging files that share history: `count` drives the
-                // warm-most-used-first ordering, and re-adding an already-accumulated
-                // file compounds it -- that is how this cache reached 41.5e9 counted
-                // draws against 5,073,509 actually recorded. Imports from the player's
-                // other devices DO share history, so they take the max (LoadImports).
-                records[it->second].count = (mode == MergeCounts::Max)
-                    ? std::max(records[it->second].count, k.count)
-                    : records[it->second].count + k.count;
+                // Only reachable if the file holds the same key twice. It must NOT be
+                // reachable from re-merging files that share history: `count` drives
+                // the warm-most-used-first ordering, and re-adding an already-
+                // accumulated file compounds it -- that is how this cache reached
+                // 41.5e9 counted draws against 5,073,509 actually recorded.
+                records[it->second].count += k.count;
             else
             {
                 keyIndex.emplace(h, (uint32_t)records.size());
@@ -869,10 +803,6 @@ class ShaderCapture
         // contribution can never arrive with keys whose shaders are missing.
         for (auto& [h, b] : c.shaders)
             if (shaderBlobs.emplace(h, b).second) blobsMergedIn++;
-
-        Log("  %s: %zu records read, %zu keys new, %zu shaders",
-            label, c.keys.size(), records.size() - uniqueBefore, c.shaders.size());
-        return true;
     }
 
     static void Flush(bool force)
@@ -915,6 +845,11 @@ public:
         FusionFix::onInitEvent() += []()
         {
             ReadConfig();
+
+            // Share this PC's capture(s) through plugins\d3d9cache\, whether or not
+            // this session captures: now, before anything could be appended to them.
+            d3d9cache::SnapshotOwnCaptures([](const char* line) { pipelinekeys::LogLine("[ShaderCapture] ", line); });
+
             if (!enabled) return;
 
             GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
