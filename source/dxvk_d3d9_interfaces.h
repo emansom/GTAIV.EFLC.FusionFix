@@ -31,6 +31,8 @@
 #include <unknwn.h>  /* IUnknown, GUID */
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <string>
 
 static const GUID FusionFix_IID_ID3D9VkInteropDevice =
     { 0x2eaa4b89, 0x0107, 0x4bdb, { 0x87, 0xf7, 0x0f, 0x54, 0x1c, 0x49, 0x3c, 0xe0 } };
@@ -128,6 +130,43 @@ static inline bool FusionFixQueryDxvk(IUnknown* device, FusionFixDxvkInfo* out)
     strcpy_s(out->driverInfo, drv.driverInfo);
     out->haveDriver = out->driverName[0] != '\0';
     return true;
+}
+
+/* Which DXVK build implements `device`: the module its vtable lives in, as
+ * "<file name> <size> fnv:<FNV-1a-64 of the file>". Identifies a build exactly --
+ * a release, a self-built one, FusionFix's pinned vulkan.dll -- without relying on
+ * a version string DXVK does not export. Empty if it cannot be read. Reads the
+ * file once per call (~8 MB); call it once. */
+static inline std::string FusionFixDxvkBuild(IUnknown* device)
+{
+    if (!device) return std::string();
+    HMODULE mod = nullptr;
+    void* vtbl0 = (*reinterpret_cast<void***>(device))[0];
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(vtbl0), &mod) || !mod)
+        return std::string();
+    char path[MAX_PATH] = {};
+    if (!GetModuleFileNameA(mod, path, MAX_PATH)) return std::string();
+
+    FILE* f = fopen(path, "rb");
+    if (!f) return std::string();
+    uint64_t h = 1469598103934665603ull, size = 0;
+    unsigned char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+    {
+        for (size_t i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ull; }
+        size += n;
+    }
+    fclose(f);
+
+    const char* name = strrchr(path, '\\');
+    name = name ? name + 1 : path;
+    char out[MAX_PATH + 64];
+    snprintf(out, sizeof(out), "%s %llu fnv:%016llx", name,
+             (unsigned long long)size, (unsigned long long)h);
+    return std::string(out);
 }
 
 #endif /* FUSIONFIX_DXVK_D3D9_INTERFACES_H */

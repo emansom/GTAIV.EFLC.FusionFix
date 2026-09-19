@@ -517,7 +517,7 @@ class ShaderCapture
     // Provenance, captured once and written into the file. See the container comment
     // in pipelinekeys.h: two captures are only mergeable if the game resolved the SAME
     // shader directory, so this is what a merge tool buckets on.
-    static inline std::string metaShaderDir = "unknown", metaAdapter, metaDriver, metaOS;
+    static inline std::string metaShaderDir = "unknown", metaAdapter, metaDriver, metaOS, metaDxvk;
     static inline uint32_t metaVendorId = 0, metaDeviceId = 0, metaBackend = 0;
 
     // GTA IV stores the shader directory it resolved (win32_30, win32_30_nv8, ...) in
@@ -568,6 +568,8 @@ class ShaderCapture
         // with the Vulkan driver that actually compiles the pipelines.
         if (dxvk.haveDriver)
             metaDriver = std::string(dxvk.driverName) + " " + dxvk.driverInfo;
+        if (metaBackend)
+            metaDxvk = FusionFixDxvkBuild(d);
         metaOS = "windows";
         if (HMODULE nt = GetModuleHandleW(L"ntdll.dll"))
         {
@@ -575,9 +577,10 @@ class ShaderCapture
             if (auto wv = (PFN_WineVer)GetProcAddress(nt, "wine_get_version"))
                 metaOS = std::string("wine ") + (wv() ? wv() : "?");
         }
-        Log("provenance: %s / %s / driver %s / backend %s",
+        Log("provenance: %s / %s / driver %s / backend %s%s%s",
             metaOS.c_str(), metaAdapter.c_str(), metaDriver.c_str(),
-            metaBackend ? "DXVK" : "native D3D9");
+            metaBackend ? "DXVK" : "native D3D9",
+            metaDxvk.empty() ? "" : " ", metaDxvk.c_str());
     }
 
     static void ResolveBundle(IDirect3DDevice9* d)
@@ -628,6 +631,7 @@ class ShaderCapture
         c.strings[pipelinekeys::kMetaAdapter]   = metaAdapter;
         c.strings[pipelinekeys::kMetaDriver]    = metaDriver;
         c.strings[pipelinekeys::kMetaOS]        = metaOS;
+        c.strings[pipelinekeys::kMetaDxvk]      = metaDxvk;
 
         // Which render states the records carry, so a reader never has to guess.
         c.rsTypes.reserve(kNumRS);

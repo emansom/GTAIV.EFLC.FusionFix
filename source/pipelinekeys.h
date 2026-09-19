@@ -474,7 +474,12 @@ namespace pipelinekeys
         kMetaAdapter   = 1,   // D3DADAPTER_IDENTIFIER9::Description
         kMetaDriver    = 2,   // under DXVK the Vulkan driver ("radv Mesa 25.2.3"), else the D3D9 driver version
         kMetaOS        = 3,   // "windows" / "wine <version>"
-        kMetaStringCount = 4,
+        // The DXVK build: "<module file> <size> fnv:<FNV-1a-64 of the file>". Part of
+        // the bucket key for Vulkan-level (Fossilize) caches, whose SPIR-V and state
+        // change with every DXVK build. Added within v2: readers take min(stringCount,
+        // kMetaStringCount), so files with 4 strings read this as empty.
+        kMetaDxvk      = 4,
+        kMetaStringCount = 5,
     };
 
 #pragma pack(push, 1)
