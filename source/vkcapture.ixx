@@ -6,6 +6,7 @@ module;
 #include "fossilize_db.hpp"
 #include "layer/utils.hpp"          // Fossilize's LOG* macros, which fossilize_errors.hpp requires
 #include "fossilize_errors.hpp"     // set_thread_log_callback
+#include "cli/fossilize_feature_filter.hpp"
 #include "pipelinekeys.h"
 #include <cstdarg>
 #include <cstdio>
@@ -67,17 +68,29 @@ import comvars;
 //
 //    Replaying on the game's own device is what makes it cache-effective on every
 //    driver (NVIDIA keys its cache on the process); it is also why nothing invalid
-//    may reach it. So:
-//      * TRUSTED: this machine's own recording, entries linked to exactly this
-//        session's application + feature hash (same DXVK build, same features).
-//        Replayed as-is, and everything they use is LEARNED as known-valid here.
-//      * Everything else -- older own entries, other PCs' files dropped into
-//        plugins\pipelinecache\, the player's own Steam pre-cache buckets (read
-//        only, never written) -- is VALIDATED: every pNext structure, pipeline
-//        flag, dynamic state, SPIR-V capability and extension it uses must be one
-//        DXVK itself used on this device (learned from the trusted entries and
-//        from DXVK's live calls through the wrappers above). Otherwise it is
-//        skipped, never risked.
+//    may reach it. A driver does not validate: RADV creates a pipeline whose depth
+//    format it cannot render to, and dereferences a missing vertex shader. And a
+//    fault in the driver cannot be caught here -- under Wine it happens on the Unix
+//    side, and winevulkan answers it with ExitProcess(3). So every object passes
+//    three checks before it is created:
+//      * RELEVANT: every pNext structure, pipeline flag, dynamic state, SPIR-V
+//        capability and extension it uses is one DXVK itself used on this device
+//        (learned from DXVK's live calls through the wrappers above and from the
+//        trusted entries). Anything else was built by another DXVK build or
+//        configuration and would never be asked for again.
+//      * SUPPORTED: Fossilize's own feature filter -- the check fossilize-replay,
+//        and so Steam's pre-caching, runs before creating anything -- set up with
+//        exactly what DXVK enabled on this device: its extensions and feature
+//        chain, the physical device's properties, formats and set-layout limits.
+//      * COMPLETE: every shader module and pipeline library the replayer resolved
+//        exists (again what fossilize-replay checks). The replayer cannot be
+//        trusted with that: an object it failed to create stays in its handle map
+//        as VK_NULL_HANDLE, and the next pipeline using it gets the null handle.
+//    TRUSTED entries -- this machine's own recording, linked to exactly this
+//    session's application + feature hash (same DXVK build, same features) -- skip
+//    the first check and teach it instead. Everything else -- older own entries,
+//    other PCs' files dropped into plugins\pipelinecache\, the player's own Steam
+//    pre-cache buckets (read only, never written) -- needs all three.
 //    Steam's top-level mixed database (every DXVK since 1.7, ~2 GB) is not read:
 //    it matched 0.3% of what DXVK 3.1.1 builds, against 85.8% for its DXVK-3 bucket.
 // ===========================================================================
@@ -92,12 +105,11 @@ class VkCapture
     // line names it.
     static inline bool replayTrace = false;
     // ReplayVulkanPipelinesForeign: also replay databases this PC did not record with
-    // this exact DXVK build (other PCs, Steam's buckets). OFF by default, and not
-    // safe in-process: an entry recorded by DXVK 3.1.0 crashed RADV inside
-    // vkCreateGraphicsPipelines here (descriptor-heap mappings are specific to the
-    // recording DXVK build and device limits -- no structural check can validate
-    // them). Valve runs Fossilize replays out-of-process with crash recovery for
-    // exactly this reason.
+    // this exact DXVK build (other PCs, Steam's buckets). OFF by default. It used to
+    // take the game down within seconds: a shader module rejected as not relevant
+    // left VK_NULL_HANDLE in the replayer's handle map, a later pipeline of the same
+    // batch was created with it, and RADV dereferenced the missing vertex shader
+    // (radv_pipeline_init_vertex_input_state) -- see the three checks above.
     static inline bool replayForeign = false;
     static inline SafetyHookInline shGIPA{};
     static inline std::string hookedLib;
@@ -136,6 +148,34 @@ class VkCapture
         PFN_vkDestroyDescriptorSetLayout  DestroyDescriptorSetLayout = nullptr;
         PFN_vkDestroyPipelineLayout       DestroyPipelineLayout = nullptr;
         PFN_vkDestroyRenderPass           DestroyRenderPass = nullptr;
+
+        // What the feature filter asks of the device beyond what DXVK enabled: format
+        // support, set-layout limits, and physical-device features (for pipeline
+        // robustness). The same answers fossilize-replay's own device gives it.
+        struct Query : Fossilize::DeviceQueryInterface
+        {
+            VkPhysicalDevice gpu = VK_NULL_HANDLE;
+            VkDevice device = VK_NULL_HANDLE;
+            PFN_vkGetPhysicalDeviceFormatProperties FormatProperties = nullptr;
+            PFN_vkGetPhysicalDeviceFeatures2        Features2 = nullptr;
+            PFN_vkGetDescriptorSetLayoutSupport     SetLayoutSupport = nullptr;
+
+            bool format_is_supported(VkFormat format, VkFormatFeatureFlags features) override
+            {
+                VkFormatProperties p{};
+                FormatProperties(gpu, format, &p);
+                return (features & (p.linearTilingFeatures | p.optimalTilingFeatures | p.bufferFeatures)) == features;
+            }
+            bool descriptor_set_layout_is_supported(const VkDescriptorSetLayoutCreateInfo* info) override
+            {
+                VkDescriptorSetLayoutSupport s{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT };
+                SetLayoutSupport(device, info, &s);
+                return s.supported == VK_TRUE;
+            }
+            void physical_device_feature_query(VkPhysicalDeviceFeatures2* pdf2) override { Features2(gpu, pdf2); }
+        } query;
+        Fossilize::FeatureFilter filter;
+        bool haveFilter = false;
 
         std::unique_ptr<Fossilize::DatabaseInterface> db;
         std::unique_ptr<Fossilize::StateRecorder>     recorder;
@@ -525,16 +565,25 @@ class VkCapture
         bool enqueue_create_raytracing_pipeline(Fossilize::Hash, const VkRayTracingPipelineCreateInfoKHR*, VkPipeline*) override { return false; }
     };
 
+    // Why a replayed entry was not created: the first check that failed while the
+    // replayer resolved it and its dependencies (see the top of this file).
+    enum class Skip { None, Irrelevant, Unsupported, Incomplete, Failed };
+
     // Creates what the replayer parses on DXVK's device, through the real entry
-    // points. Trusted entries are created and learned from; the rest must pass
-    // Accepts() first. Pipelines are destroyed at once (libraries only at the end,
-    // since links reference them); everything else when the file is done.
+    // points, once it passes the checks at the top of this file. Trusted entries skip
+    // the relevance check and teach it instead. Pipelines are destroyed at once
+    // (libraries only when the batch is released, since links reference them).
     struct ReplayCreator : Fossilize::StateCreatorInterface
     {
         VkDevice device;
         Device* d;
         bool trusted = false;
-        uint32_t created = 0, createdTrusted = 0, rejected = 0, failed = 0;
+        // The entry being replayed, and how it went.
+        Fossilize::Hash entry = 0;
+        bool entryCreated = false;
+        Skip entrySkip = Skip::None;
+        uint32_t pipelines = 0;     // every pipeline created, libraries it needed included
+        uint32_t created = 0, createdTrusted = 0, irrelevant = 0, unsupported = 0, incomplete = 0, failed = 0, earlier = 0;
         std::vector<VkSampler> samplers;
         std::vector<VkDescriptorSetLayout> setLayouts;
         std::vector<VkPipelineLayout> layouts;
@@ -553,7 +602,7 @@ class VkCapture
         void Release()
         {
             for (auto p : libraries)  d->DestroyPipeline(device, p, nullptr);
-            for (auto m : modules)    d->DestroyShaderModule(device, m, nullptr);
+            for (auto m : modules)    { d->filter.unregister_shader_module_info(m); d->DestroyShaderModule(device, m, nullptr); }
             for (auto l : layouts)    d->DestroyPipelineLayout(device, l, nullptr);
             for (auto s : setLayouts) d->DestroyDescriptorSetLayout(device, s, nullptr);
             for (auto s : samplers)   d->DestroySampler(device, s, nullptr);
@@ -562,62 +611,188 @@ class VkCapture
             setLayouts.clear(); samplers.clear(); passes.clear();
         }
 
-        bool Allow(const Uses& u, bool isPipeline)
+        bool Reject(Skip why)
         {
-            if (trusted) { Learn(u, isPipeline); return true; }
-            if (Accepts(u)) return true;
-            rejected++;
+            if (entrySkip == Skip::None) entrySkip = why;
             return false;
         }
 
-        template <typename Info, typename Handle, typename Fn>
-        bool Make(const Info* ci, Handle* out, Fn create, std::vector<Handle>& keep, const Uses& u)
+        // Settle the entry just parsed. `parsed` is the replayer's own verdict: false
+        // when it could not resolve something itself (a pipeline layout it never saw,
+        // a module missing from the archive).
+        void Settle(bool parsed)
+        {
+            if (entryCreated) { created++; if (trusted) createdTrusted++; return; }
+            switch (entrySkip)
+            {
+            case Skip::Irrelevant:  irrelevant++;  break;
+            case Skip::Unsupported: unsupported++; break;
+            case Skip::Failed:      failed++;      break;
+            case Skip::Incomplete:  incomplete++;  break;
+            // Nothing rejected: already resolved in this batch (as a library another
+            // entry linked), or the replayer itself found a dependency missing.
+            case Skip::None:        (parsed ? earlier : incomplete)++; break;
+            }
+            if (replayTrace && !trusted && entrySkip != Skip::None)
+                Log("trace:   not created: %s", entrySkip == Skip::Irrelevant ? "not relevant" :
+                    entrySkip == Skip::Unsupported ? "not supported" : entrySkip == Skip::Failed ? "failed" : "incomplete");
+        }
+
+        // RELEVANT, then SUPPORTED: `supported` is the feature filter's verdict, only
+        // asked once the object is relevant (it parses whole SPIR-V modules).
+        template <typename Supported>
+        bool Allow(const Uses& u, bool isPipeline, Supported supported)
+        {
+            if (!trusted && !Accepts(u)) return Reject(Skip::Irrelevant);
+            if (d->haveFilter && !supported()) return Reject(Skip::Unsupported);
+            if (trusted) Learn(u, isPipeline);
+            return true;
+        }
+
+        template <typename Info, typename Handle, typename Fn, typename Supported>
+        bool Make(const Info* ci, Handle* out, Fn create, std::vector<Handle>& keep, const Uses& u, Supported supported)
         {
             *out = VK_NULL_HANDLE;
-            if (!Allow(u, false)) return false;
-            if (create(device, ci, nullptr, out) != VK_SUCCESS) { *out = VK_NULL_HANDLE; failed++; return false; }
+            if (!Allow(u, false, supported)) return false;
+            if (create(device, ci, nullptr, out) != VK_SUCCESS) { *out = VK_NULL_HANDLE; return Reject(Skip::Failed); }
             keep.push_back(*out);
             return true;
         }
 
         bool enqueue_create_sampler(Fossilize::Hash, const VkSamplerCreateInfo* ci, VkSampler* out) override
-        { return Make(ci, out, d->CreateSampler, samplers, CollectPlain(*ci)); }
+        { return Make(ci, out, d->CreateSampler, samplers, CollectPlain(*ci), [&] { return d->filter.sampler_is_supported(ci); }); }
         bool enqueue_create_descriptor_set_layout(Fossilize::Hash, const VkDescriptorSetLayoutCreateInfo* ci, VkDescriptorSetLayout* out) override
-        { return Make(ci, out, d->CreateDescriptorSetLayout, setLayouts, CollectPlain(*ci)); }
+        {
+            return Make(ci, out, d->CreateDescriptorSetLayout, setLayouts, CollectPlain(*ci),
+                        [&] { return d->filter.descriptor_set_layout_is_supported(ci); });
+        }
         bool enqueue_create_pipeline_layout(Fossilize::Hash, const VkPipelineLayoutCreateInfo* ci, VkPipelineLayout* out) override
-        { return Make(ci, out, d->CreatePipelineLayout, layouts, CollectPlain(*ci)); }
+        { return Make(ci, out, d->CreatePipelineLayout, layouts, CollectPlain(*ci), [&] { return d->filter.pipeline_layout_is_supported(ci); }); }
         bool enqueue_create_shader_module(Fossilize::Hash, const VkShaderModuleCreateInfo* ci, VkShaderModule* out) override
-        { return Make(ci, out, d->CreateShaderModule, modules, CollectModule(*ci)); }
+        {
+            if (!Make(ci, out, d->CreateShaderModule, modules, CollectModule(*ci), [&] { return d->filter.shader_module_is_supported(ci); }))
+                return false;
+            // What the filter checks pipelines against (entry points, workgroup sizes).
+            d->filter.register_shader_module_info(*out, ci);
+            return true;
+        }
         bool enqueue_create_render_pass(Fossilize::Hash, const VkRenderPassCreateInfo* ci, VkRenderPass* out) override
-        { return d->CreateRenderPass && Make(ci, out, d->CreateRenderPass, passes, CollectPlain(*ci)); }
+        {
+            return d->CreateRenderPass &&
+                   Make(ci, out, d->CreateRenderPass, passes, CollectPlain(*ci), [&] { return d->filter.render_pass_is_supported(ci); });
+        }
         bool enqueue_create_render_pass2(Fossilize::Hash, const VkRenderPassCreateInfo2* ci, VkRenderPass* out) override
         {
             auto fn = d->CreateRenderPass2 ? d->CreateRenderPass2 : d->CreateRenderPass2KHR;
-            return fn && Make(ci, out, fn, passes, CollectPlain(*ci));
+            return fn && Make(ci, out, fn, passes, CollectPlain(*ci), [&] { return d->filter.render_pass2_is_supported(ci); });
         }
 
-        template <typename Info, typename Fn>
-        bool MakePipeline(const Info* ci, VkPipeline* out, Fn create, const Uses& u)
+        // COMPLETE: every shader module and library the replayer resolved exists, as
+        // fossilize-replay checks in enqueue_pipeline() before it creates anything.
+        // The replayer's handle maps keep a failed object as VK_NULL_HANDLE
+        // (parse_shader_modules inserts the hash before it asks us to create it), so a
+        // module rejected for one pipeline comes back as a null handle to the next one
+        // in the same batch -- and RADV dereferences the missing vertex shader. A stage
+        // may carry its SPIR-V inline instead; a module identifier alone never counts
+        // (it names another driver's cache).
+        static bool Complete(const VkPipelineShaderStageCreateInfo& s)
+        {
+            return s.module != VK_NULL_HANDLE || FindPNext(s.pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
+        }
+        static bool Complete(const VkGraphicsPipelineCreateInfo& c)
+        {
+            for (uint32_t i = 0; i < c.stageCount; i++)
+                if (!Complete(c.pStages[i])) return false;
+            if (auto* l = static_cast<const VkPipelineLibraryCreateInfoKHR*>(FindPNext(c.pNext, VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR)))
+                for (uint32_t i = 0; i < l->libraryCount; i++)
+                    if (l->pLibraries[i] == VK_NULL_HANDLE) return false;
+            // Base pipelines are destroyed as soon as they exist.
+            return !(PipelineFlags(c.pNext, c.flags) & VK_PIPELINE_CREATE_DERIVATIVE_BIT) || c.basePipelineHandle;
+        }
+        static bool Complete(const VkComputePipelineCreateInfo& c)
+        {
+            return Complete(c.stage) && (!(PipelineFlags(c.pNext, c.flags) & VK_PIPELINE_CREATE_DERIVATIVE_BIT) || c.basePipelineHandle);
+        }
+
+        static void Describe(const VkGraphicsPipelineCreateInfo& c, char* buf, size_t n)
+        {
+            uint32_t nullStages = 0, libs = 0, nullLibs = 0, depth = 0, stencil = 0, color0 = 0;
+            for (uint32_t i = 0; i < c.stageCount; i++) if (c.pStages[i].module == VK_NULL_HANDLE) nullStages++;
+            if (auto* l = static_cast<const VkPipelineLibraryCreateInfoKHR*>(FindPNext(c.pNext, VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR)))
+                for (uint32_t i = 0; i < l->libraryCount; i++) { libs++; if (!l->pLibraries[i]) nullLibs++; }
+            if (auto* r = static_cast<const VkPipelineRenderingCreateInfo*>(FindPNext(c.pNext, VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO)))
+            { depth = r->depthAttachmentFormat; stencil = r->stencilAttachmentFormat; color0 = r->colorAttachmentCount ? r->pColorAttachmentFormats[0] : 0; }
+            snprintf(buf, n, "flags %llx, %u stages (%u null module), %u libraries (%u null), layout %s, render pass %s, "
+                     "formats color0 %u depth %u stencil %u", (unsigned long long)PipelineFlags(c.pNext, c.flags), c.stageCount,
+                     nullStages, libs, nullLibs, c.layout ? "set" : "none", c.renderPass ? "set" : "none", color0, depth, stencil);
+        }
+        static void Describe(const VkComputePipelineCreateInfo& c, char* buf, size_t n)
+        {
+            snprintf(buf, n, "compute, flags %llx, module %s", (unsigned long long)PipelineFlags(c.pNext, c.flags),
+                     c.stage.module ? "set" : "NULL");
+        }
+
+        template <typename Info, typename Fn, typename Supported>
+        bool MakePipeline(Fossilize::Hash h, const Info* ci, VkPipeline* out, Fn create, const Uses& u, Supported supported)
         {
             *out = VK_NULL_HANDLE;
-            if (!Allow(u, true)) return false;
-            if (create(device, VK_NULL_HANDLE, 1, ci, nullptr, out) != VK_SUCCESS) { *out = VK_NULL_HANDLE; failed++; return false; }
-            created++;
-            if (trusted) createdTrusted++;
+            if (!Complete(*ci)) return Reject(Skip::Incomplete);
+            if (!Allow(u, true, supported)) return false;
+            char what[256];
+            if (replayTrace && !trusted) { Describe(*ci, what, sizeof(what)); Log("trace:   create %s", what); }
+            const VkResult r = create(device, VK_NULL_HANDLE, 1, ci, nullptr, out);
+            if (replayTrace && !trusted) Log("trace:   -> %d", (int)r);
+            if (r != VK_SUCCESS) { *out = VK_NULL_HANDLE; return Reject(Skip::Failed); }
+            pipelines++;
+            if (h == entry) entryCreated = true;
             if (u.flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) libraries.push_back(*out);
             else { d->DestroyPipeline(device, *out, nullptr); *out = VK_NULL_HANDLE; }
             return true;
         }
 
-        bool enqueue_create_graphics_pipeline(Fossilize::Hash, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* out) override
-        { return MakePipeline(ci, out, d->CreateGraphicsPipelines, CollectGraphics(*ci)); }
-        bool enqueue_create_compute_pipeline(Fossilize::Hash, const VkComputePipelineCreateInfo* ci, VkPipeline* out) override
-        { return MakePipeline(ci, out, d->CreateComputePipelines, CollectCompute(*ci)); }
+        bool enqueue_create_graphics_pipeline(Fossilize::Hash h, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* out) override
+        {
+            return MakePipeline(h, ci, out, d->CreateGraphicsPipelines, CollectGraphics(*ci),
+                                [&] { return d->filter.graphics_pipeline_is_supported(ci); });
+        }
+        bool enqueue_create_compute_pipeline(Fossilize::Hash h, const VkComputePipelineCreateInfo* ci, VkPipeline* out) override
+        {
+            return MakePipeline(h, ci, out, d->CreateComputePipelines, CollectCompute(*ci),
+                                [&] { return d->filter.compute_pipeline_is_supported(ci); });
+        }
         bool enqueue_create_raytracing_pipeline(Fossilize::Hash, const VkRayTracingPipelineCreateInfoKHR*, VkPipeline*) override
         { return false; }
     };
 
-    struct Totals { uint32_t files = 0, created = 0, trusted = 0, rejected = 0, failed = 0, already = 0, stale = 0; bool lowVA = false; };
+    // Entries by outcome (`pipelines` counts every pipeline created, libraries included).
+    struct Totals
+    {
+        uint32_t files = 0, pipelines = 0, created = 0, trusted = 0, irrelevant = 0, unsupported = 0, incomplete = 0,
+                 failed = 0, already = 0, stale = 0;
+        bool lowVA = false;
+
+        void Add(const Totals& o)
+        {
+            files += o.files; pipelines += o.pipelines; created += o.created; trusted += o.trusted;
+            irrelevant += o.irrelevant; unsupported += o.unsupported; incomplete += o.incomplete; failed += o.failed;
+            already += o.already; stale += o.stale; lowVA |= o.lowVA;
+        }
+        // What was created and why the rest was not, for the log.
+        std::string Outcome() const
+        {
+            char buf[384];
+            snprintf(buf, sizeof(buf), "%u entries created (%u trusted, %u pipelines in all); skipped: %u not relevant "
+                     "(another DXVK build or configuration), %u not supported by this device, %u incomplete (a dependency "
+                     "missing or skipped), %u failed; %u already done", created, trusted, pipelines, irrelevant, unsupported,
+                     incomplete, failed, already);
+            return buf;
+        }
+        std::string Stale() const
+        {
+            return stale ? "; " + std::to_string(stale) + " from another DXVK build/feature set not replayed (foreign replay off)"
+                         : std::string();
+        }
+    };
 
     // Free virtual address space. GTA IV is a 32-bit process that needs most of its
     // 4 GB itself; the replay must never be what runs it out.
@@ -684,7 +859,7 @@ class VkCapture
                         return;
                     }
                     if (parsed % 2048 == 0)
-                        Log("replay: %s: %u entries, %u pipelines created, %llu MB address space free",
+                        Log("replay: %s: %u entries, %u created, %llu MB address space free",
                             path.c_str(), parsed, creator.created, (unsigned long long)(va >> 20));
                 }
                 currentEntry = h;
@@ -699,19 +874,23 @@ class VkCapture
                 if (replayTrace && !creator.trusted)
                     Log("trace: %s entry %016llx (#%u)", tag == Fossilize::RESOURCE_GRAPHICS_PIPELINE ? "graphics" : "compute",
                         (unsigned long long)h, parsed);
-                (void)replayer.parse(creator, db.get(), p, n);
+                creator.entry = h;
+                creator.entryCreated = false;
+                creator.entrySkip = Skip::None;
+                creator.Settle(replayer.parse(creator, db.get(), p, n));
                 // The parsed create-infos are dead once created; keep memory flat
                 // in a 32-bit process, as fossilize-replay does between batches.
                 replayer.get_allocator().reset();
             });
         }
 
-        t.files++; t.created += creator.created; t.trusted += creator.createdTrusted;
-        t.rejected += creator.rejected; t.failed += creator.failed; t.already += already; t.stale += stale;
+        Totals f;
+        f.files = 1; f.pipelines = creator.pipelines; f.created = creator.created; f.trusted = creator.createdTrusted;
+        f.irrelevant = creator.irrelevant; f.unsupported = creator.unsupported; f.incomplete = creator.incomplete;
+        f.failed = creator.failed; f.already = already + creator.earlier; f.stale = stale;
+        t.Add(f);
         if (parts == 1)
-            Log("replay: %s: %u pipelines created (%u trusted), %u objects rejected as not valid here, %u failed, "
-                "%u already done, %u skipped (another DXVK build/feature set)", path.c_str(), creator.created,
-                creator.createdTrusted, creator.rejected, creator.failed, already, stale);
+            Log("replay: %s: %s%s", path.c_str(), f.Outcome().c_str(), f.Stale().c_str());
     }
 
     // This PC's own recording, split across a few workers. Everything in it that
@@ -733,17 +912,17 @@ class VkCapture
                 ReplayFile(path, dev, d, true, seen[k], part[k], k, parts);
             });
         for (auto& w : workers) w.join();
-        uint32_t created = 0, trusted = 0, failed = 0, stale = 0;
+        Totals sum;
         for (uint32_t k = 0; k < parts; k++)
         {
-            created += part[k].created; trusted += part[k].trusted; failed += part[k].failed; stale += part[k].stale;
-            t.lowVA |= part[k].lowVA;
+            sum.Add(part[k]);
             done.insert(seen[k].begin(), seen[k].end());
         }
-        t.files++; t.created += created; t.trusted += trusted; t.failed += failed; t.stale += stale;
-        Log("replay: %s: %u pipelines created (%u trusted) on %u threads in %.1fs, %u failed, "
-            "%u skipped (another DXVK build/feature set)", path.c_str(), created, trusted, parts,
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), failed, stale);
+        sum.files = 1;
+        t.Add(sum);
+        Log("replay: %s: on %u threads in %.1fs: %s%s", path.c_str(), parts,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), sum.Outcome().c_str(),
+            sum.Stale().c_str());
     }
 
     // Other PCs' recordings, and this player's own Steam pre-cache buckets.
@@ -867,14 +1046,16 @@ class VkCapture
         if (GetFileAttributesA(own.c_str()) != INVALID_FILE_ATTRIBUTES)
             ReplayOwnParallel(own, dev, d, done, t);
 
-        // Foreign entries are judged against what is known to be valid here, so let
-        // DXVK show enough of that first: the trusted replay above usually already
-        // has, otherwise the game's own first pipelines (the loading-screen pass
-        // builds hundreds) do.
+        // Foreign entries are judged by what DXVK uses here, so let it show enough of
+        // that first: the trusted replay above usually already has, otherwise the
+        // game's own first pipelines (the loading-screen pass builds hundreds) do.
+        // Without the feature filter nothing foreign is validated, so nothing runs.
         auto inputs = ForeignInputs();
         if (!inputs.empty() && !replayForeign)
             Log("replay: %zu foreign database(s) found (other PCs / Steam pre-cache) - not replayed in-process, "
                 "see ReplayVulkanPipelinesForeign", inputs.size());
+        else if (!inputs.empty() && !d->haveFilter)
+            Log("replay: %zu foreign database(s) skipped - no feature filter for this device", inputs.size());
         else if (!inputs.empty())
         {
             for (int i = 0; i < 240 && !d->stop && learned.pipelines < 64; i++) Sleep(500);
@@ -882,12 +1063,18 @@ class VkCapture
                 Log("replay: only %u pipelines seen from DXVK - not enough to validate against, %zu foreign "
                     "database(s) skipped this launch", learned.pipelines.load(), inputs.size());
             else
-                for (auto& p : inputs) { if (d->stop || t.lowVA) break; ReplayFile(p, dev, d, false, done, t); }
+            {
+                const auto f0 = std::chrono::steady_clock::now();
+                Totals ft;
+                for (auto& p : inputs) { if (d->stop || t.lowVA || ft.lowVA) break; ReplayFile(p, dev, d, false, done, ft); }
+                t.Add(ft);
+                Log("replay: foreign, %u files in %.1fs: %s", ft.files,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - f0).count(), ft.Outcome().c_str());
+            }
         }
 
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        Log("replay: done in %.1fs - %u files, %u pipelines created (%u trusted), %u objects rejected, "
-            "%u failed, %u duplicates skipped", s, t.files, t.created, t.trusted, t.rejected, t.failed, t.already);
+        Log("replay: done in %.1fs - %u files: %s%s", s, t.files, t.Outcome().c_str(), t.Stale().c_str());
     }
 
     // ---- loader-level wrappers --------------------------------------------
@@ -933,6 +1120,74 @@ class VkCapture
                 VK_API_VERSION_PATCH(appInfo.engineVersion));
         }
         return res;
+    }
+
+    // Set up Fossilize's feature filter the way fossilize-replay sets it up for its own
+    // device (cli/device.cpp), but from DXVK's: the extensions and the feature chain
+    // DXVK enabled, the physical device's properties, and the device itself for format
+    // and set-layout queries.
+    static void InitFilter(Device& d, VkPhysicalDevice gpu, VkDevice dev, const VkDeviceCreateInfo* info)
+    {
+        auto gipa = [](const char* n) { return shGIPA.stdcall<PFN_vkVoidFunction>(instance, n); };
+        auto GetProperties  = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(gipa("vkGetPhysicalDeviceProperties"));
+        auto GetProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(gipa("vkGetPhysicalDeviceProperties2"));
+        auto EnumerateExts  = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(gipa("vkEnumerateDeviceExtensionProperties"));
+        d.query.gpu = gpu;
+        d.query.device = dev;
+        d.query.FormatProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(gipa("vkGetPhysicalDeviceFormatProperties"));
+        d.query.Features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(gipa("vkGetPhysicalDeviceFeatures2"));
+        d.query.SetLayoutSupport = reinterpret_cast<PFN_vkGetDescriptorSetLayoutSupport>(realGDPA(dev, "vkGetDescriptorSetLayoutSupport"));
+        if (!GetProperties || !GetProperties2 || !EnumerateExts || !d.query.FormatProperties || !d.query.Features2 ||
+            !d.query.SetLayoutSupport)
+        {
+            Log("no Vulkan 1.1 device queries - no feature filter, foreign pipelines cannot be validated");
+            return;
+        }
+
+        // The device's API version: what DXVK asked for, capped by the driver.
+        VkPhysicalDeviceProperties base{};
+        GetProperties(gpu, &base);
+        const uint32_t api = (std::min)(haveAppInfo && appInfo.apiVersion ? appInfo.apiVersion : VK_API_VERSION_1_0, base.apiVersion);
+
+        // Properties are facts about the GPU, so ask for those of every extension it
+        // supports -- as fossilize-replay's enable-everything device does. Built from
+        // DXVK's list alone, the filter would never see e.g. the float-controls limits:
+        // their struct is chained for VK_KHR_shader_float_controls, which a Vulkan 1.3
+        // application like DXVK does not name, and every shader using a rounding or
+        // denormal mode would then look unsupported.
+        uint32_t count = 0;
+        EnumerateExts(gpu, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> supported(count);
+        EnumerateExts(gpu, nullptr, &count, supported.data());
+        std::vector<const char*> supportedNames;
+        for (uint32_t i = 0; i < count; i++) supportedNames.push_back(supported[i].extensionName);
+        Fossilize::VulkanProperties props{};
+        VkPhysicalDeviceProperties2 props2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        props2.pNext = Fossilize::build_pnext_chain(props, api, supportedNames.data(), count);
+        GetProperties2(gpu, &props2);
+
+        auto exts = const_cast<const char**>(info->ppEnabledExtensionNames);
+
+        // DXVK's feature chain as a VkPhysicalDeviceFeatures2: the filter takes the core
+        // features from it and walks the rest (Vulkan 1.1-1.4 and extension structs).
+        VkPhysicalDeviceFeatures2 features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        if (auto* f2 = static_cast<const VkPhysicalDeviceFeatures2*>(FindPNext(info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)))
+            features.features = f2->features;
+        else if (info->pEnabledFeatures)
+            features.features = *info->pEnabledFeatures;
+        features.pNext = const_cast<void*>(info->pNext);
+
+        d.haveFilter = d.filter.init(api, exts, info->enabledExtensionCount, &features, &props2);
+        d.filter.set_device_query_interface(&d.query);
+        Log("feature filter: Vulkan %u.%u, the %u extensions and the features DXVK enabled on %s",
+            VK_API_VERSION_MAJOR(api), VK_API_VERSION_MINOR(api), info->enabledExtensionCount, base.deviceName);
+        if (replayTrace)
+            for (uint32_t i = 0; i < info->enabledExtensionCount; i += 8)
+            {
+                std::string line;
+                for (uint32_t k = i; k < info->enabledExtensionCount && k < i + 8; k++) { line += ' '; line += exts[k]; }
+                Log("trace: device extensions%s", line.c_str());
+            }
     }
 
     static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice gpu, const VkDeviceCreateInfo* info,
@@ -1029,6 +1284,8 @@ class VkCapture
             d->recorder ? ("recording to " + d->path).c_str() : "not recording",
             replayEnabled ? ", replaying" : "",
             d->usesIdentifiers ? " (with shader module identifiers)" : "");
+        if (replayEnabled)
+            InitFilter(*d, gpu, dev, info);
         Device* raw = d.get();
         {
             std::unique_lock lock(devLock);
@@ -1061,6 +1318,23 @@ class VkCapture
         return real;
     }
 
+    // winevulkan.dll ends the process with ExitProcess(3) when the Unix side of a call
+    // faults: Wine hands the fault back as the call's status ("Exception %#lx in Unix
+    // call", an ERR Proton does not print) and raises no Windows exception, so no
+    // handler ever sees the fault itself -- only whatever DLL then crashes on the way
+    // out. Say what happened first.
+    static void WINAPI VulkanLibExit(UINT code)
+    {
+        if (onReplayThread)
+            Log("%s is ending the process (exit code %u): the Unix side of a Vulkan call faulted while replaying "
+                "entry %016llx of %s", hookedLib.c_str(), code, (unsigned long long)currentEntry,
+                currentFile ? currentFile->c_str() : "?");
+        else
+            Log("%s is ending the process (exit code %u): the Unix side of a Vulkan call faulted on thread %lu",
+                hookedLib.c_str(), code, GetCurrentThreadId());
+        ExitProcess(code);
+    }
+
     // Runs inside the LoadLibraryA that loads the Vulkan library -- DXVK's, if it
     // is the first to ask -- so the hook is in place before anyone resolves it.
     static void InstallHook(const wchar_t* lib)
@@ -1074,6 +1348,8 @@ class VkCapture
         WideCharToMultiByte(CP_UTF8, 0, lib, -1, narrow, sizeof(narrow), nullptr, nullptr);
         hookedLib = narrow;
         Log(shGIPA ? "hooked vkGetInstanceProcAddr in %s" : "could not hook vkGetInstanceProcAddr in %s", narrow);
+        if (_wcsicmp(lib, L"winevulkan.dll") == 0)
+            IATHook::Replace(mod, "kernel32.dll", std::forward_as_tuple("ExitProcess", &VulkanLibExit));
     }
 
 public:
