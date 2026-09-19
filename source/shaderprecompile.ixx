@@ -28,12 +28,13 @@ module;
 //     what the game produces — otherwise DXVK compiles a fresh pipeline at first
 //     gameplay use.  [W3 the spec-constant/sampler-type join]
 //
-// COMPLETION GATE (W4): GPL is left at the DXVK default (Auto). After all creates
-// + draws are submitted we drain the GPU with a D3DQUERYTYPE_EVENT fence plus a
-// short present-settle, so nothing is left compiling when gameplay starts. DXVK
-// exposes no app-readable compiler counter; with the default Auto, background
-// "optimized" recompiles are non-blocking (they never stall a draw). No dxvk.conf
-// change is required or made.
+// COMPLETION GATE (W4): after all creates + draws are submitted we drain the GPU
+// with a D3DQUERYTYPE_EVENT fence, then wait until DXVK is QUIET -- DXVK exposes no
+// app-readable compiler counter, so vkcapture watches what it does instead: its
+// pipeline creations from every thread, and its compiler threads' CPU time. Then
+// the Vulkan replay (vkcapture) runs with the loading screen held, and the same
+// wait follows it; only then does the loading screen go (see WaitUntilIdle,
+// HoldForVulkanReplay). No dxvk.conf change is required or made.
 //
 // INTEGRATION (W2): a FusionFix ASI module. Injection anchor is the render-thread
 // per-frame loading-screen render function FUN_005cc760 (GTA IV 1.2.0.59), found
@@ -397,6 +398,11 @@ class ShaderPrecompiler
     static constexpr uint32_t kCreateW = 1;
     static constexpr uint32_t kPassW = 100;
     static inline std::string curLabel;
+    // What the bar measures, in the title: the D3D9 pass, then the Vulkan replay.
+    // curTitle replaces the whole title (no percentage, no ETA) while the bar
+    // measures something that is not work done -- the waits for DXVK to go quiet.
+    static inline const char* curWhat = "Compiling shaders";
+    static inline std::string curTitle;
     static inline std::chrono::steady_clock::time_point tStart;
     static inline std::chrono::steady_clock::time_point tPhase;   // what the bar's ETA extrapolates from
     static inline std::chrono::steady_clock::time_point tLastPresent;
@@ -1023,15 +1029,15 @@ class ShaderPrecompiler
                 double eta = secs * (1.0 - frac) / frac;
                 if (eta > 5999.0) eta = 5999.0;   // clamp the mm:ss field
                 _snprintf_s(line, sizeof(line), _TRUNCATE,
-                            "Compiling shaders  %3d%%    ETA %d:%02d", (int)(frac * 100.0f),
+                            "%s  %3d%%    ETA %d:%02d", curWhat, (int)(frac * 100.0f),
                             (int)eta / 60, (int)eta % 60);
             }
             else
             {
                 _snprintf_s(line, sizeof(line), _TRUNCATE,
-                            "Compiling shaders  %3d%%    estimating...", (int)(frac * 100.0f));
+                            "%s  %3d%%    estimating...", curWhat, (int)(frac * 100.0f));
             }
-            title = line;
+            title = curTitle.empty() ? std::string(line) : curTitle;
             sub = curLabel.empty() ? std::string("Preparing shaders...") : ("Building: " + curLabel);
         }
         if (!overlayBase || title != overlayTitle || sub != overlaySub)
@@ -2359,10 +2365,30 @@ class ShaderPrecompiler
     }
 
     // -------------------------------------------------------------------
-    //  Completion gate (W4) — drain the GPU so nothing compiles in gameplay.
+    //  Completion gate (W4) — nothing may still be compiling when the loading
+    //  screen goes.
     // -------------------------------------------------------------------
-    static void WaitUntilIdle()
+    static bool BudgetSpent()
     {
+        return cfg.budgetSeconds > 0 && std::chrono::steady_clock::now() - tStart > std::chrono::seconds(cfg.budgetSeconds);
+    }
+
+    // First the GPU: an event query drains everything submitted, so DXVK's CS thread
+    // has also executed every draw so far and created every pipeline they needed.
+    // Then DXVK itself, until it is QUIET: none of its pipeline creations in flight,
+    // none started or finished and no CPU time used by its compiler threads for a
+    // whole second, while the overlay keeps presenting (what that covers: the top of
+    // vkcapture.ixx; the signals: VulkanReplayState in pipelinekeys.h). Without
+    // vkcapture watching DXVK -- native D3D9, or no DXVK device seen -- there is
+    // nothing to observe, and a few presents have to do. Logs what it saw:
+    //   wait after <what>: <how it ended> at t=<s> after <s>s (GPU drain <s>s) - DXVK
+    //     started <n> creations (at most <n> at once), its <n> compiler threads used
+    //     <s>s CPU (<s>s since they started; its CS thread <s>s), last activity
+    //     t=<s>; settle <s>s
+    static void WaitUntilIdle(const char* after)
+    {
+        auto& vr = pipelinekeys::VulkanReplay();
+        const int64_t w0 = pipelinekeys::ClockUs();
         IDirect3DQuery9* q = nullptr;
         if (SUCCEEDED(dev->CreateQuery(D3DQUERYTYPE_EVENT, &q)) && q)
         {
@@ -2374,33 +2400,107 @@ class ShaderPrecompiler
             }
             q->Release();
         }
-        // Settle: a few extra presents so the DXVK worker queue (background GPL
-        // "optimized" upgrades under the default Auto) drains before gameplay.
-        for (int i = 0; i < 6; i++) { PresentOverlay(true); }
+        const int64_t d0 = pipelinekeys::ClockUs();
+        if (!vr.watching || !vr.compilerCpuUs)
+        {
+            for (int i = 0; i < 6; i++) { PresentOverlay(true); }
+            Log("wait after %s: GPU drained in %.2fs; DXVK not watched, so whether it is quiet cannot be seen",
+                after, (d0 - w0) / 1e6);
+            return;
+        }
+
+        constexpr int64_t kSettleUs = 1000000, kSampleUs = 100000, kGiveUpUs = 600000000;
+        const uint32_t creations0 = vr.creations.load();
+        uint32_t threads = 0;
+        uint64_t cs = 0;
+        const uint64_t cpu0 = vr.compilerCpuUs(&threads, nullptr);
+        uint64_t cpu = cpu0;
+        int64_t cpuAt = d0, sampledAt = d0, labelAt = 0;   // cpuAt: when that CPU time last grew
+        bool cpuGrew = false;
+        int32_t most = 0;
+        const char* ended = "quiet";
+        tPhase = std::chrono::steady_clock::now();
+        workTotal = 1000;
+        workDone = 0;
+        for (;;)
+        {
+            const int64_t now = pipelinekeys::ClockUs();
+            if (now - sampledAt >= kSampleUs)
+            {
+                const uint64_t c = vr.compilerCpuUs(&threads, &cs);
+                if (c != cpu) { cpu = c; cpuAt = now; cpuGrew = true; }
+                sampledAt = now;
+            }
+            const int32_t inFlight = vr.inFlight.load();
+            most = (std::max)(most, inFlight);
+            const int64_t quietFor = inFlight > 0 ? 0 : now - (std::max)(vr.lastActivityUs.load(), cpuAt);
+            if (quietFor >= kSettleUs) break;
+            if (BudgetSpent()) { ended = "stopped by PrecompileBudgetSeconds"; break; }
+            if (now - d0 >= kGiveUpUs) { ended = "NOT quiet, gave up"; break; }
+
+            // The bar fills as the quiet second does, and starts over whenever DXVK
+            // compiles something: it is full exactly when the wait is over.
+            workDone = (uint32_t)std::clamp<int64_t>(quietFor * 1000 / kSettleUs, 0, 1000);
+            if (now - labelAt >= 250000)
+            {
+                labelAt = now;
+                const int64_t s = (now - w0) / 1000000;
+                char text[128];
+                _snprintf_s(text, sizeof(text), _TRUNCATE, "Waiting for DXVK to finish compiling    %d:%02d",
+                            (int)(s / 60), (int)(s % 60));
+                curTitle = text;
+                if (inFlight > 0)
+                    _snprintf_s(text, sizeof(text), _TRUNCATE, "DXVK compiling (%d pipelines at once)", inFlight);
+                else if (cpuGrew && now - cpuAt < kSettleUs)
+                    _snprintf_s(text, sizeof(text), _TRUNCATE, "DXVK compiler threads busy");
+                else
+                    _snprintf_s(text, sizeof(text), _TRUNCATE, "DXVK quiet for %.1f of %.1f s", quietFor / 1e6, kSettleUs / 1e6);
+                curLabel = text;
+            }
+            PresentOverlay(false);
+            Sleep(5);
+        }
+        const int64_t end = pipelinekeys::ClockUs(), last = vr.lastActivityUs.load();
+        Log("wait after %s: %s at t=%.3f after %.2fs (GPU drain %.2fs) - DXVK started %u creations (at most %d at once), "
+            "its %u compiler threads used %.2fs CPU (%.2fs since they started; its CS thread %.2fs), last activity "
+            "t=%.3f; settle %.1fs", after, ended, vr.Seconds(end), (end - w0) / 1e6, (d0 - w0) / 1e6,
+            vr.creations.load() - creations0, most, threads, (cpu - cpu0) / 1e6, cpu / 1e6, cs / 1e6,
+            last ? vr.Seconds(last) : 0.0, kSettleUs / 1e6);
+        curTitle.clear();
+        workDone = workTotal;
+        PresentOverlay(true);
     }
 
-    // Keep the loading screen up until the Vulkan replay (vkcapture) is done. It
-    // starts on everything that is not this PC's own recording -- other PCs' files,
-    // the player's Steam pre-cache -- the moment this pass says it is done, and
-    // while held it runs on most of the cores. A pipeline it has not warmed yet is
-    // one gameplay would compile itself, and that is a stutter; the time spent here
-    // is not. PrecompileBudgetSeconds, if set, still bounds the whole load: past it
-    // the replay carries on in the background.
-    static void HoldForVulkanReplay()
+    // Keep the loading screen up for the Vulkan replay (vkcapture), which starts the
+    // moment this sets passDone: this PC's own recording, then other PCs' files and
+    // the player's Steam pre-cache, on most of the cores while held. A pipeline it
+    // has not warmed yet is one gameplay would compile itself, and that is a stutter;
+    // the time spent here is not. PrecompileBudgetSeconds, if set, still bounds the
+    // whole load: past it the replay carries on in the background. True if the
+    // replay went through something and finished while held.
+    static bool HoldForVulkanReplay()
     {
         auto& vr = pipelinekeys::VulkanReplay();
-        if (!vr.running) { vr.passDone = true; return; }
+        if (!vr.running || BudgetSpent())
+        {
+            vr.passDone = true;
+            Log("order: 2. no Vulkan replay to hold the loading screen for (%s), t=%.3f",
+                vr.running ? "PrecompileBudgetSeconds reached, it runs in the background" : "none running", vr.Seconds());
+            return false;
+        }
         vr.holding = true;
         vr.passDone = true;
+        Log("order: 2. Vulkan replay with the loading screen held, t=%.3f", vr.Seconds());
 
         const auto h0 = std::chrono::steady_clock::now();
         tPhase = h0;
         workDone = 0;
+        curWhat = "Warming Vulkan pipelines";
         bool budgetHit = false;
         auto labelAt = h0 - std::chrono::seconds(1);
         while (vr.running)
         {
-            if (cfg.budgetSeconds > 0 && std::chrono::steady_clock::now() - tStart > std::chrono::seconds(cfg.budgetSeconds))
+            if (BudgetSpent())
             {
                 budgetHit = true;
                 break;
@@ -2413,17 +2513,24 @@ class ShaderPrecompiler
             {
                 labelAt = now;
                 char label[128];
-                _snprintf_s(label, sizeof(label), _TRUNCATE, "Vulkan pipelines, %u of %u", workDone.load(), total);
+                const uint32_t phase = vr.phase.load();
+                if (phase == pipelinekeys::VulkanReplayState::kPreparing)
+                    _snprintf_s(label, sizeof(label), _TRUNCATE, "Vulkan pipelines, reading the recordings");
+                else
+                    _snprintf_s(label, sizeof(label), _TRUNCATE, "Vulkan pipelines from %s, %u of %u",
+                                phase == pipelinekeys::VulkanReplayState::kOwn ? "this PC" : "other PCs and Steam",
+                                workDone.load(), total);
                 curLabel = label;
             }
             PresentOverlay(false);
             Sleep(5);
         }
         vr.holding = false;
-        Log("held the loading screen %.1fs for the Vulkan replay (%u of %u entries)%s",
+        Log("held the loading screen %.1fs for the Vulkan replay (%u of %u entries), t=%.3f%s",
             std::chrono::duration<double>(std::chrono::steady_clock::now() - h0).count(), vr.done.load(), vr.total.load(),
-            budgetHit ? " - PrecompileBudgetSeconds reached, it carries on in the background" : "");
+            vr.Seconds(), budgetHit ? " - PrecompileBudgetSeconds reached, it carries on in the background" : "");
         PresentOverlay(true);
+        return !budgetHit && vr.total.load() > 0;
     }
 
     static void ReleaseResources()
@@ -2523,6 +2630,11 @@ class ShaderPrecompiler
         CreateOverlay();
         PresentOverlay(true);
 
+        // The order on the loading screen (VulkanReplayState in pipelinekeys.h):
+        //   1. the D3D9 pass, then wait until DXVK is quiet;
+        //   2. the whole Vulkan replay, held, then wait until DXVK is quiet again;
+        //   3. only then is the loading screen let go.
+        Log("order: 1. D3D9 pass, t=%.3f", pipelinekeys::VulkanReplay().Seconds());
         fxc_db* db = fxc_load_all(ResolveShaderDir().c_str());
         if (!db) { Log("fxc_load_all failed: %s", fxc_last_error()); }
         else
@@ -2565,10 +2677,11 @@ class ShaderPrecompiler
             {
                 DummyDrawPass(db);
             }
-            WaitUntilIdle();
+            WaitUntilIdle("the D3D9 pass");
             fxc_free(db);
         }
-        HoldForVulkanReplay();
+        if (HoldForVulkanReplay())
+            WaitUntilIdle("the Vulkan replay");
         // NB: ReleaseResources() deliberately happens AFTER the state restore below.
         // Releasing our scratch targets and textures while they are still bound, and
         // only then putting the game's state back, is the wrong order -- COM keeps
@@ -2623,6 +2736,7 @@ class ShaderPrecompiler
         else
             Log("presents accounted for: %u device presents vs %u overlay frames - nothing else "
                 "is presenting during the pass", devPresents, overlayFrames);
+        Log("order: 3. loading screen released, t=%.3f", pipelinekeys::VulkanReplay().Seconds());
         dev->Release();
         dev = nullptr;
     }
@@ -2868,7 +2982,8 @@ public:
         FusionFix::onInitEvent() += []()
         {
             ReadConfig();
-            // The Vulkan replay waits for this pass before judging foreign entries.
+            // The whole Vulkan replay waits for this pass, and then runs with the loading
+            // screen held; without the pass it runs in the background from the start.
             pipelinekeys::VulkanReplay().passPlanned = cfg.enabled;
             // The flash probe rides the same hook, so arm for either.
             if (!cfg.enabled && cfg.flashProbe <= 0) { Log("disabled via ini"); return; }

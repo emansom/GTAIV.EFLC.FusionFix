@@ -406,20 +406,69 @@ namespace pipelinekeys
 
     // ---- the Vulkan replay and the loading-screen pass -----------------------
     //
-    // vkcapture replays Fossilize databases on DXVK's device from threads of its own;
-    // shaderprecompile owns the loading screen. They meet here.
-    //   * passPlanned / passDone: the loading-screen pass will run / has run. The
-    //     foreign replay waits for it: foreign entries are judged against what DXVK
-    //     has used on this device, and that pass is where DXVK shows most of it.
-    //   * holding: the loading screen is held until the replay is done, so the
-    //     replay may use most of the cores instead of one background thread. An
-    //     unwarmed pipeline is a stutter in gameplay; a longer load is not.
-    //   * running, done / total: whether the replay is still going, and how many of
-    //     the pipeline entries it has found it has been through, for the bar.
+    // vkcapture replays Fossilize databases on DXVK's device from threads of its own
+    // and sees every pipeline DXVK creates; shaderprecompile owns the loading screen.
+    // They meet here. On the loading screen, strictly in this order:
+    //   1. the D3D9 pass (shaderprecompile), then a wait until DXVK is QUIET: nothing
+    //      it started compiling -- on its own worker threads too -- is still going;
+    //   2. the whole Vulkan replay: this PC's own recording, then other PCs' files
+    //      and the player's Steam pre-cache, on most of the cores;
+    //   3. another wait until DXVK is quiet, and only then is the loading screen let go.
+    // An unwarmed pipeline is a stutter in gameplay; a longer load is not.
+    //   * passPlanned / passDone: the loading-screen pass will run / step 1 is over.
+    //     The replay waits for it -- and foreign entries are judged against what
+    //     DXVK has used on this device, which that pass shows most of. Without the
+    //     pass (PrecompileShaders = 0) nothing waits and nothing is held.
+    //   * holding: the loading screen is held for the replay, so it may use most of
+    //     the cores instead of background threads. PrecompileBudgetSeconds, if set,
+    //     ends the hold; the replay then carries on in the background.
+    //   * running, phase, done / total: whether the replay is still going, which
+    //     part of it, and how many of the pipeline entries it found it has been
+    //     through, for the bar.
+    //   * watching, inFlight, creations, lastActivityUs: vkcapture's view of DXVK's
+    //     own vkCreate*Pipelines / vkCreateShaderModule calls, from every thread --
+    //     whether it wraps DXVK's device at all, how many are running right now, how
+    //     many have started, and when one last started or finished (ClockUs). The
+    //     replay's own creations bypass the wrappers and are not counted.
+    //   * compilerCpuUs: the CPU time DXVK's compiler threads ("dxvk-shader-*" and
+    //     the IR cache writer "dxvk-cache") have used so far, and how many there are.
+    //     DXVK also works on them without any Vulkan call (turning D3D9 shaders into
+    //     its IR, with or without pipeline libraries), so a create counter alone
+    //     cannot say they are idle. Set once watching is; not free, ask sparingly.
+    //     csUs, if asked for, gets the CS thread's ("dxvk-cs") CPU time: busy at
+    //     every draw, so a reading that stays 0 there means this cannot be measured
+    //     here at all, rather than that the compilers were idle.
+    //   * epochUs / epochLocal: the session clock every "t=" in the log counts from
+    //     (vkcapture touches this state when the ASI loads).
+    // Quiet cannot see a driver compiling in threads of its own after the create call
+    // has returned. RADV does not; it compiles inside the call.
+
+    // Microseconds on the one clock every module shares.
+    inline int64_t ClockUs()
+    {
+        static const int64_t freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return (int64_t)f.QuadPart; }();
+        LARGE_INTEGER c;
+        QueryPerformanceCounter(&c);
+        return (int64_t)(c.QuadPart / freq * 1000000 + c.QuadPart % freq * 1000000 / freq);
+    }
+
     struct VulkanReplayState
     {
         std::atomic<bool> passPlanned{ false }, passDone{ false }, holding{ false }, running{ false };
         std::atomic<uint32_t> done{ 0 }, total{ 0 };
+        enum Phase : uint32_t { kPreparing = 0, kOwn = 1, kForeign = 2 };
+        std::atomic<uint32_t> phase{ kPreparing };
+
+        std::atomic<bool> watching{ false };
+        std::atomic<int32_t> inFlight{ 0 };
+        std::atomic<uint32_t> creations{ 0 };
+        std::atomic<int64_t> lastActivityUs{ 0 };
+        uint64_t (*compilerCpuUs)(uint32_t* threads, uint64_t* csUs) = nullptr;
+
+        const int64_t epochUs = ClockUs();
+        const SYSTEMTIME epochLocal = [] { SYSTEMTIME st{}; GetLocalTime(&st); return st; }();
+        double Seconds(int64_t us) const { return (us - epochUs) / 1e6; }
+        double Seconds() const { return Seconds(ClockUs()); }
     };
     inline VulkanReplayState& VulkanReplay()
     {

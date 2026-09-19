@@ -8,9 +8,12 @@ module;
 #include "fossilize_errors.hpp"     // set_thread_log_callback
 #include "cli/fossilize_feature_filter.hpp"
 #include "pipelinekeys.h"
+#include <tlhelp32.h>
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cwctype>
 #include <string>
 #include <memory>
 #include <mutex>
@@ -64,13 +67,30 @@ import comvars;
 //    DRIVER's pipeline cache before gameplay asks for the same pipelines. Each
 //    pipeline is destroyed as soon as it exists: the goal is the driver cache, not
 //    the objects, and GTA IV is a 32-bit process.
-//      1. Right after DXVK creates its device, this PC's own recording, on a few
-//         low-priority threads while the game loads.
-//      2. Once the loading-screen pass (shaderprecompile) is done, everything else:
-//         other PCs' .foz files dropped into plugins\pipelinecache\ and the
-//         player's own Steam pre-cache. The loading screen is held until this is
-//         done too, so it runs on most of the cores; an unwarmed pipeline is a
-//         stutter in gameplay, a longer first load is not.
+//    The replay thread starts with DXVK's device and counts what it will go through
+//    while the game loads. It replays nothing until the loading-screen pass
+//    (shaderprecompile) has run AND everything DXVK compiled for it has finished
+//    (see VulkanReplayState in pipelinekeys.h); then, with the loading screen held
+//    and on most of the cores:
+//      1. this PC's own recording,
+//      2. everything else: other PCs' .foz files in plugins\pipelinecache\ and
+//         the player's own Steam pre-cache.
+//    The loading screen then waits once more for DXVK to go quiet. An unwarmed
+//    pipeline is a stutter in gameplay, a longer first load is not.
+//    Without the loading-screen pass (PrecompileShaders = 0) nothing is held: the
+//    own recording replays right away on a few lowest-priority threads while the
+//    game loads, and the foreign files on one, once DXVK has shown enough of its
+//    own pipelines to judge them by (see ReplayAll).
+//
+//  SHARING BETWEEN PCs (plugins\pipelinecache\)
+//    Once per launch, before this session appends anything, the own recording is
+//    copied to plugins\pipelinecache\FusionFix.<h>.foz, <h> being the 64-bit FNV-1a
+//    of its bytes: the player copies that folder's contents to their other PCs, and
+//    never renames anything. The copy this PC wrote before (remembered in
+//    FusionFix.pipelinecache.state beside the ASI) is deleted; no other file there
+//    is ever touched. The folder is read flat -- .foz files at its top level, any
+//    name -- and every input is used once per content, so the own copy, or the same
+//    file under two names, is not replayed twice.
 //
 //    Replaying on the game's own device is what makes it cache-effective on every
 //    driver (NVIDIA keys its cache on the process); it is also why nothing invalid
@@ -95,10 +115,41 @@ import comvars;
 //    TRUSTED entries -- this machine's own recording, linked to exactly this
 //    session's application + feature hash (same DXVK build, same features) -- skip
 //    the first check and teach it instead. Everything else -- older own entries,
-//    other PCs' files dropped into plugins\pipelinecache\, the player's own Steam
-//    pre-cache buckets (read only, never written) -- needs all three.
+//    other PCs' files in plugins\pipelinecache\, the player's own Steam pre-cache
+//    buckets (read only, never written) -- needs all three.
 //    Steam's top-level mixed database (every DXVK since 1.7, ~2 GB) is not read:
 //    it matched 0.3% of what DXVK 3.1.1 builds, against 85.8% for its DXVK-3 bucket.
+//
+//  WATCHING DXVK COMPILE (whenever DXVK creates its device, whatever the settings)
+//    What DXVK 3.1.1 does after the D3D9 calls have returned:
+//      * every D3D9 shader created is queued to its "dxvk-shader-n/-l" workers
+//        (registerShader, src/dxvk/dxvk_pipemanager.cpp), which turn it into DXVK's
+//        IR and SPIR-V and, with pipeline libraries, build its library;
+//      * binding a shader not compiled yet queues it again at high priority
+//        (requestCompileShader), picked up by any worker;
+//      * every draw is executed later on its CS thread ("dxvk-cs"), which creates a
+//        pipeline the first time a state is drawn: the full compile with pipeline
+//        libraries off (as on this rig), a fast link with them on -- and then the
+//        optimized pipeline is queued to the "dxvk-shader-l" workers;
+//      * new shaders are written to DXVK's IR cache by "dxvk-cache", which converts
+//        whatever the workers have not yet.
+//    So quiet is: none of DXVK's vkCreateGraphicsPipelines / vkCreateComputePipelines
+//    / vkCreateShaderModule calls in flight, from any thread, none started or ended
+//    for a while, and no CPU time used by those worker threads meanwhile (the IR
+//    work calls no Vulkan at all). The wrappers count the calls; CompilerCpuUs reads
+//    the CPU time; shaderprecompile does the waiting (see VulkanReplayState in
+//    pipelinekeys.h). A driver may compile further in threads of its own after
+//    vkCreate*Pipelines has returned, and nothing here can see that; RADV does not,
+//    it compiles inside the call.
+//
+//  GAMEPLAY METRICS (whenever DXVK creates its device, whatever the settings)
+//    Every DXVK pipeline creation is timed, and every vkQueuePresentKHR on its device
+//    makes a frame time. Gameplay is while no loading screen has been up for 2 s,
+//    once the first one has gone and the loading-screen pass (if one runs) is done
+//    (InGameplay). Reported every 15 s of gameplay and once more at exit; the lines
+//    are described at ReportGameplay. Costs a clock read per creation and per
+//    present: it stays on with everything else off, to measure the unwarmed game
+//    against.
 // ===========================================================================
 
 class VkCapture
@@ -190,13 +241,16 @@ class VkCapture
         // This session's application + feature hash, the one Fossilize links every
         // blob to: equal means same DXVK build and same enabled features.
         Fossilize::Hash appHash = 0;
-        std::thread replay;
+        std::thread replay, metrics;
         std::atomic<bool> stop{ false };
 
         std::atomic<uint32_t> graphics{ 0 }, compute{ 0 }, modules{ 0 }, other{ 0 }, failed{ 0 };
     };
     static inline std::shared_mutex devLock;
     static inline std::unordered_map<VkDevice, std::unique_ptr<Device>> devices;
+    // The wrapped device's present, for the frame times. Queues carry no device, and
+    // only one device is ever wrapped.
+    static inline PFN_vkQueuePresentKHR realQueuePresent = nullptr;
 
     static void Log(const char* fmt, ...)
     {
@@ -378,10 +432,110 @@ class VkCapture
         return true;
     }
 
-    // How long DXVK's own pipeline creations take, split at the end of the loading
-    // screen. A driver-cache hit costs well under a millisecond, a compile several to
-    // tens. Whatever still compiles once gameplay has started is what the warming
-    // missed: the number that says whether it worked, and what stutters.
+    // ---- watching DXVK compile, and the gameplay metrics ---------------------
+
+    // Gameplay: the first loading screen has come and gone, none has been up for the
+    // last kClearUs, and the loading-screen pass is done (or none is coming).
+    // Everything else -- startup screens, loading, the pass and its hold, the first
+    // moments after a loading screen -- is loading. The wait matters: GTA IV's
+    // loading goes through phases, and between two of them a present can find no
+    // loading screen up (seen once, 15 s before the game was playable). The flags
+    // are only looked at here, on presents and creations.
+    static inline std::atomic<bool> seenLoading{ false };
+    static inline std::atomic<int64_t> clearSinceUs{ 0 };   // first seen with no loading screen up, 0 = one is up
+    static constexpr int64_t kClearUs = 2000000;
+
+    static bool InGameplay(int64_t now)
+    {
+        auto& vr = pipelinekeys::VulkanReplay();
+        if ((CMenuManager::bLoadscreenShown && *CMenuManager::bLoadscreenShown) || bLoadingShown)
+        {
+            seenLoading = true;
+            clearSinceUs = 0;
+            return false;
+        }
+        if (!seenLoading || vr.holding || (vr.passPlanned && !vr.passDone)) return false;
+        int64_t since = clearSinceUs.load();
+        if (!since && clearSinceUs.compare_exchange_strong(since, now)) since = now;
+        return now - since >= kClearUs;
+    }
+
+    // One of DXVK's creations in flight (see VulkanReplayState). The finish is
+    // stamped before the count drops, so whoever sees nothing in flight also sees
+    // when the last one ended.
+    struct InFlight
+    {
+        InFlight()
+        {
+            auto& vr = pipelinekeys::VulkanReplay();
+            vr.inFlight++;
+            vr.creations++;
+            vr.lastActivityUs = pipelinekeys::ClockUs();
+        }
+        ~InFlight()
+        {
+            auto& vr = pipelinekeys::VulkanReplay();
+            vr.lastActivityUs = pipelinekeys::ClockUs();
+            vr.inFlight--;
+        }
+    };
+
+    // CPU time used so far by DXVK's compiler threads -- the workers it names
+    // "dxvk-shader-h", "-n" and "-l" (src/dxvk/dxvk_pipemanager.cpp) and its IR cache
+    // writer "dxvk-cache" (src/dxvk/dxvk_shader_cache.cpp) -- and how many there are.
+    // An idle one blocks on a condition variable and adds nothing; under Wine the
+    // time of another thread comes from /proc, in 10 ms steps. csUs, if given, gets
+    // the CS thread's ("dxvk-cs") -- not a compiler, but busy at every draw, so it
+    // shows whether this can be measured at all. Only asked while the loading screen
+    // waits for quiet, and once as gameplay starts: a snapshot of the process's
+    // threads is not free.
+    static uint64_t CompilerCpuUs(uint32_t* threads, uint64_t* csUs)
+    {
+        using GetDescription = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+        static const auto getDescription = [] {
+            auto p = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription");
+            if (!p) p = GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "GetThreadDescription");
+            return reinterpret_cast<GetDescription>(p);
+        }();
+        uint64_t sum = 0, cs = 0;
+        uint32_t n = 0;
+        HANDLE snap = getDescription ? CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) : INVALID_HANDLE_VALUE;
+        if (snap != INVALID_HANDLE_VALUE)
+        {
+            const DWORD pid = GetCurrentProcessId();
+            THREADENTRY32 te{ sizeof(te) };
+            for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
+            {
+                if (te.th32OwnerProcessID != pid) continue;
+                HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+                if (!h) continue;
+                PWSTR name = nullptr;
+                FILETIME created, exited, kernel, user;
+                if (SUCCEEDED(getDescription(h, &name)) && name)
+                {
+                    const bool compiler = wcsncmp(name, L"dxvk-shader-", 12) == 0 || wcscmp(name, L"dxvk-cache") == 0;
+                    if ((compiler || wcscmp(name, L"dxvk-cs") == 0) && GetThreadTimes(h, &created, &exited, &kernel, &user))
+                    {
+                        const uint64_t us = ((((uint64_t)kernel.dwHighDateTime << 32) | kernel.dwLowDateTime) +
+                                             (((uint64_t)user.dwHighDateTime << 32) | user.dwLowDateTime)) / 10;
+                        if (compiler) { sum += us; n++; }
+                        else cs += us;
+                    }
+                }
+                if (name) LocalFree(name);
+                CloseHandle(h);
+            }
+            CloseHandle(snap);
+        }
+        if (threads) *threads = n;
+        if (csUs) *csUs = cs;
+        return sum;
+    }
+
+    // How long DXVK's own pipeline creations take, split at the start of gameplay
+    // (InGameplay). A driver-cache hit costs well under a millisecond, a compile
+    // several to tens. Whatever still compiles once gameplay has started is what the
+    // warming missed: the number that says whether it worked, and what stutters.
     struct CreateTimes
     {
         std::atomic<uint32_t> n{ 0 }, libraries{ 0 }, linked{ 0 }, over1{ 0 }, over5{ 0 }, over20{ 0 }, slowLibraries{ 0 };
@@ -409,45 +563,199 @@ class VkCapture
     };
     static inline CreateTimes loadingTimes, gameplayTimes;
     static inline std::atomic<uint32_t> slowLogged{ 0 };
+    // Lines logged per kind of gameplay event (slow creation, long frame); the counts
+    // in the 15 s reports go on past it.
+    static constexpr uint32_t kDetailLines = 2000;
 
-    // Gameplay starts once the loading-screen pass is done and no loading screen is
-    // up; everything before (startup screens, loading, the pass itself) is loading.
-    static void TimeCreate(std::chrono::steady_clock::time_point t0, uint64_t flags, const void* pNext)
+    // t0 is when the creation started (ClockUs), which is also the t= of its line,
+    // so it can be laid against the frame it landed in.
+    static void TimeCreate(int64_t t0, uint64_t flags, const void* pNext)
     {
-        const uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - t0).count();
+        const int64_t now = pipelinekeys::ClockUs();
+        const uint64_t us = (uint64_t)(now - t0);
         const bool library = (flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) != 0;
         auto* libs = static_cast<const VkPipelineLibraryCreateInfoKHR*>(FindPNext(pNext, VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR));
         const bool link = libs && libs->libraryCount;
-        const bool gameplay = pipelinekeys::VulkanReplay().passDone &&
-                              !((CMenuManager::bLoadscreenShown && *CMenuManager::bLoadscreenShown) || bLoadingShown);
+        const bool gameplay = InGameplay(now);
         (gameplay ? gameplayTimes : loadingTimes).Add(us, library, link);
-        if (gameplay && us >= 20000 && slowLogged++ < 50)
-            Log("gameplay: DXVK spent %.1f ms creating a %s", us / 1000.0,
-                library ? "pipeline library" : link ? "linked pipeline" : "pipeline");
+        if (!gameplay || us < 20000) return;
+        const uint32_t k = slowLogged++;
+        if (k < kDetailLines)
+            Log("gameplay compile t=%.3f: DXVK spent %.1f ms creating a %s", pipelinekeys::VulkanReplay().Seconds(t0),
+                us / 1000.0, library ? "pipeline library" : link ? "linked pipeline" : "pipeline");
+        else if (k == kDetailLines)
+            Log("gameplay compile: more than %u - no more of these lines, the reports still count them", kDetailLines);
     }
 
-    // Once the replay is done, its thread reports what DXVK still had to create,
-    // every 15 s in which that changed.
-    static void ReportCreateTimes(Device* d)
+    // Gameplay frame times: the gap between two vkQueuePresentKHR calls on DXVK's
+    // device, both made in gameplay. DXVK presents from its submission thread once
+    // its CS thread has worked through the frame, so a compile on the CS thread shows
+    // up here as a long frame. Percentiles come from a histogram of 0.1 ms bins (the
+    // last one takes everything from 1 s up), so reading them needs no lock: the
+    // final report runs at process exit, when a thread holding one may be gone.
+    struct FrameTimes
     {
-        uint32_t logged = 0;
-        bool loadingLogged = false;
+        static constexpr uint32_t kBinUs = 100, kBins = 10000;
+        std::atomic<uint32_t> bins[kBins]{};
+        std::atomic<uint32_t> n{ 0 }, spikes{ 0 }, over50{ 0 };
+        std::atomic<uint64_t> sumUs{ 0 }, maxUs{ 0 };
+        std::atomic<int64_t> startUs{ 0 };     // gameplay's first present (ClockUs), 0 = none yet
+
+        // The presenting thread's own state, under `m`: the previous present, and the
+        // rolling window a spike is measured against.
+        std::mutex m;
+        int64_t lastUs = 0;
+        bool lastGameplay = false;
+        static constexpr uint32_t kWindow = 64, kWindowMin = 16;
+        uint32_t window[kWindow] = {};
+        uint32_t windowN = 0, windowAt = 0;
+        uint32_t longLogged = 0;
+
+        void Add(uint32_t us)
+        {
+            bins[(std::min)(us / kBinUs, kBins - 1)]++;   // before n, so a reader never finds fewer
+            n++;
+            sumUs += us;
+            uint64_t w = maxUs.load();
+            while (us > w && !maxUs.compare_exchange_weak(w, us)) {}
+        }
+        // The pct-th percentile: the upper edge of the bin holding the frame of that
+        // rank (nearest-rank), or the longest frame if it is in the last bin.
+        double PercentileMs(uint32_t pct) const
+        {
+            const uint64_t total = n.load();
+            if (!total) return 0.0;
+            const uint64_t rank = (std::max)(1ull, (total * pct + 99) / 100);
+            uint64_t seen = 0;
+            for (uint32_t i = 0; i + 1 < kBins; i++)
+                if ((seen += bins[i].load(std::memory_order_relaxed)) >= rank)
+                    return (i + 1) * kBinUs / 1000.0;
+            return maxUs.load() / 1000.0;
+        }
+    };
+    static inline FrameTimes frameTimes;
+
+    // Once per present. A frame is the time from one gameplay present to the next.
+    // A SPIKE is a frame longer than twice the median of the 64 gameplay frames
+    // before it AND longer than that median + 8 ms (no verdict until 16 frames are
+    // in; with an even count the median is the upper middle one): at 60 fps that is
+    // anything over ~33.3 ms, at 144 fps over ~14.9 ms. Every frame over 50 ms is
+    // logged with its t= (the present that ended it), whether or not it is a spike.
+    static void CountFrame()
+    {
+        const int64_t now = pipelinekeys::ClockUs();
+        const bool gameplay = InGameplay(now);
+        auto& f = frameTimes;
+        std::lock_guard lock(f.m);
+        const bool both = gameplay && f.lastGameplay && f.lastUs;
+        const uint32_t us = both ? (uint32_t)(std::min)(now - f.lastUs, (int64_t)UINT32_MAX) : 0u;
+        f.lastUs = now;
+        f.lastGameplay = gameplay;
+        if (gameplay && !f.startUs)
+        {
+            f.startUs = now;
+            Log("metrics: gameplay starts at t=%.3f", pipelinekeys::VulkanReplay().Seconds(now));
+        }
+        if (!both) return;
+
+        uint32_t median = 0;
+        if (f.windowN >= f.kWindowMin)
+        {
+            uint32_t sorted[FrameTimes::kWindow];
+            std::copy_n(f.window, f.windowN, sorted);
+            std::nth_element(sorted, sorted + f.windowN / 2, sorted + f.windowN);
+            median = sorted[f.windowN / 2];
+        }
+        const bool spike = f.windowN >= f.kWindowMin && us > 2 * median && us > median + 8000;
+        f.window[f.windowAt] = us;
+        f.windowAt = (f.windowAt + 1) % f.kWindow;
+        if (f.windowN < f.kWindow) f.windowN++;
+
+        f.Add(us);
+        if (spike) f.spikes++;
+        if (us > 50000)
+        {
+            f.over50++;
+            const uint32_t k = f.longLogged++;
+            if (k < kDetailLines)
+                Log("gameplay long frame t=%.3f: %.1f ms, median %.2f ms, spike %s",
+                    pipelinekeys::VulkanReplay().Seconds(now), us / 1000.0, median / 1000.0, spike ? "yes" : "no");
+            else if (k == kDetailLines)
+                Log("gameplay long frame: more than %u - no more of these lines, the reports still count them", kDetailLines);
+        }
+    }
+
+    // The gameplay report, every 15 s of gameplay and once at exit ("final"):
+    //   gameplay frames[ final] t=<s> play=<s>s: frames <n>, avg <fps> fps, p50 <ms> ms,
+    //     p95 <ms> ms, p99 <ms> ms, max <ms> ms, spikes <n>, >50 ms <n>
+    //   created by DXVK in gameplay so far: <CreateTimes::Describe>   ("in gameplay:" at exit)
+    // t is the session clock (seconds since the ASI loaded), play the time since
+    // gameplay's first present. Every figure covers the whole of gameplay so far, not
+    // just the last 15 s: frames and fps (frames / their summed time), percentiles
+    // (nearest rank, the upper edge of a 0.1 ms bin), the longest frame, spikes and
+    // frames over 50 ms as defined at CountFrame. Frames under a later loading screen,
+    // or in the kClearUs after one, are not gameplay and not counted.
+    static void ReportGameplay(bool final)
+    {
+        auto& f = frameTimes;
+        const int64_t now = pipelinekeys::ClockUs(), start = f.startUs.load();
+        const uint32_t n = f.n.load();
+        const uint64_t sum = f.sumUs.load();
+        Log("gameplay frames%s t=%.3f play=%.1fs: frames %u, avg %.1f fps, p50 %.2f ms, p95 %.2f ms, p99 %.2f ms, "
+            "max %.1f ms, spikes %u, >50 ms %u", final ? " final" : "", pipelinekeys::VulkanReplay().Seconds(now),
+            start ? (now - start) / 1e6 : 0.0, n, sum ? n * 1e6 / (double)sum : 0.0, f.PercentileMs(50),
+            f.PercentileMs(95), f.PercentileMs(99), f.maxUs.load() / 1000.0, f.spikes.load(), f.over50.load());
+        Log(final ? "created by DXVK in gameplay: %s" : "created by DXVK in gameplay so far: %s",
+            gameplayTimes.Describe().c_str());
+    }
+
+    // Runs as long as the device: the 15 s gameplay reports. The final one comes from
+    // the shutdown event (ReportFinal), since DXVK rarely destroys its device.
+    static inline std::atomic<bool> loadingReported{ false };
+
+    // cpu: also what DXVK's threads have used by then (CompilerCpuUs); not at exit,
+    // when they are gone.
+    static void ReportLoading(bool cpu)
+    {
+        if (loadingReported.exchange(true)) return;
+        Log("created by DXVK before gameplay: %s", loadingTimes.Describe().c_str());
+        if (!cpu) return;
+        uint32_t threads = 0;
+        uint64_t cs = 0;
+        const uint64_t us = CompilerCpuUs(&threads, &cs);
+        Log("CPU used by DXVK before gameplay: %.2fs by its %u compiler threads, %.2fs by its CS thread", us / 1e6,
+            threads, cs / 1e6);
+    }
+
+    static void ReportMetrics(Device* d)
+    {
+        constexpr int64_t kEveryUs = 15000000;
+        int64_t next = 0;
         while (!d->stop)
         {
-            for (int i = 0; i < 30 && !d->stop; i++) Sleep(500);
-            const uint32_t n = gameplayTimes.n.load();
-            if (n == logged) continue;
-            if (!loadingLogged)
+            Sleep(250);
+            const int64_t start = frameTimes.startUs.load();
+            if (!start) continue;
+            if (!next)
             {
-                loadingLogged = true;
-                Log("created by DXVK before gameplay: %s", loadingTimes.Describe().c_str());
+                next = start + kEveryUs;
+                ReportLoading(true);
             }
-            logged = n;
-            Log("created by DXVK in gameplay so far: %s", gameplayTimes.Describe().c_str());
+            const int64_t now = pipelinekeys::ClockUs();
+            if (now < next) continue;
+            while (next <= now) next += kEveryUs;
+            ReportGameplay(false);
         }
-        if (gameplayTimes.n.load() != logged)
-            Log("created by DXVK in gameplay: %s", gameplayTimes.Describe().c_str());
+    }
+
+    // At exit, from the shutdown event, if DXVK's device was ever watched.
+    static inline std::atomic<bool> metricsOn{ false };
+
+    static void ReportFinal()
+    {
+        if (!metricsOn) return;
+        ReportLoading(false);
+        ReportGameplay(true);
     }
 
     // ---- device-level wrappers (Fossilize layer/dispatch.cpp, normal mode) ----
@@ -456,8 +764,12 @@ class VkCapture
         const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* alloc, VkPipeline* out)
     {
         Device* d = Get(device);
-        const auto t0 = std::chrono::steady_clock::now();
-        VkResult res = d->CreateGraphicsPipelines(device, cache, count, infos, alloc, out);
+        const int64_t t0 = pipelinekeys::ClockUs();
+        VkResult res;
+        {
+            InFlight busy;
+            res = d->CreateGraphicsPipelines(device, cache, count, infos, alloc, out);
+        }
         if (count) TimeCreate(t0, PipelineFlags(infos[0].pNext, infos[0].flags), infos[0].pNext);
         // Recorded only on success: a VK_PIPELINE_COMPILE_REQUIRED probe creates
         // nothing, and DXVK records the pipeline when it then compiles it for real.
@@ -479,8 +791,12 @@ class VkCapture
         const VkComputePipelineCreateInfo* infos, const VkAllocationCallbacks* alloc, VkPipeline* out)
     {
         Device* d = Get(device);
-        const auto t0 = std::chrono::steady_clock::now();
-        VkResult res = d->CreateComputePipelines(device, cache, count, infos, alloc, out);
+        const int64_t t0 = pipelinekeys::ClockUs();
+        VkResult res;
+        {
+            InFlight busy;
+            res = d->CreateComputePipelines(device, cache, count, infos, alloc, out);
+        }
         if (count) TimeCreate(t0, PipelineFlags(infos[0].pNext, infos[0].flags), infos[0].pNext);
         if (res != VK_SUCCESS) return res;
         for (uint32_t i = 0; i < count; i++)
@@ -501,7 +817,11 @@ class VkCapture
     {
         Device* d = Get(device);
         *out = VK_NULL_HANDLE;
-        VkResult res = d->CreateShaderModule(device, info, alloc, out);
+        VkResult res;
+        {
+            InFlight busy;
+            res = d->CreateShaderModule(device, info, alloc, out);
+        }
         if (res != VK_SUCCESS) return res;
         if (replayEnabled) Learn(CollectModule(*info), false);
         if (!d->recorder) return res;
@@ -597,6 +917,12 @@ class VkCapture
         return res;
     }
 
+    static VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info)
+    {
+        CountFrame();
+        return realQueuePresent(queue, info);
+    }
+
     // Flush and stop the recorder before the device goes; then forget the device.
     //
     // DXVK usually does NOT destroy its device when GTA IV quits -- the process just
@@ -613,9 +939,11 @@ class VkCapture
             if (it != devices.end()) { d = std::move(it->second); devices.erase(it); }
         }
         if (!d) return;
+        pipelinekeys::VulkanReplay().watching = false;
         // The replay creates objects on this device: it must be finished first.
         d->stop = true;
         if (d->replay.joinable()) d->replay.join();
+        if (d->metrics.joinable()) d->metrics.join();
         if (d->recorder)
         {
             d->recorder->tear_down_recording_thread();
@@ -1026,16 +1354,147 @@ class VkCapture
             sum.Stale().c_str());
     }
 
+    // ---- sharing between PCs (plugins\pipelinecache\) -------------------------
+
+    static std::string PipelineCacheDir() { return PluginsDir() + "pipelinecache\\"; }
+
+    // 64-bit FNV-1a over every byte of a file: the <h> in its shared name, and what
+    // tells two inputs apart. False if it cannot be read to the end.
+    static bool HashFile(const std::string& path, uint64_t& out)
+    {
+        HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (f == INVALID_HANDLE_VALUE) return false;
+        std::vector<uint8_t> buf(1u << 20);
+        uint64_t h = 0xcbf29ce484222325ull;
+        DWORD n = 0;
+        BOOL ok;
+        while ((ok = ReadFile(f, buf.data(), (DWORD)buf.size(), &n, nullptr)) && n)
+            for (DWORD i = 0; i < n; i++) { h ^= buf[i]; h *= 0x100000001b3ull; }
+        CloseHandle(f);
+        if (ok) out = h;
+        return ok != FALSE;
+    }
+
+    // The content hash of this PC's recording as the launch found it, before this
+    // session appended anything: the name of its copy in plugins\pipelinecache\, and
+    // how the replay knows that copy when it meets it there.
+    static inline uint64_t ownHash = 0;
+    static inline bool haveOwnHash = false;
+
+    // "FusionFix.<16 lowercase hex digits>.foz": the only names ShareOwnRecording ever
+    // deletes, and only those its state file lists.
+    static bool IsSharedName(const std::string& n)
+    {
+        if (n.size() != 30 || n.compare(0, 10, "FusionFix.") != 0 || n.compare(26, 4, ".foz") != 0) return false;
+        for (size_t i = 10; i < 26; i++)
+            if (!((n[i] >= '0' && n[i] <= '9') || (n[i] >= 'a' && n[i] <= 'f'))) return false;
+        return true;
+    }
+
+    // Once per launch, before the recorder opens the file for appending: copy this
+    // PC's recording to plugins\pipelinecache\FusionFix.<h>.foz, through a temporary
+    // name, unless that name is there already. Once it is in place, delete the copies
+    // earlier launches wrote -- the names FusionFix.pipelinecache.state lists, nothing
+    // else -- and remember the new one.
+    static void ShareOwnRecording(const std::string& own)
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        if (!GetFileAttributesExA(own.c_str(), GetFileExInfoStandard, &fa) || (!fa.nFileSizeHigh && !fa.nFileSizeLow))
+            return;   // nothing recorded yet
+        if (!HashFile(own, ownHash)) { Log("share: cannot read %s", own.c_str()); return; }
+        haveOwnHash = true;
+
+        const std::string dir = PipelineCacheDir(), state = PluginsDir() + "FusionFix.pipelinecache.state";
+        char name[32];
+        snprintf(name, sizeof(name), "FusionFix.%016llx.foz", (unsigned long long)ownHash);
+        const std::string target = dir + name;
+
+        std::vector<std::string> wrote;
+        std::string before;
+        if (FILE* f = fopen(state.c_str(), "r"))
+        {
+            char line[MAX_PATH];
+            while (fgets(line, sizeof(line), f))
+            {
+                std::string s(line);
+                while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
+                if (IsSharedName(s)) { wrote.push_back(s); before += s + "\n"; }
+            }
+            fclose(f);
+        }
+        bool ours = std::find(wrote.begin(), wrote.end(), name) != wrote.end();
+        if (GetFileAttributesA(target.c_str()) != INVALID_FILE_ATTRIBUTES)
+            Log(ours ? "share: %s%s is there since an earlier launch - the recording has not changed"
+                     : "share: %s%s is there already - the same content, not written by this PC", dir.c_str(), name);
+        else
+        {
+            CreateDirectoryA(dir.c_str(), nullptr);
+            const std::string tmp = target + ".tmp";
+            if (!CopyFileA(own.c_str(), tmp.c_str(), FALSE) || !MoveFileExA(tmp.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH))
+            {
+                Log("share: could not write %s%s (error %lu) - the earlier copies stay", dir.c_str(), name, GetLastError());
+                DeleteFileA(tmp.c_str());
+                return;
+            }
+            ours = true;
+            Log("share: wrote %s%s (%llu KB) - copy that folder's files to plugins\\pipelinecache\\ on your other PCs",
+                dir.c_str(), name, ((uint64_t)fa.nFileSizeHigh << 32 | fa.nFileSizeLow) >> 10);
+        }
+
+        std::string after;
+        for (auto& n : wrote)
+        {
+            if (n == name) continue;
+            if (DeleteFileA((dir + n).c_str()))
+                Log("share: deleted %s, the copy an earlier launch wrote", n.c_str());
+            else if (GetLastError() != ERROR_FILE_NOT_FOUND)
+                after += n + "\n";   // try again next launch
+        }
+        if (ours) after += std::string(name) + "\n";
+        if (after == before) return;
+        if (after.empty()) { DeleteFileA(state.c_str()); return; }
+        const std::string tmp = state + ".tmp";
+        FILE* f = fopen(tmp.c_str(), "w");
+        if (f && fputs(after.c_str(), f) >= 0 && fclose(f) == 0 && MoveFileExA(tmp.c_str(), state.c_str(), MOVEFILE_REPLACE_EXISTING))
+            return;
+        Log("share: could not update %s", state.c_str());
+    }
+
     // Other PCs' recordings, and this player's own Steam pre-cache buckets.
+    //
+    // plugins\pipelinecache\ is read flat: the .foz files at its top level, whatever
+    // their names. A folder inside it is not read, and a D3D9 cache file (.bin) in it
+    // is not loaded; either gets one line in the log saying where files go. Sorted,
+    // so each launch goes through them in the same order. A file that cannot be read
+    // is skipped with a line in the log (ReplayFile).
     static std::vector<std::string> ForeignInputs()
     {
         namespace fs = std::filesystem;
         std::vector<std::string> out;
         std::error_code ec;
-        const std::string imports = pipelinekeys::ImportDir();
-        if (!imports.empty())
-            for (auto& e : fs::directory_iterator(imports, ec))
-                if (e.is_regular_file(ec) && e.path().extension() == ".foz") out.push_back(e.path().string());
+        uint32_t folders = 0, bins = 0, unnamed = 0;
+        for (fs::directory_iterator it(fs::path(PipelineCacheDir()), ec), end; !ec && it != end; it.increment(ec))
+        {
+            std::error_code fec;
+            if (it->is_directory(fec)) { folders++; continue; }
+            if (!it->is_regular_file(fec)) continue;
+            std::wstring ext = it->path().extension().wstring();
+            for (auto& c : ext) c = towlower(c);
+            if (ext == L".bin") bins++;
+            if (ext != L".foz") continue;
+            try { out.push_back(it->path().string()); }
+            catch (const std::exception&) { unnamed++; }   // a name the ANSI code page cannot hold
+        }
+        if (folders)
+            Log("replay: %u folder(s) in plugins\\pipelinecache\\ not read - put .foz files directly in "
+                "plugins\\pipelinecache\\, not in folders inside it", folders);
+        if (bins)
+            Log("replay: %u .bin file(s) in plugins\\pipelinecache\\ not loaded - that folder is for Vulkan .foz files, "
+                "D3D9 cache files (.bin) go in plugins\\d3d9cache\\", bins);
+        if (unnamed)
+            Log("replay: %u .foz file(s) in plugins\\pipelinecache\\ not read - rename them to plain ASCII names", unnamed);
+        std::sort(out.begin(), out.end());
 
         // <library>\steamapps\common\Grand Theft Auto IV\GTAIV\GTAIV.exe ->
         // <library>\steamapps\shadercache\<appid>\fozpipelinesv6\steamapprun_pipeline_cache.<bucket>\*.foz
@@ -1059,6 +1518,25 @@ class VkCapture
                         out.push_back(f.path().string());
                 }
             }
+        return out;
+    }
+
+    // Each input once per content (HashFile): this PC's own copy in
+    // plugins\pipelinecache\ is the recording the replay goes through first anyway,
+    // and one file dropped in under two names is one file.
+    static std::vector<std::string> Distinct(const std::vector<std::string>& inputs)
+    {
+        std::unordered_map<uint64_t, std::string> seen;
+        if (haveOwnHash) seen.emplace(ownHash, "this PC's own recording");
+        std::vector<std::string> out;
+        for (auto& p : inputs)
+        {
+            uint64_t h = 0;
+            if (!HashFile(p, h)) { out.push_back(p); continue; }   // ReplayFile says it cannot be read
+            auto [it, fresh] = seen.emplace(h, p);
+            if (fresh) out.push_back(p);
+            else Log("replay: %s skipped - the same content as %s", p.c_str(), it->second.c_str());
+        }
         return out;
     }
 
@@ -1136,7 +1614,6 @@ class VkCapture
     {
         ReplayAll(dev, d);
         pipelinekeys::VulkanReplay().running = false;
-        ReportCreateTimes(d);
     }
 
     static void ReplayAll(VkDevice dev, Device* d)
@@ -1146,42 +1623,77 @@ class VkCapture
         Fossilize::set_thread_log_callback(&FossilizeLog, nullptr);
         onReplayThread = true;
         AddVectoredExceptionHandler(1, &ReplayFaultHandler);
-        const auto t0 = std::chrono::steady_clock::now();
         auto since = [](std::chrono::steady_clock::time_point a) {
             return std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
         };
         std::unordered_set<Fossilize::Hash> done;
         Totals t;
-        Log("replay: starting, %llu MB of address space free", (unsigned long long)(AvailableVA() >> 20));
 
-        // Everything this launch will go through, counted up front for the bar.
+        // Everything this launch will go through, counted for the bar while the game is
+        // still loading.
         const std::string own = PluginsDir() + "FusionFix.vkpipelines.foz";
         const bool haveOwn = GetFileAttributesA(own.c_str()) != INVALID_FILE_ATTRIBUTES;
-        const auto inputs = ForeignInputs();
-        const bool foreign = !inputs.empty() && replayForeign && d->haveFilter;
+        const auto found = ForeignInputs();
+        const bool foreign = !found.empty() && replayForeign && d->haveFilter;
+        const auto inputs = foreign ? Distinct(found) : found;
+        const uint32_t ownEntries = haveOwn ? CountPipelines(own) : 0;
         uint32_t foreignEntries = 0;
-        if (haveOwn) vr.total += CountPipelines(own);
         if (foreign)
             for (auto& p : inputs) foreignEntries += CountPipelines(p);
-        vr.total += foreignEntries;
-
-        const uint32_t hw = (std::max)(1u, std::thread::hardware_concurrency());
-        if (haveOwn)
-            ReplayParallel(own, dev, d, true, (std::max)(1u, (std::min)(4u, hw / 4)), done, t);
-
-        if (!inputs.empty() && !replayForeign)
+        vr.total = ownEntries + foreignEntries;
+        if (!found.empty() && !replayForeign)
             Log("replay: %zu foreign database(s) found (other PCs / Steam pre-cache) - not replayed, "
-                "see ReplayVulkanPipelinesForeign", inputs.size());
-        else if (!inputs.empty() && !d->haveFilter)
-            Log("replay: %zu foreign database(s) skipped - no feature filter for this device", inputs.size());
-        else if (foreign)
+                "see ReplayVulkanPipelinesForeign", found.size());
+        else if (!found.empty() && !d->haveFilter)
+            Log("replay: %zu foreign database(s) skipped - no feature filter for this device", found.size());
+        if (!ownEntries && !foreign)
         {
+            Log("replay: nothing to replay");
+            return;
+        }
+
+        // Nothing is created before the loading-screen pass and everything DXVK
+        // compiled for it are done (VulkanReplayState): the D3D9 pass comes first, and
+        // then the loading screen is held for this. If the pass never comes, this
+        // goes on in the background after 10 minutes.
+        const auto w0 = std::chrono::steady_clock::now();
+        if (vr.passPlanned)
+        {
+            Log("replay: %u pipeline entries ready (%u own, %u in %zu other file(s)) - waiting for the loading-screen pass",
+                vr.total.load(), ownEntries, foreignEntries, foreign ? inputs.size() : (size_t)0);
+            while (!d->stop && !vr.passDone && since(w0) < 600.0) Sleep(20);
+        }
+        if (d->stop) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        Log("replay: starting t=%.3f %s, %llu MB of address space free", vr.Seconds(),
+            vr.holding ? "with the loading screen held" :
+            !vr.passPlanned ? "in the background (PrecompileShaders = 0)" :
+            vr.passDone ? "in the background (the loading screen was not held)" :
+                          "in the background (no loading-screen pass after 600s)",
+            (unsigned long long)(AvailableVA() >> 20));
+
+        // While the loading screen is held: most of the cores. Otherwise a few
+        // lowest-priority threads for the own recording and one for the rest, out of
+        // the game's way.
+        const uint32_t hw = (std::max)(1u, std::thread::hardware_concurrency());
+        auto parts = [&](bool isOwn) {
+            return vr.holding ? (std::max)(1u, (std::min)(6u, hw / 2)) : isOwn ? (std::max)(1u, (std::min)(4u, hw / 4)) : 1u;
+        };
+        if (ownEntries)
+        {
+            vr.phase = pipelinekeys::VulkanReplayState::kOwn;
+            Log("replay: 1. this PC's own recording, t=%.3f", vr.Seconds());
+            ReplayParallel(own, dev, d, true, parts(true), done, t);
+        }
+
+        if (foreign)
+        {
+            vr.phase = pipelinekeys::VulkanReplayState::kForeign;
+            Log("replay: 2. other PCs' files and the Steam pre-cache (%zu file(s)), t=%.3f", inputs.size(), vr.Seconds());
             // Foreign entries are judged by what DXVK uses here, so let it show as much
             // of that as it will first: the loading-screen pass creates every pipeline
             // the game has been seen to use. Without that pass (PrecompileShaders = 0),
-            // or if it never comes, the game's own first pipelines have to do.
-            const auto w0 = std::chrono::steady_clock::now();
-            while (!d->stop && vr.passPlanned && !vr.passDone && since(w0) < 600.0) Sleep(100);
+            // or if it never came, the game's own first pipelines have to do.
             if (!vr.passDone)
                 for (int i = 0; i < 240 && !d->stop && learned.pipelines < 64; i++) Sleep(500);
             if (learned.pipelines < 64)
@@ -1198,11 +1710,9 @@ class VkCapture
                 for (auto& p : inputs)
                 {
                     if (d->stop || t.lowVA || ft.lowVA) break;
-                    // While the loading screen is held for it: most of the cores. Otherwise
-                    // one background thread, out of the game's way.
-                    const uint32_t parts = vr.holding ? (std::max)(1u, (std::min)(6u, hw / 2)) : 1u;
-                    mostParts = (std::max)(mostParts, parts);
-                    ReplayParallel(p, dev, d, false, parts, done, ft);
+                    const uint32_t n = parts(false);
+                    mostParts = (std::max)(mostParts, n);
+                    ReplayParallel(p, dev, d, false, n, done, ft);
                 }
                 t.Add(ft);
                 Log("replay: foreign, %u files in %.1fs on up to %u threads (%u DXVK pipelines learned first): %s",
@@ -1210,7 +1720,8 @@ class VkCapture
             }
         }
 
-        Log("replay: done in %.1fs - %u files: %s%s", since(t0), t.files, t.Outcome().c_str(), t.Stale().c_str());
+        Log("replay: done t=%.3f in %.1fs - %u files: %s%s", vr.Seconds(), since(t0), t.files, t.Outcome().c_str(),
+            t.Stale().c_str());
     }
 
     // ---- loader-level wrappers --------------------------------------------
@@ -1230,6 +1741,7 @@ class VkCapture
             { "vkCreateRenderPass2",         reinterpret_cast<PFN_vkVoidFunction>(&CreateRenderPass2) },
             { "vkCreateRenderPass2KHR",      reinterpret_cast<PFN_vkVoidFunction>(&CreateRenderPass2KHR) },
             { "vkDestroyDevice",             reinterpret_cast<PFN_vkVoidFunction>(&DestroyDevice) },
+            { "vkQueuePresentKHR",           realQueuePresent ? reinterpret_cast<PFN_vkVoidFunction>(&QueuePresentKHR) : real },
         };
         for (auto& w : wrap)
             if (strcmp(w.name, name) == 0) return w.fn;
@@ -1350,6 +1862,12 @@ class VkCapture
                 return res;
             }
         }
+        // DXVK's device only: the wrappers are always on, for the metrics.
+        if (haveAppInfo && engineName != "DXVK")
+        {
+            Log("device %p (engine \"%s\") left alone: not DXVK's", (void*)*out, engineName.c_str());
+            return res;
+        }
 
         auto d = std::make_unique<Device>();
         VkDevice dev = *out;
@@ -1370,6 +1888,7 @@ class VkCapture
         d->DestroyDescriptorSetLayout = reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(load("vkDestroyDescriptorSetLayout"));
         d->DestroyPipelineLayout     = reinterpret_cast<PFN_vkDestroyPipelineLayout>(load("vkDestroyPipelineLayout"));
         d->DestroyRenderPass         = reinterpret_cast<PFN_vkDestroyRenderPass>(load("vkDestroyRenderPass"));
+        realQueuePresent             = reinterpret_cast<PFN_vkQueuePresentKHR>(load("vkQueuePresentKHR"));
 
         auto* ident = static_cast<const VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT*>(
             FindPNext(info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT));
@@ -1398,6 +1917,10 @@ class VkCapture
             Fossilize::Hashing::compute_application_feature_hash(haveAppInfo ? &appInfo : nullptr, devicePNext));
 
         d->path = PluginsDir() + "FusionFix.vkpipelines.foz";
+        // Before this session appends anything (see SHARING BETWEEN PCs at the top).
+        static std::atomic<bool> shared{ false };
+        if ((enabled || replayEnabled) && !shared.exchange(true))
+            ShareOwnRecording(d->path);
         if (enabled)
         {
             d->db.reset(Fossilize::create_stream_archive_database(d->path.c_str(), Fossilize::DatabaseMode::Append));
@@ -1427,10 +1950,15 @@ class VkCapture
             std::unique_lock lock(devLock);
             devices[dev] = std::move(d);
         }
+        auto& vr = pipelinekeys::VulkanReplay();
+        vr.compilerCpuUs = &CompilerCpuUs;
+        vr.watching = true;
+        metricsOn = true;
+        raw->metrics = std::thread(&ReportMetrics, raw);
         if (replayEnabled)
         {
             // Before the thread starts, so the loading screen can never miss it.
-            pipelinekeys::VulkanReplay().running = true;
+            vr.running = true;
             raw->replay = std::thread(&ReplayThread, dev, raw);
         }
         return res;
@@ -1500,12 +2028,18 @@ public:
         replayEnabled = ini.ReadInteger("SHADERS", "ReplayVulkanPipelines", 1) != 0;
         replayTrace   = ini.ReadInteger("SHADERS", "ReplayVulkanPipelinesTrace", 0) != 0;
         replayForeign = ini.ReadInteger("SHADERS", "ReplayVulkanPipelinesForeign", 1) != 0;
-        if (!enabled && !replayEnabled) return;
 
+        // The session clock every "t=" in the log counts from.
+        const SYSTEMTIME& t = pipelinekeys::VulkanReplay().epochLocal;
+        Log("session clock: t=0 is %04u-%02u-%02u %02u:%02u:%02u.%03u local time", t.wYear, t.wMonth, t.wDay, t.wHour,
+            t.wMinute, t.wSecond, t.wMilliseconds);
+
+        // Hooked whatever the settings: the gameplay metrics need DXVK's device too.
         // DXVK prefers winevulkan.dll and only falls back to vulkan-1.dll; under Wine,
         // vulkan-1.dll forwards to winevulkan.dll. Hook exactly the one DXVK uses.
         bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
         static const wchar_t* lib = wine ? L"winevulkan.dll" : L"vulkan-1.dll";
         CallbackHandler::RegisterCallback(lib, [] { InstallHook(lib); });
+        FusionFix::onShutdownEvent() += [] { ReportFinal(); };
     }
 } VkCapture;
