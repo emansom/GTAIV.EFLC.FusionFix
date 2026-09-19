@@ -93,6 +93,15 @@ workspace "GTAIV.EFLC.FusionFix"
    files { "source/gxt/src/**.h", "source/gxt/src/**.cpp" }
    files { "data/plugins/*.ini" }
 
+   -- Fossilize (Valve, MIT): records the Vulkan pipelines DXVK creates, in-process (vkcapture.ixx).
+   -- Only the recorder/database core; the CLI tools and the Vulkan layer are not built.
+   -- cli/dirent/include holds only dirent.h, which MSVC lacks (Fossilize's own CMake adds it the same way).
+   includedirs { "external/Fossilize", "external/Fossilize/khronos", "external/Fossilize/rapidjson/include",
+                 "external/Fossilize/miniz", "external/Fossilize/cli/dirent/include" }
+   files { "external/Fossilize/fossilize.cpp", "external/Fossilize/fossilize_db.cpp",
+           "external/Fossilize/fossilize_application_filter.cpp", "external/Fossilize/varint.cpp",
+           "external/Fossilize/path.cpp", "external/Fossilize/miniz/miniz.c" }
+
    os.mkdir("shaders/external/gamma/asm")
    os.mkdir("source/resources/shaders/win32_30")
 
