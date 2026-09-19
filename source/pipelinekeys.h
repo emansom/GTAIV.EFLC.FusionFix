@@ -19,17 +19,12 @@
 
 namespace pipelinekeys
 {
-    constexpr uint32_t kMagic   = 0x4B504646;   // 'FFPK'
-
-    // The on-disk format carries a version purely so a stale or foreign file is
-    // REJECTED rather than misread -- there is deliberately no migration path. This
-    // feature is not upstream yet, so no user has a cache worth preserving, and
-    // carrying readers for formats nobody has costs more than re-capturing does.
-    // Bump this on any layout change; add migration only once upstream ships a
-    // release whose caches must survive.
-    constexpr uint32_t kVersion = 2;
-
     constexpr uint32_t kMaxRT       = 4;
+
+    // Vertex streams whose instancing is recorded. GTA IV's declarations only ever
+    // use streams 0 and 1 (every capture so far: 29 declarations, max stream 1), and
+    // the replay binds 0..3, so 4 covers the game with room to spare.
+    constexpr uint32_t kMaxStreams  = 4;
     constexpr uint32_t kPSSamplers  = 16;       // s0..s15
     constexpr uint32_t kVSSamplers  = 4;        // D3DVERTEXTEXTURESAMPLER0..3
     constexpr uint32_t kNumSamplers = kPSSamplers + kVSSamplers;
@@ -127,11 +122,27 @@ namespace pipelinekeys
         uint32_t msQuality;                 // multisample quality level (v2+)
         uint32_t rs[kNumRS];                // values of kTrackedRS, in order
         uint8_t  samplerType[kNumSamplers]; // SamplerKind per sampler
+        uint32_t streamFreq[kMaxStreams];   // InstanceFreq() per stream the declaration uses (v2+)
         uint32_t count;                     // how many draws hit this key
         uint32_t firstFrame;                // frame ordinal of first sighting
     };
 
 #pragma pack(pop)
+
+    // The part of SetStreamSourceFreq that selects a Vulkan pipeline.
+    //
+    // DXVK turns each stream the declaration uses into a vertex binding whose input
+    // rate and divisor come from this setting (d3d9_device.cpp, BindInputLayout):
+    // INSTANCEDATA makes it a per-instance binding with divisor = the low 23 bits;
+    // anything else is per-vertex. The instance COUNT (INDEXEDDATA | n on stream 0)
+    // only reaches the draw call, not the pipeline, so recording it would split one
+    // pipeline into a key per batch size. Keep exactly what DXVK keeps.
+    inline uint32_t InstanceFreq(UINT setting)
+    {
+        return (setting & D3DSTREAMSOURCE_INSTANCEDATA)
+            ? (D3DSTREAMSOURCE_INSTANCEDATA | (setting & 0x7FFFFFu))
+            : 0u;
+    }
 
     // Everything that identifies a key, excluding the bookkeeping tail.
     constexpr size_t kKeyHashBytes = offsetof(KeyRecord, count);
@@ -308,7 +319,18 @@ namespace pipelinekeys
     //  can still depend on the Vulkan implementation. So record what was actually
     //  resolved and let the merge tool bucket on it, rather than assuming convergence.
     constexpr uint32_t kCacheMagic   = 0x43504646;   // 'FFPC'
-    constexpr uint32_t kCacheVersion = 1;
+
+    // The version exists purely so a stale or foreign file is REJECTED rather than
+    // misread -- there is deliberately no migration path in the ASI. This feature is
+    // not upstream yet, so no user has a cache worth preserving, and carrying readers
+    // for formats nobody has costs more than re-capturing does. Bump this on any
+    // layout change; add migration only once upstream ships a release whose caches
+    // must survive. (A rejected file is moved aside, never overwritten: see the
+    // capture's LoadExisting.)
+    //
+    //   v1  first single-file container
+    //   v2  KeyRecord::streamFreq -- instanced streams are a different pipeline
+    constexpr uint32_t kCacheVersion = 2;
 
     enum CacheSectionId : uint32_t
     {

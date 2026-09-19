@@ -110,6 +110,10 @@ struct PrecompileConfig
     // Set a positive value only if you specifically want loading bounded.
     int     budgetSeconds = 0;      // PrecompileBudgetSeconds: 0 = run until everything is warm
     int     fenceChunk    = 1;      // PrecompileFenceChunk: pipelines per fence; 1 = smoothest bar
+    // Replay the spec-constant variants after the base pipelines (see ReplayBaseKey).
+    // They warm DXVK's background-optimized pipelines on drivers that fast-link;
+    // where a driver cannot, only the base pipelines are ever synchronous.
+    bool    specVariants  = true;   // PrecompileSpecVariants
     // Authoring-only: dump the deduplicated pipeline set so it can be SHIPPED as a
     // baseline. Off for players -- it costs a file write and they have nothing to
     // contribute that their own capture does not already hold.
@@ -436,7 +440,7 @@ class ShaderPrecompiler
         void* tex[pipelinekeys::kNumSamplers]{};
         void* vs{}; void* ps{}; void* decl{}; void* ib{};
         DWORD fvf{};
-        struct { void* vb; UINT offset, stride; } stream[4]{};
+        struct { void* vb; UINT offset, stride, freq; } stream[4]{};
         void* rt[4]{}; void* ds{};
         D3DVIEWPORT9 vp{};
         RECT scissor{};
@@ -475,6 +479,9 @@ class ShaderPrecompiler
             IDirect3DVertexBuffer9* vb = nullptr;
             dev->GetStreamSource(i, &vb, &s.stream[i].offset, &s.stream[i].stride);
             s.stream[i].vb = GrabPtr(vb);
+            // The replay sets instancing now; a leaked INSTANCEDATA would make the
+            // game's next draws fetch per-instance and render garbage.
+            dev->GetStreamSourceFreq(i, &s.stream[i].freq);
         }
         for (UINT i = 0; i < 4; i++)
         {
@@ -528,6 +535,13 @@ class ShaderPrecompiler
                 _snprintf_s(b, sizeof(b), _TRUNCATE, "stream source %u", i);
                 note(b);
             }
+            else if (before.stream[i].freq != after.stream[i].freq)
+            {
+                char b[96];
+                _snprintf_s(b, sizeof(b), _TRUNCATE, "stream %u frequency: 0x%08x -> 0x%08x",
+                            i, before.stream[i].freq, after.stream[i].freq);
+                note(b);
+            }
         for (UINT i = 0; i < 4; i++)
             if (before.rt[i] != after.rt[i])
             {
@@ -541,7 +555,7 @@ class ShaderPrecompiler
 
         if (diffs == 0)
             Log("state verified: device handed back byte-identical across %u render states, "
-                "%u samplers, shaders, streams and targets",
+                "%u samplers, shaders, streams (incl. frequency) and targets",
                 pipelinekeys::kNumRS, pipelinekeys::kNumSamplers);
         else
             Log("state NOT restored: %d differences (listed above) - THIS is the black-sky bug", diffs);
@@ -1236,6 +1250,7 @@ class ShaderPrecompiler
     // -------------------------------------------------------------------
 
     static inline std::vector<pipelinekeys::KeyRecord> replayRecs;
+    static inline uint32_t replayBaseCount = 0;   // leading drawList entries that are base identities
     static inline std::vector<std::vector<D3DVERTEXELEMENT9>> replayDecls;
     static inline std::vector<IDirect3DVertexDeclaration9*> replayDeclObjs;
     static inline std::unordered_map<uint64_t, IDirect3DVertexShader9*> vsByHash;
@@ -1260,38 +1275,104 @@ class ShaderPrecompiler
     static inline const int kRS_AlphaTestEnable = RSIndexOf(D3DRS_ALPHATESTENABLE);
     static inline const int kRS_AlphaFunc       = RSIndexOf(D3DRS_ALPHAFUNC);
     static inline const int kRS_FogEnable       = RSIndexOf(D3DRS_FOGENABLE);
+    static inline const int kRS_ClipPlanes      = RSIndexOf(D3DRS_CLIPPLANEENABLE);
+    static inline const int kRS_BlendEnable     = RSIndexOf(D3DRS_ALPHABLENDENABLE);
+    static inline const int kRS_SeparateAlpha   = RSIndexOf(D3DRS_SEPARATEALPHABLENDENABLE);
+    static inline const int kRS_ColorBlend[3]   = { RSIndexOf(D3DRS_SRCBLEND), RSIndexOf(D3DRS_DESTBLEND),
+                                                    RSIndexOf(D3DRS_BLENDOP) };
+    static inline const int kRS_AlphaBlend[3]   = { RSIndexOf(D3DRS_SRCBLENDALPHA), RSIndexOf(D3DRS_DESTBLENDALPHA),
+                                                    RSIndexOf(D3DRS_BLENDOPALPHA) };
+    static inline const int kRS_WriteMask[4]    = { RSIndexOf(D3DRS_COLORWRITEENABLE), RSIndexOf(D3DRS_COLORWRITEENABLE1),
+                                                    RSIndexOf(D3DRS_COLORWRITEENABLE2), RSIndexOf(D3DRS_COLORWRITEENABLE3) };
 
-    // The fields that actually select a distinct pipeline object.
+    static uint32_t RSOr0(const pipelinekeys::KeyRecord& k, int idx) { return idx >= 0 ? k.rs[idx] : 0u; }
+
+    // Replay identity comes in two tiers, because DXVK compiles in two tiers.
+    //
+    // TIER 1, the BASE pipeline: shaders, vertex input and fragment output. This is
+    // what DXVK links from separately built libraries on a GPL driver, and what it
+    // compiles from scratch, synchronously, on the draw that first needs it when the
+    // driver cannot fast-link (dxvk_graphics.cpp, getPipelineHandle ->
+    // createBasePipeline). AMD's Windows compiler is suspected to be in that second
+    // group for every D3D9 pixel shader (zero-stutter-research.md, finding A), so on
+    // that driver each base identity the replay misses is a stall in gameplay.
+    //
+    // The previous key was oriented the other way round. It dropped blend state and
+    // write masks as "dynamic" -- they are not, they are the fragment-output library
+    // -- and it never saw instancing at all. Measured offline against the raw
+    // captures, that missed 16 base identities on the Windows capture and 32 on the
+    // Linux one, plus every instanced draw.
+    //
+    // Blend is normalised the way D3D9 semantics allow: factors only matter while
+    // blending is on and something is written, alpha factors only with separate
+    // alpha. DXVK normalises further (write masks against the format, pass-through
+    // blending); that is left to DXVK, which gets the full recorded state at replay.
+    // Keying finer than DXVK costs a duplicate draw it resolves for free; keying
+    // coarser costs a compile in gameplay.
+    static uint64_t ReplayBaseKey(const pipelinekeys::KeyRecord& k)
+    {
+        struct Base
+        {
+            uint64_t vs, ps;
+            uint32_t decl, fvf, prim;
+            uint32_t streamFreq[pipelinekeys::kMaxStreams];
+            uint32_t rt[pipelinekeys::kMaxRT], ds, ms, msq;
+            uint32_t writeMask[pipelinekeys::kMaxRT];
+            uint32_t blendEnable, color[3], alpha[3];
+        } b;
+        memset(&b, 0, sizeof(b));   // hashed as bytes, so padding must be zero too
+
+        b.vs = k.vsHash; b.ps = k.psHash;
+        b.decl = k.declIndex; b.fvf = k.fvf; b.prim = k.primType;
+        for (uint32_t s = 0; s < pipelinekeys::kMaxStreams; s++) b.streamFreq[s] = k.streamFreq[s];
+        for (uint32_t i = 0; i < pipelinekeys::kMaxRT; i++) b.rt[i] = k.rtFmt[i];
+        b.ds = k.dsFmt; b.ms = k.msType; b.msq = k.msQuality;
+
+        bool writes = false;
+        for (uint32_t i = 0; i < pipelinekeys::kMaxRT; i++)
+            if (k.rtFmt[i])
+            {
+                b.writeMask[i] = RSOr0(k, kRS_WriteMask[i]) & 0xFu;
+                writes |= b.writeMask[i] != 0;
+            }
+        if (writes && RSOr0(k, kRS_BlendEnable))
+        {
+            b.blendEnable = 1;
+            const bool separate = RSOr0(k, kRS_SeparateAlpha) != 0;
+            for (int j = 0; j < 3; j++)
+            {
+                b.color[j] = RSOr0(k, kRS_ColorBlend[j]);
+                b.alpha[j] = separate ? RSOr0(k, kRS_AlphaBlend[j]) : b.color[j];
+            }
+        }
+        return pipelinekeys::Fnv1a(&b, sizeof(b));
+    }
+
+    // TIER 2, the full key: the base plus what DXVK turns into spec constants --
+    // alpha test, fog, clip planes, sampler types. On a GPL driver these never cost
+    // a synchronous compile (the base pipeline reads them from a buffer), but each
+    // one is its own optimized pipeline DXVK builds in the background, which is
+    // what replaying them warms.
     //
     // Measured 2026-09-18: replaying 6994 strict keys produced 634 Vulkan
-    // pipelines, and 226 new keys during play produced 29 new pipelines -- our key
-    // was ~10x more granular than the driver's, and that excess was most of the 16s
-    // stall. Everything dropped here is either set dynamically (colour-write masks,
-    // cull mode, depth/stencil ops on any driver with extended dynamic state) or
-    // configures fixed-function stages these shader-based draws never run.
-    //
-    // Deliberately KEPT even though this driver may treat them dynamically: vertex
-    // declaration and topology. They are classic pipeline state, and a driver
-    // without dynamic vertex input -- plausibly the Windows target -- will bake
-    // them. Over-warming there costs a few draws; under-warming costs a stutter.
+    // pipelines -- the strict record is ~10x finer than the driver's identity. What
+    // is dropped here (cull mode, depth/stencil ops, and the rest) is dynamic state
+    // or fixed-function configuration these shader-based draws never run.
     static uint64_t ReplayPipelineKey(const pipelinekeys::KeyRecord& k)
     {
         struct Reduced
         {
-            uint64_t vs, ps;
-            uint32_t decl, fvf, prim;
-            uint32_t rt[pipelinekeys::kMaxRT], ds, ms, msq;
-            uint32_t alphaEnable, alphaFunc, fogEnable;
+            uint64_t base;
+            uint32_t alphaEnable, alphaFunc, fogEnable, clipPlanes;
             uint8_t  samplerType[pipelinekeys::kNumSamplers];
-        } r{};
+        } r;
+        memset(&r, 0, sizeof(r));
 
-        r.vs = k.vsHash; r.ps = k.psHash;
-        r.decl = k.declIndex; r.fvf = k.fvf; r.prim = k.primType;
-        for (uint32_t i = 0; i < pipelinekeys::kMaxRT; i++) r.rt[i] = k.rtFmt[i];
-        r.ds = k.dsFmt; r.ms = k.msType; r.msq = k.msQuality;
-        if (kRS_AlphaTestEnable >= 0) r.alphaEnable = k.rs[kRS_AlphaTestEnable];
-        if (kRS_AlphaFunc >= 0)       r.alphaFunc   = k.rs[kRS_AlphaFunc];
-        if (kRS_FogEnable >= 0)       r.fogEnable   = k.rs[kRS_FogEnable];
+        r.base = ReplayBaseKey(k);
+        r.alphaEnable = RSOr0(k, kRS_AlphaTestEnable);
+        r.alphaFunc   = RSOr0(k, kRS_AlphaFunc);
+        r.fogEnable   = RSOr0(k, kRS_FogEnable);
+        r.clipPlanes  = RSOr0(k, kRS_ClipPlanes) & 0x3Fu;
 
         // Mask pixel-shader sampler slots to the ones the shader declares. Vertex
         // samplers stay unmasked: there are only four and we do not parse VS
@@ -1397,13 +1478,17 @@ class ShaderPrecompiler
         using namespace pipelinekeys;
 
         CacheContents c;
-        if (!ReadCache(path, c)) { Log("replay: no usable %s cache at %s", what, path.c_str()); return false; }
+        if (!ReadCache(path, c))
+        {
+            Log("replay: no usable %s cache at %s (absent, or not format v%u)", what, path.c_str(), kCacheVersion);
+            return false;
+        }
 
         const size_t recsBefore = replayRecs.size();
 
         // A file written by a build tracking a different state set cannot be
         // replayed field-for-field, and guessing would be worse than not trying.
-        // No migration path by design (see kVersion): reject rather than misread.
+        // No migration path by design (see kCacheVersion): reject rather than misread.
         if (c.meta.numRS != kNumRS || c.meta.numSamplers != kNumSamplers ||
             c.rsTypes.size() != kNumRS)
         {
@@ -1893,13 +1978,48 @@ class ShaderPrecompiler
             return replayRecs[a].count > replayRecs[b].count;
         });
 
+        // Then every BASE identity before any spec-constant variant (see
+        // ReplayBaseKey). Where the driver cannot fast-link, the base pipelines are
+        // the whole synchronous cost and the variants only queue background work, so
+        // they go first; within each tier the most-used still lead. The first
+        // (most-used) key of each identity is its representative.
+        {
+            std::unordered_set<uint64_t> seenBase;
+            seenBase.reserve(drawList.size());
+            std::vector<uint32_t> variants;
+            size_t nBase = 0;
+            for (uint32_t r : drawList)
+            {
+                if (seenBase.insert(ReplayBaseKey(replayRecs[r])).second) drawList[nBase++] = r;
+                else variants.push_back(r);
+            }
+            drawList.resize(nBase);
+            replayBaseCount = (uint32_t)nBase;
+            drawList.insert(drawList.end(), variants.begin(), variants.end());
+        }
+        uint32_t instanced = 0;
+        for (uint32_t r : drawList)
+            for (uint32_t s = 0; s < kMaxStreams; s++)
+                if (replayRecs[r].streamFreq[s]) { instanced++; break; }
+
+        // The export keeps both tiers whatever this run replays: it is the input for
+        // other machines, whose drivers may want the variants.
+        if (cfg.exportBaseline) ExportBaseline(drawList);
+
+        if (!cfg.specVariants && drawList.size() > replayBaseCount)
+        {
+            Log("replay: PrecompileSpecVariants = 0 - dropping %zu spec-constant variants",
+                drawList.size() - replayBaseCount);
+            drawList.resize(replayBaseCount);
+        }
+
         // workDone currently holds the create-pass units; everything left is drawing.
         workTotal = workDone + (uint32_t)drawList.size() * kPassW;
         if (workTotal == 0) workTotal = 1;
-        Log("replay: %zu unique pipelines to build from %zu keys (ordered by use)",
-            drawList.size(), replayRecs.size());
-
-        if (cfg.exportBaseline) ExportBaseline(drawList);
+        Log("replay: %zu unique pipelines to build from %zu keys: %u base identities first "
+            "(shaders + vertex input + output state), then %zu spec-constant variants; %u instanced",
+            drawList.size(), replayRecs.size(), replayBaseCount,
+            drawList.size() - replayBaseCount, instanced);
 
         // Adaptive exit: if pipelines are not actually being COMPILED, there is
         // nothing to win and the whole pass is a pure loading-time regression.
@@ -1968,6 +2088,20 @@ class ShaderPrecompiler
             }
             for (UINT s = 0; s < 4; s++)
                 if (stride[s]) dev->SetStreamSource(s, dummyVB, 0, stride[s]);
+
+            // Instancing, as recorded. DXVK builds a per-instance binding (with the
+            // recorded divisor) for each INSTANCEDATA stream, and only draws instances
+            // when stream 0 carries INDEXEDDATA -- it rejects INSTANCEDATA on stream 0
+            // outright. One instance is enough to create the pipeline.
+            {
+                bool anyInstanced = false;
+                for (UINT s = 1; s < kMaxStreams; s++)
+                {
+                    dev->SetStreamSourceFreq(s, k.streamFreq[s] ? k.streamFreq[s] : 1u);
+                    anyInstanced |= k.streamFreq[s] != 0;
+                }
+                dev->SetStreamSourceFreq(0, anyInstanced ? (D3DSTREAMSOURCE_INDEXEDDATA | 1u) : 1u);
+            }
 
             dev->SetVertexShader(vs);
             dev->SetPixelShader(ps);
@@ -2087,6 +2221,7 @@ class ShaderPrecompiler
         // Unbind, so nothing below inherits a scratch target or dummy stream.
         for (uint32_t i = 1; i < kMaxRT; i++) dev->SetRenderTarget(i, nullptr);
         for (UINT s = 0; s < 4; s++) dev->SetStreamSource(s, nullptr, 0, 0);
+        for (UINT s = 0; s < kMaxStreams; s++) dev->SetStreamSourceFreq(s, 1);
         dev->SetIndices(nullptr);
         for (uint32_t i = 0; i < kPSSamplers; i++) dev->SetTexture(i, nullptr);
         for (uint32_t i = 0; i < kVSSamplers; i++) dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + i, nullptr);
@@ -2563,6 +2698,7 @@ class ShaderPrecompiler
         cfg.adaptiveExit = ini.ReadInteger("SHADERS", "PrecompileAdaptiveExit", 0) != 0;
         cfg.budgetSeconds = ini.ReadInteger("SHADERS", "PrecompileBudgetSeconds", 0);
         cfg.fenceChunk    = ini.ReadInteger("SHADERS", "PrecompileFenceChunk", 1);
+        cfg.specVariants  = ini.ReadInteger("SHADERS", "PrecompileSpecVariants", 1) != 0;
         cfg.exportBaseline = ini.ReadInteger("SHADERS", "PrecompileExportBaseline", 0) != 0;
     }
 

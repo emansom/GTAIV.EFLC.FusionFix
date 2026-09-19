@@ -288,6 +288,31 @@ class ShaderCapture
         if (k.declIndex == 0xFFFFFFFFu)
             dev->GetFVF((DWORD*)&k.fvf);
 
+        // Instancing. DXVK bakes each used stream's input rate and divisor into the
+        // vertex-input state, so an instanced draw is a different pipeline from the
+        // same shaders drawn per-vertex -- and a replay that never sets the frequency
+        // warms only the per-vertex one. Only streams the declaration reads matter
+        // (DXVK binds nothing else); the FVF path reads stream 0.
+        {
+            uint32_t streamMask = 1u;
+            if (k.declIndex != 0xFFFFFFFFu)
+            {
+                streamMask = 0;
+                for (const auto& e : declTable[k.declIndex])
+                {
+                    if (e.Stream == 0xFF) break;               // D3DDECL_END
+                    if (e.Stream < pipelinekeys::kMaxStreams) streamMask |= 1u << e.Stream;
+                }
+            }
+            for (uint32_t s = 0; s < pipelinekeys::kMaxStreams; s++)
+            {
+                if (!(streamMask & (1u << s))) continue;
+                UINT setting = 1;
+                if (SUCCEEDED(dev->GetStreamSourceFreq(s, &setting)))
+                    k.streamFreq[s] = pipelinekeys::InstanceFreq(setting);
+            }
+        }
+
         for (uint32_t i = 0; i < kMaxRT; i++)
         {
             IDirect3DSurface9* rt = nullptr;
@@ -655,13 +680,35 @@ class ShaderCapture
     // every extra candidate is another file whose counts get merged in AGAIN on every
     // run -- which is exactly how this file's draw counts reached 41.5e9 against
     // 5,073,509 draws actually recorded. One bundle per (format, MSAA), nothing else.
+    //
+    // A file that exists but cannot be merged -- an older format version, another
+    // state set, another shader directory -- is MOVED ASIDE, never left in place.
+    // Capture writes to this same path on its first flush, so "refuse and start
+    // fresh" used to mean "refuse and then overwrite": every format bump silently
+    // destroyed the accumulated capture it had just declined to read.
     static void LoadExisting()
     {
-        if (MergeBundleFile(OutDir() + bundleBin, bundleBin.c_str()))
+        const std::string path = OutDir() + bundleBin;
+        if (MergeBundleFile(path, bundleBin.c_str()))
+        {
             Log("merged %u keys from the existing cache (%zu unique, %zu declarations)",
                 mergedIn, records.size(), declTable.size());
-        else
+            return;
+        }
+        if (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+        {
             Log("no existing cache for this configuration - starting a new one");
+            return;
+        }
+        const std::string aside = path + ".unmerged";
+        remove(aside.c_str());
+        if (rename(path.c_str(), aside.c_str()) == 0)
+            Log("existing cache could not be merged (not format v%u, or the reason above) - kept it "
+                "as %s.unmerged and started a new one", pipelinekeys::kCacheVersion, bundleBin.c_str());
+        else
+            Log("existing cache could not be merged NOR moved aside - capture disabled so it is "
+                "not overwritten");
+        if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) enabled = false;
     }
 
     // Merge one cache file. Returns false if it is absent or unusable.
@@ -676,8 +723,8 @@ class ShaderCapture
         const size_t uniqueBefore = records.size();
 
         // A cache recorded against a different state set cannot be merged field for
-        // field. Keep it rather than silently corrupting it: bail and start fresh.
-        // There is deliberately no migration path (see kVersion).
+        // field. Keep it rather than silently corrupting it: bail and start fresh
+        // (LoadExisting moves the file aside). No migration path (see kCacheVersion).
         if (c.meta.numRS != kNumRS || c.meta.numSamplers != kNumSamplers ||
             c.rsTypes.size() != kNumRS)
         {
