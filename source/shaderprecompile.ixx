@@ -1353,7 +1353,7 @@ class ShaderPrecompiler
         int msaa = ini.ReadInteger("EXPERIMENTAL", "ReflectionMSAAQuality", 0);
 
         (void)w; (void)h;   // resolution provably does not affect the keys, see BundleName
-        return dir + pipelinekeys::BundleName(fmt, msaa, "bin");
+        return dir + pipelinekeys::CacheName(fmt, msaa);
     }
 
     // A shipped baseline, so the very first launch on a machine that has never
@@ -1364,11 +1364,21 @@ class ShaderPrecompiler
     // Kept under its own name so the capture, which writes the per-configuration
     // bundle, can never overwrite it, and so it is always merged IN ADDITION to
     // whatever the user has recorded rather than being an either/or.
-    static std::string BaselinePath() { return ModuleDir() + "FusionFix.pipelinekeys.baseline.bin"; }
+    static std::string BaselinePath() { return ModuleDir() + "FusionFix.pipelinecache.baseline.bin"; }
+
+    // Provenance of the cache we loaded, carried into an exported baseline so the
+    // shipped artifact says what it was built against -- the shader directory above
+    // all, which is the field a merge tool buckets on.
+    static inline std::string exportShaderDir = "unknown";
+    static inline pipelinekeys::CacheMeta exportMeta{};
+    static inline std::string exportStrings[pipelinekeys::kMetaStringCount];
 
     // Dedup state shared by every file merged into the replay set.
     static inline std::unordered_map<uint64_t, uint32_t> replayDeclByHash;
     static inline std::unordered_map<uint64_t, uint32_t> replayKeyIndex;
+    // Bytecode carried by the same container as the keys, merged across every cache
+    // file we load (local capture, then the shipped baseline).
+    static inline pipelinekeys::ShaderBlobMap replayBlobs;
 
     // Returns false (and leaves replayRecs empty) for any malformed or absent file,
     // so the caller can fall back to the synthetic pass rather than doing nothing.
@@ -1378,6 +1388,7 @@ class ShaderPrecompiler
         replayDecls.clear();
         replayDeclByHash.clear();
         replayKeyIndex.clear();
+        replayBlobs.clear();
 
         // The user's own capture first: it is the one recorded at THIS graphics
         // configuration, and merging it first means its draw counts drive the
@@ -1397,51 +1408,34 @@ class ShaderPrecompiler
     {
         using namespace pipelinekeys;
 
-        FILE* f = fopen(path.c_str(), "rb");
-        if (!f) { Log("replay: no %s key file at %s", what, path.c_str()); return false; }
+        CacheContents c;
+        if (!ReadCache(path, c)) { Log("replay: no usable %s cache at %s", what, path.c_str()); return false; }
 
         const size_t recsBefore = replayRecs.size();
 
-        FileHeader h{};
-        if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); return false; }
-        if (h.magic != kMagic) { Log("replay: bad magic 0x%08X", h.magic); fclose(f); return false; }
-        // No migration path by design (see kVersion): reject rather than misread.
-        if (h.version != kVersion)
-        {
-            Log("replay: file is v%u, this build reads v%u", h.version, kVersion);
-            fclose(f);
-            return false;
-        }
         // A file written by a build tracking a different state set cannot be
         // replayed field-for-field, and guessing would be worse than not trying.
-        if (h.numRS != kNumRS || h.numSamplers != kNumSamplers)
+        // No migration path by design (see kVersion): reject rather than misread.
+        if (c.meta.numRS != kNumRS || c.meta.numSamplers != kNumSamplers ||
+            c.rsTypes.size() != kNumRS)
         {
-            Log("replay: file tracks %u states / %u samplers, this build expects %u / %u",
-                h.numRS, h.numSamplers, kNumRS, kNumSamplers);
-            fclose(f);
+            Log("replay: %s tracks %u states / %u samplers, this build expects %u / %u",
+                what, c.meta.numRS, c.meta.numSamplers, kNumRS, kNumSamplers);
             return false;
         }
-
-        std::vector<uint32_t> rsTypes(h.numRS);
-        if (fread(rsTypes.data(), sizeof(uint32_t), h.numRS, f) != h.numRS) { fclose(f); return false; }
-        for (uint32_t i = 0; i < h.numRS; i++)
-            if (rsTypes[i] != (uint32_t)kTrackedRS[i].rs)
+        for (uint32_t i = 0; i < kNumRS; i++)
+            if (c.rsTypes[i] != (uint32_t)kTrackedRS[i].rs)
             {
-                Log("replay: state %u is %u in the file but %u here - refusing", i, rsTypes[i], (uint32_t)kTrackedRS[i].rs);
-                fclose(f);
+                Log("replay: state %u is %u in the file but %u here - refusing",
+                    i, c.rsTypes[i], (uint32_t)kTrackedRS[i].rs);
                 return false;
             }
 
         // File-local declaration index -> our index.
-        std::vector<uint32_t> remap(h.declCount, 0);
-        for (uint32_t i = 0; i < h.declCount; i++)
+        std::vector<uint32_t> remap(c.decls.size(), 0);
+        for (size_t i = 0; i < c.decls.size(); i++)
         {
-            uint32_t n = 0;
-            if (fread(&n, sizeof(n), 1, f) != 1 || n == 0 || n > MAXD3DDECLLENGTH + 1) { fclose(f); return false; }
-            std::vector<D3DVERTEXELEMENT9> elems(n);
-            if (fread(elems.data(), sizeof(D3DVERTEXELEMENT9), n, f) != n) { fclose(f); return false; }
-
-            uint64_t dh = Fnv1a(elems.data(), elems.size() * sizeof(D3DVERTEXELEMENT9));
+            uint64_t dh = Fnv1a(c.decls[i].data(), c.decls[i].size() * sizeof(D3DVERTEXELEMENT9));
             if (auto it = replayDeclByHash.find(dh); it != replayDeclByHash.end())
             {
                 remap[i] = it->second;
@@ -1450,21 +1444,17 @@ class ShaderPrecompiler
             {
                 remap[i] = (uint32_t)replayDecls.size();
                 replayDeclByHash.emplace(dh, remap[i]);
-                replayDecls.push_back(std::move(elems));
+                replayDecls.push_back(c.decls[i]);
             }
         }
 
-        size_t got = 0, merged = 0;
-        for (uint32_t i = 0; i < h.recCount; i++)
+        size_t merged = 0;
+        for (auto& rec : c.keys)
         {
-            KeyRecord k{};
-            if (fread(&k, sizeof(k), 1, f) != 1)
-                break;
-            got++;
-
+            KeyRecord k = rec;
             if (k.declIndex != kDeclNone)
             {
-                if (k.declIndex >= h.declCount) continue;   // corrupt index: drop the key, keep the file
+                if (k.declIndex >= remap.size()) continue;   // corrupt index: drop the key, keep the file
                 k.declIndex = remap[k.declIndex];
             }
 
@@ -1480,16 +1470,24 @@ class ShaderPrecompiler
                 replayRecs.push_back(k);
             }
         }
-        fclose(f);
 
-        // A capture flushed while the game was killed can be short; keep what is
-        // whole rather than discarding a useful file over its last record.
-        if (got != h.recCount)
-            Log("replay: %s file claims %u records, read %zu - using the complete ones", what, h.recCount, got);
+        // The bytecode arrives in the same file as the keys that name it, so a key set
+        // can never be loaded without the shaders needed to replay it.
+        uint32_t newShaders = 0;
+        for (auto& [hash, blob] : c.shaders)
+            if (replayBlobs.emplace(hash, blob).second) newShaders++;
+        if (newShaders)
+            Log("replay: %s carried %u shader blobs", what, newShaders);
+        if (!c.strings[kMetaShaderDir].empty() && c.strings[kMetaShaderDir] != "unknown")
+        {
+            exportShaderDir = c.strings[kMetaShaderDir];
+            exportMeta = c.meta;
+            for (uint32_t i = 0; i < kMetaStringCount; i++) exportStrings[i] = c.strings[i];
+        }
 
         Log("replay: %s contributed %zu new keys (%zu already known) from %zu records",
-            what, replayRecs.size() - recsBefore, merged, got);
-        return got != 0;
+            what, replayRecs.size() - recsBefore, merged, c.keys.size());
+        return !c.keys.empty();
     }
 
     // Write the deduplicated, use-ordered pipeline set as a baseline others can ship.
@@ -1504,9 +1502,7 @@ class ShaderPrecompiler
     {
         using namespace pipelinekeys;
 
-        std::string path = ModuleDir() + "FusionFix.pipelinekeys.baseline.export.bin";
-        FILE* f = fopen(path.c_str(), "wb");
-        if (!f) { Log("baseline: cannot write %s", path.c_str()); return; }
+        std::string path = ModuleDir() + "FusionFix.pipelinecache.baseline.export.bin";
 
         // Only the declarations these records actually reference.
         std::unordered_map<uint32_t, uint32_t> declRemap;
@@ -1518,32 +1514,39 @@ class ShaderPrecompiler
             if (declRemap.emplace(d, (uint32_t)declOrder.size()).second) declOrder.push_back(d);
         }
 
-        FileHeader h{ kMagic, kVersion, kNumRS, kNumSamplers,
-                      (uint32_t)declOrder.size(), (uint32_t)drawList.size() };
-        fwrite(&h, sizeof(h), 1, f);
+        CacheContents c;
+        c.meta = exportMeta;               // provenance of the capture this came from
+        c.meta.numRS       = kNumRS;
+        c.meta.numSamplers = kNumSamplers;
+        for (uint32_t i = 0; i < kMetaStringCount; i++) c.strings[i] = exportStrings[i];
+        c.strings[kMetaShaderDir] = exportShaderDir;
 
-        for (uint32_t i = 0; i < kNumRS; i++)
-        {
-            uint32_t rs = (uint32_t)kTrackedRS[i].rs;
-            fwrite(&rs, 4, 1, f);
-        }
-        for (uint32_t d : declOrder)
-        {
-            uint32_t n = (uint32_t)replayDecls[d].size();
-            fwrite(&n, 4, 1, f);
-            fwrite(replayDecls[d].data(), sizeof(D3DVERTEXELEMENT9), n, f);
-        }
+        c.rsTypes.reserve(kNumRS);
+        for (uint32_t i = 0; i < kNumRS; i++) c.rsTypes.push_back((uint32_t)kTrackedRS[i].rs);
+
+        for (uint32_t d : declOrder) c.decls.push_back(replayDecls[d]);
+
+        std::unordered_set<uint64_t> needed;
         for (uint32_t r : drawList)
         {
             KeyRecord k = replayRecs[r];
             if (k.declIndex != kDeclNone)
                 k.declIndex = declRemap.count(k.declIndex) ? declRemap[k.declIndex] : kDeclNone;
-            fwrite(&k, sizeof(k), 1, f);
+            c.keys.push_back(k);
+            needed.insert(k.vsHash);
+            needed.insert(k.psHash);
         }
-        fclose(f);
 
-        Log("baseline: wrote %zu pipelines and %zu declarations to %s",
-            drawList.size(), declOrder.size(), path.c_str());
+        // Ship only the bytecode these keys actually name. A baseline that carries the
+        // whole sidecar would be mostly shaders no shipped key references.
+        for (uint64_t hash : needed)
+            if (auto it = replayBlobs.find(hash); it != replayBlobs.end())
+                c.shaders.emplace(hash, it->second);
+
+        if (!WriteCache(path, c)) { Log("baseline: cannot write %s", path.c_str()); return; }
+
+        Log("baseline: wrote %zu pipelines, %zu declarations, %zu shaders to %s",
+            drawList.size(), declOrder.size(), c.shaders.size(), path.c_str());
     }
 
     // Index the shaders we just created by the same bytecode hash the capture used,
@@ -1616,18 +1619,14 @@ class ShaderPrecompiler
     // bytecode; create the shader from it and the key becomes replayable. Identical
     // bytes resolve to the same DXVK shader module, so this warms the pipeline the
     // game will actually use, not a lookalike.
-    static void IndexShadersFromSidecar(const std::string& dir)
+    // The blobs came in with the keys, from the same container, so there is no second
+    // file to find and no way for the two to disagree.
+    static void IndexShadersFromBlobs()
     {
-        pipelinekeys::ShaderBlobMap blobs;
-        std::string path = dir + pipelinekeys::ShaderSidecarName();
-        if (!pipelinekeys::ReadShaderSidecar(path, blobs))
-        {
-            Log("replay: no shader bytecode sidecar at %s", path.c_str());
-            return;
-        }
+        if (replayBlobs.empty()) { Log("replay: the cache carried no shader bytecode"); return; }
 
         uint32_t madeVS = 0, madePS = 0, failed = 0;
-        for (auto& [hash, blob] : blobs)
+        for (auto& [hash, blob] : replayBlobs)
         {
             const DWORD* fn = reinterpret_cast<const DWORD*>(blob.code.data());
             if (blob.stage == pipelinekeys::kStageVS)
@@ -1662,8 +1661,8 @@ class ShaderPrecompiler
             }
         }
 
-        Log("replay: created %u VS + %u PS from the bytecode sidecar (%zu stored, %u failed)",
-            madeVS, madePS, blobs.size(), failed);
+        Log("replay: created %u VS + %u PS from the cache's bytecode (%zu stored, %u failed)",
+            madeVS, madePS, replayBlobs.size(), failed);
     }
 
     // ---- FusionFix's OWN embedded shaders ------------------------------------
@@ -2281,7 +2280,7 @@ class ShaderPrecompiler
             if (useReplay)
             {
                 IndexShadersByHash(db);
-                IndexShadersFromSidecar(ModuleDir());
+                IndexShadersFromBlobs();
                 IndexShadersFromOwnResources();
                 ReplayPass();
             }

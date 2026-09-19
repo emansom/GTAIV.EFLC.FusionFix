@@ -131,19 +131,6 @@ namespace pipelinekeys
         uint32_t firstFrame;                // frame ordinal of first sighting
     };
 
-    // File header, immediately followed by:
-    //   uint32_t rsTypes[numRS]
-    //   declCount x { uint32_t n; D3DVERTEXELEMENT9 elems[n] }
-    //   recCount  x KeyRecord
-    struct FileHeader
-    {
-        uint32_t magic;
-        uint32_t version;
-        uint32_t numRS;
-        uint32_t numSamplers;
-        uint32_t declCount;
-        uint32_t recCount;
-    };
 #pragma pack(pop)
 
     // Everything that identifies a key, excluding the bookkeeping tail.
@@ -174,11 +161,13 @@ namespace pipelinekeys
     // resolution therefore fragmented the cache for nothing: it split one cache into
     // near-identical copies, reset a user's coverage whenever they changed
     // resolution, and would have forced us to ship a separate baseline per bucket.
-    inline std::string BundleName(uint32_t bbFormat, int msaa, const char* ext)
+    // One self-contained file per graphics configuration: keys, the declarations they
+    // index, and the shader bytecode they name. This is what a player sends in.
+    inline std::string CacheName(uint32_t bbFormat, int msaa)
     {
         char buf[128];
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "FusionFix.pipelinekeys.f%u-ms%d.%s",
-                    bbFormat, msaa, ext);
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "FusionFix.pipelinecache.f%u-ms%d.bin",
+                    bbFormat, msaa);
         return std::string(buf);
     }
 
@@ -250,12 +239,84 @@ namespace pipelinekeys
     // pipelines that the game's separate objects then reuse, which is the entire
     // reason replay measured as a win.
     //
-    // Bytecode does not vary with the graphics configuration, so unlike the keys this
-    // is ONE file shared by every bundle.
-    constexpr uint32_t kShaderMagic   = 0x53504646;   // 'FFPS'
-    constexpr uint32_t kShaderVersion = 1;
-
+    // The bytecode travels in the same container as the keys that name it, so a
+    // contribution can never arrive with keys whose shaders are missing.
     enum ShaderStage : uint32_t { kStageVS = 0, kStagePS = 1 };
+
+    // =======================================================================
+    //  ONE-FILE CONTRIBUTION CONTAINER
+    //
+    //  A player's capture has to be a SINGLE artifact: they send one file, an
+    //  external tool indexes and merges many of them, and the result ships back as
+    //  one "golden" cache. Three files (keys, shader bytecode, a text summary) made
+    //  that a packaging problem for every contributor and an ordering problem for
+    //  the merge tool, because the keys are useless without the bytecode they name.
+    //
+    //  Sectioned rather than one fixed struct so the merge tool can seek to what it
+    //  needs -- read the metadata of a thousand contributions to bucket them without
+    //  parsing a thousand key tables -- and so a section can be added later without
+    //  invalidating readers.
+    //
+    //  THE METADATA IS NOT DECORATION. Two captures are only mergeable if the game
+    //  resolved the SAME shader directory: GTA IV picks between win32_30 and five
+    //  vendor-specific variants by probing depth formats (RAWZ -> nv6, DF24 ->
+    //  atidx10, INTZ -> nv8, else win32_30), and those directories hold genuinely
+    //  different bytecode, so the shader hashes -- and every key naming them -- differ.
+    //  Under DXVK that probe is answered by DXVK rather than the vendor driver, which
+    //  is what makes one golden cache plausible at all, but DXVK's own format support
+    //  can still depend on the Vulkan implementation. So record what was actually
+    //  resolved and let the merge tool bucket on it, rather than assuming convergence.
+    constexpr uint32_t kCacheMagic   = 0x43504646;   // 'FFPC'
+    constexpr uint32_t kCacheVersion = 1;
+
+    enum CacheSectionId : uint32_t
+    {
+        kSecMeta    = 1,   // CacheMeta, then metaStrings length-prefixed UTF-8
+        kSecRSTypes = 2,   // uint32_t rsType[numRS]
+        kSecDecls   = 3,   // count x { uint32_t n; D3DVERTEXELEMENT9 elems[n] }
+        kSecKeys    = 4,   // count x KeyRecord
+        kSecShaders = 5,   // count x { ShaderBlobHeader; uint8_t code[size] }
+    };
+
+    // Fixed order of the strings in kSecMeta. shaderDir is the bucketing key.
+    enum CacheMetaString : uint32_t
+    {
+        kMetaShaderDir = 0,   // "win32_30", "win32_30_nv8", ... or "unknown"
+        kMetaAdapter   = 1,   // D3DADAPTER_IDENTIFIER9::Description
+        kMetaDriver    = 2,   // driver version, or the DXVK version when known
+        kMetaOS        = 3,   // "windows" / "wine <version>"
+        kMetaStringCount = 4,
+    };
+
+#pragma pack(push, 1)
+    struct CacheHeader
+    {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t sectionCount;
+        uint32_t reserved;
+    };
+    struct CacheSection
+    {
+        uint32_t id;
+        uint32_t offset;     // from the start of the file
+        uint32_t size;       // bytes
+        uint32_t count;      // elements, where the section has them
+    };
+    struct CacheMeta
+    {
+        uint32_t numRS;          // reader rejects a mismatch rather than misreading
+        uint32_t numSamplers;
+        uint32_t bbFormat;       // D3DFORMAT of the back buffer
+        int32_t  msaa;           // ReflectionMSAAQuality this capture ran with
+        uint32_t frames;         // frames the capture observed
+        uint64_t draws;          // draws recorded (this capture's own count)
+        uint32_t backend;        // 0 = native D3D9, 1 = DXVK
+        uint32_t vendorId;       // from D3DADAPTER_IDENTIFIER9
+        uint32_t deviceId;
+        uint32_t stringCount;    // == kMetaStringCount for this version
+    };
+#pragma pack(pop)
 
 #pragma pack(push, 1)
     struct ShaderFileHeader { uint32_t magic; uint32_t version; uint32_t count; };
@@ -265,58 +326,174 @@ namespace pipelinekeys
     struct ShaderBlob { uint32_t stage; std::vector<uint8_t> code; };
     using ShaderBlobMap = std::unordered_map<uint64_t, ShaderBlob>;
 
-    inline const char* ShaderSidecarName() { return "FusionFix.pipelineshaders.bin"; }
+    // ---- container I/O ----------------------------------------------------
+    // Everything a reader needs from one file, so no caller has to know the layout.
+    struct CacheContents
+    {
+        CacheMeta                meta{};
+        std::string              strings[kMetaStringCount];
+        std::vector<uint32_t>    rsTypes;
+        std::vector<std::vector<D3DVERTEXELEMENT9>> decls;
+        std::vector<KeyRecord>   keys;
+        ShaderBlobMap            shaders;
+    };
 
-    // Merges into `out`; an entry already present wins, so a caller can load several
-    // files (or load over what it captured) without losing anything.
-    inline bool ReadShaderSidecar(const std::string& path, ShaderBlobMap& out)
+    inline bool ReadStr(FILE* f, std::string& out)
+    {
+        uint32_t n = 0;
+        if (fread(&n, 4, 1, f) != 1 || n > (1u << 16)) return false;
+        out.assign(n, '\0');
+        return n == 0 || fread(&out[0], 1, n, f) == n;
+    }
+
+    inline void WriteStr(FILE* f, const std::string& s)
+    {
+        uint32_t n = (uint32_t)s.size();
+        fwrite(&n, 4, 1, f);
+        if (n) fwrite(s.data(), 1, n, f);
+    }
+
+    // `want` selects sections, so the merge tool can read a thousand files' metadata
+    // without touching their key tables. Sections absent from the file are simply
+    // left empty -- a reader asks for what it needs and checks what it got.
+    inline bool ReadCache(const std::string& path, CacheContents& out, uint32_t wantMask = ~0u)
     {
         FILE* f = fopen(path.c_str(), "rb");
         if (!f) return false;
 
-        ShaderFileHeader hdr{};
-        if (fread(&hdr, sizeof(hdr), 1, f) != 1 ||
-            hdr.magic != kShaderMagic || hdr.version != kShaderVersion)
+        CacheHeader h{};
+        if (fread(&h, sizeof(h), 1, f) != 1 || h.magic != kCacheMagic ||
+            h.version != kCacheVersion || h.sectionCount == 0 || h.sectionCount > 32)
         {
             fclose(f);
             return false;
         }
 
-        for (uint32_t i = 0; i < hdr.count; i++)
+        std::vector<CacheSection> secs(h.sectionCount);
+        if (fread(secs.data(), sizeof(CacheSection), h.sectionCount, f) != h.sectionCount)
         {
-            ShaderBlobHeader bh{};
-            if (fread(&bh, sizeof(bh), 1, f) != 1) break;    // short file: keep what is whole
-            // A shader token stream is DWORDs and far smaller than this; the bound
-            // only exists so a corrupt length cannot ask for a gigabyte.
-            if (bh.size == 0 || bh.size > (1u << 20) || (bh.size & 3u)) break;
+            fclose(f);
+            return false;
+        }
 
-            std::vector<uint8_t> code(bh.size);
-            if (fread(code.data(), 1, bh.size, f) != bh.size) break;
-            if (bh.stage != kStageVS && bh.stage != kStagePS) continue;
+        bool ok = true;
+        for (auto& s : secs)
+        {
+            if (!(wantMask & (1u << s.id))) continue;
+            if (fseek(f, (long)s.offset, SEEK_SET) != 0) { ok = false; break; }
 
-            out.emplace(bh.hash, ShaderBlob{ bh.stage, std::move(code) });
+            if (s.id == kSecMeta)
+            {
+                if (fread(&out.meta, sizeof(CacheMeta), 1, f) != 1) { ok = false; break; }
+                for (uint32_t i = 0; i < out.meta.stringCount && i < kMetaStringCount; i++)
+                    if (!ReadStr(f, out.strings[i])) { ok = false; break; }
+            }
+            else if (s.id == kSecRSTypes)
+            {
+                out.rsTypes.resize(s.count);
+                if (s.count && fread(out.rsTypes.data(), 4, s.count, f) != s.count) { ok = false; break; }
+            }
+            else if (s.id == kSecDecls)
+            {
+                out.decls.resize(s.count);
+                for (uint32_t i = 0; i < s.count; i++)
+                {
+                    uint32_t n = 0;
+                    if (fread(&n, 4, 1, f) != 1 || n == 0 || n > MAXD3DDECLLENGTH + 1) { ok = false; break; }
+                    out.decls[i].resize(n);
+                    if (fread(out.decls[i].data(), sizeof(D3DVERTEXELEMENT9), n, f) != n) { ok = false; break; }
+                }
+            }
+            else if (s.id == kSecKeys)
+            {
+                out.keys.resize(s.count);
+                if (s.count && fread(out.keys.data(), sizeof(KeyRecord), s.count, f) != s.count)
+                {
+                    out.keys.clear();
+                    ok = false;
+                    break;
+                }
+            }
+            else if (s.id == kSecShaders)
+            {
+                for (uint32_t i = 0; i < s.count; i++)
+                {
+                    ShaderBlobHeader bh{};
+                    if (fread(&bh, sizeof(bh), 1, f) != 1 || bh.size == 0 || bh.size > (1u << 20)) { ok = false; break; }
+                    ShaderBlob b{ bh.stage, std::vector<uint8_t>(bh.size) };
+                    if (fread(b.code.data(), 1, bh.size, f) != bh.size) { ok = false; break; }
+                    out.shaders.emplace(bh.hash, std::move(b));
+                }
+            }
         }
         fclose(f);
-        return true;
+        return ok;
     }
 
-    inline bool WriteShaderSidecar(const std::string& path, const ShaderBlobMap& in)
+    inline bool WriteCache(const std::string& path, const CacheContents& in)
     {
+        // Two passes: reserve the section table, write the payload recording each
+        // section's real offset, then rewrite the table. Simpler and less fragile than
+        // computing sizes up front, which would have to track every element's encoding.
         FILE* f = fopen(path.c_str(), "wb");
         if (!f) return false;
 
-        ShaderFileHeader hdr{ kShaderMagic, kShaderVersion, (uint32_t)in.size() };
-        fwrite(&hdr, sizeof(hdr), 1, f);
+        CacheSection secs[5] = {
+            { kSecMeta, 0, 0, 1 },
+            { kSecRSTypes, 0, 0, (uint32_t)in.rsTypes.size() },
+            { kSecDecls, 0, 0, (uint32_t)in.decls.size() },
+            { kSecKeys, 0, 0, (uint32_t)in.keys.size() },
+            { kSecShaders, 0, 0, (uint32_t)in.shaders.size() },
+        };
+        const uint32_t nsec = 5;
 
-        for (auto& [hash, blob] : in)
+        CacheHeader h{ kCacheMagic, kCacheVersion, nsec, 0 };
+        fwrite(&h, sizeof(h), 1, f);
+        const long tableAt = ftell(f);
+        fwrite(secs, sizeof(CacheSection), nsec, f);
+
+        auto mark = [&](uint32_t i) { secs[i].offset = (uint32_t)ftell(f); };
+        auto seal = [&](uint32_t i) { secs[i].size = (uint32_t)ftell(f) - secs[i].offset; };
+
+        mark(0);
+        CacheMeta m = in.meta;
+        m.stringCount = kMetaStringCount;
+        fwrite(&m, sizeof(m), 1, f);
+        for (uint32_t i = 0; i < kMetaStringCount; i++) WriteStr(f, in.strings[i]);
+        seal(0);
+
+        mark(1);
+        if (!in.rsTypes.empty()) fwrite(in.rsTypes.data(), 4, in.rsTypes.size(), f);
+        seal(1);
+
+        mark(2);
+        for (auto& d : in.decls)
+        {
+            uint32_t n = (uint32_t)d.size();
+            fwrite(&n, 4, 1, f);
+            fwrite(d.data(), sizeof(D3DVERTEXELEMENT9), n, f);
+        }
+        seal(2);
+
+        mark(3);
+        if (!in.keys.empty()) fwrite(in.keys.data(), sizeof(KeyRecord), in.keys.size(), f);
+        seal(3);
+
+        mark(4);
+        for (auto& [hash, blob] : in.shaders)
         {
             ShaderBlobHeader bh{ hash, blob.stage, (uint32_t)blob.code.size() };
             fwrite(&bh, sizeof(bh), 1, f);
             fwrite(blob.code.data(), 1, blob.code.size(), f);
         }
+        seal(4);
+
+        fseek(f, tableAt, SEEK_SET);
+        fwrite(secs, sizeof(CacheSection), nsec, f);
         fclose(f);
         return true;
     }
+
 
     // Hash a shader the same way the capture does: from the bytes GetFunction
     // returns, never from the caller's pointer, so the two can never disagree.

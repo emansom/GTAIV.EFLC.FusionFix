@@ -452,9 +452,9 @@ class ShaderCapture
         // Which bundle this configuration reads and writes.
         ResolveBundle(d);
 
-        // Inherit previous sessions' coverage before recording anything new.
+        // Inherit previous sessions' coverage before recording anything new. Keys and
+        // the bytecode they name arrive together, from one file.
         LoadExisting();
-        LoadShaderBlobs();
 
         auto vtbl = *reinterpret_cast<void***>(d);
         bool ok = true;
@@ -487,10 +487,80 @@ class ShaderCapture
     // Cache file for THIS graphics configuration. Recorded keys carry render-target
     // formats, so one captured at another resolution or MSAA level is both useless
     // (nothing matches) and harmful (warms pipelines this setup never uses).
-    static inline std::string bundleBin, bundleTxt;
-    // Kept so LoadExisting can build every predecessor name for this configuration.
+    static inline std::string bundleBin;
     static inline uint32_t bundleFmt = 0;
     static inline int      bundleMsaa = 0;
+    // Provenance, captured once and written into the file. See the container comment
+    // in pipelinekeys.h: two captures are only mergeable if the game resolved the SAME
+    // shader directory, so this is what a merge tool buckets on.
+    static inline std::string metaShaderDir = "unknown", metaAdapter, metaDriver, metaOS;
+    static inline uint32_t metaVendorId = 0, metaDeviceId = 0, metaBackend = 0;
+
+    // GTA IV stores the shader directory it resolved (win32_30, win32_30_nv8, ...) in
+    // a char* global, chosen by probing depth formats. Read it defensively: a wrong
+    // build would give a wild pointer, and recording "unknown" is far better than
+    // recording a plausible-looking lie that a merge tool would bucket on.
+    static void ResolveShaderDir()
+    {
+        const uintptr_t kShaderDirPtr = 0x01633800;   // GTA IV 1.2.0.59
+        __try
+        {
+            auto base = (uintptr_t)GetModuleHandleW(nullptr);
+            const char* s = *(const char* const*)(base + (kShaderDirPtr - 0x400000));
+            if (s && !IsBadStringPtrA(s, 64) && strncmp(s, "win32_", 6) == 0)
+                metaShaderDir = s;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        Log("shader directory in use: %s", metaShaderDir.c_str());
+    }
+
+    static void ResolveProvenance(IDirect3DDevice9* d)
+    {
+        IDirect3D9* d3d = nullptr;
+        if (d && SUCCEEDED(d->GetDirect3D(&d3d)) && d3d)
+        {
+            D3DADAPTER_IDENTIFIER9 id{};
+            if (SUCCEEDED(d3d->GetAdapterIdentifier(D3DADAPTER_DEFAULT, 0, &id)))
+            {
+                metaAdapter = id.Description;
+                metaVendorId = id.VendorId;
+                metaDeviceId = id.DeviceId;
+                char drv[64];
+                _snprintf_s(drv, sizeof(drv), _TRUNCATE, "%u.%u.%u.%u",
+                            HIWORD(id.DriverVersion.HighPart), LOWORD(id.DriverVersion.HighPart),
+                            HIWORD(id.DriverVersion.LowPart), LOWORD(id.DriverVersion.LowPart));
+                metaDriver = drv;
+            }
+            d3d->Release();
+        }
+        // DXVK is the backend that makes one shared cache plausible (it answers the
+        // depth-format probe itself instead of the vendor driver), so record which one
+        // produced this capture rather than assuming.
+        metaBackend = GetModuleHandleW(L"dxvk_d3d9.dll") ? 1 : 0;
+        if (!metaBackend)
+        {
+            // DXVK usually ships as d3d9.dll; its version resource names it.
+            if (HMODULE m = GetModuleHandleW(L"d3d9.dll"))
+            {
+                char path[MAX_PATH]{};
+                if (GetModuleFileNameA(m, path, MAX_PATH))
+                    metaBackend = (strstr(path, "dxvk") || strstr(path, "DXVK")) ? 1 : 0;
+            }
+        }
+        metaOS = "windows";
+        if (HMODULE nt = GetModuleHandleW(L"ntdll.dll"))
+        {
+            using PFN_WineVer = const char* (__cdecl*)(void);
+            if (auto wv = (PFN_WineVer)GetProcAddress(nt, "wine_get_version"))
+            {
+                metaOS = std::string("wine ") + (wv() ? wv() : "?");
+                metaBackend = 1;   // d3d9 under wine is DXVK in every supported setup
+            }
+        }
+        Log("provenance: %s / %s / driver %s / backend %s",
+            metaOS.c_str(), metaAdapter.c_str(), metaDriver.c_str(),
+            metaBackend ? "DXVK" : "native D3D9");
+    }
 
     static void ResolveBundle(IDirect3DDevice9* d)
     {
@@ -509,205 +579,72 @@ class ShaderCapture
         CIniReader ini("");
         int msaa = ini.ReadInteger("EXPERIMENTAL", "ReflectionMSAAQuality", 0);
 
-        bundleBin = pipelinekeys::BundleName(fmt, msaa, "bin");
-        bundleTxt = pipelinekeys::BundleName(fmt, msaa, "txt");
+        bundleBin  = pipelinekeys::CacheName(fmt, msaa);
         bundleFmt  = fmt;
         bundleMsaa = msaa;
+        ResolveShaderDir();
+        ResolveProvenance(d);
         // Log the back buffer this was derived from. It is NOT reliably the resolution
         // the session runs at -- a window left at 720p by a previous run made the game
         // start 720p and only later reset to 1080p -- which is exactly why the bundle
         // name no longer depends on it.
-        Log("cache bundle for this configuration: %s (back buffer %ux%u fmt %u msaa %d)",
+        Log("cache for this configuration: %s (back buffer %ux%u fmt %u msaa %d)",
             bundleBin.c_str(), w, h, fmt, msaa);
     }
 
-    static void WriteBinary()
+    // One file: keys, the declarations they index, the bytecode they name, and the
+    // provenance a merge tool needs. A player sends this and nothing else.
+    static void WriteCacheFile()
     {
-        FILE* f = fopen((OutDir() + bundleBin).c_str(), "wb");
-        if (!f) return;
-
-        const uint32_t magic = pipelinekeys::kMagic;
-        const uint32_t version = pipelinekeys::kVersion;
-        const uint32_t recCount = (uint32_t)records.size();
-        const uint32_t declCount = (uint32_t)declTable.size();
-        const uint32_t numRS = kNumRS;
-        const uint32_t numSamplers = kNumSamplers;
-
-        fwrite(&magic, 4, 1, f);
-        fwrite(&version, 4, 1, f);
-        fwrite(&numRS, 4, 1, f);
-        fwrite(&numSamplers, 4, 1, f);
-        fwrite(&declCount, 4, 1, f);
-        fwrite(&recCount, 4, 1, f);
+        pipelinekeys::CacheContents c;
+        c.meta.numRS       = kNumRS;
+        c.meta.numSamplers = kNumSamplers;
+        c.meta.bbFormat    = bundleFmt;
+        c.meta.msaa        = bundleMsaa;
+        c.meta.frames      = (uint32_t)frameOrdinal;   // a session never reaches 2^32 frames
+        c.meta.draws       = totalDraws;
+        c.meta.backend     = metaBackend;
+        c.meta.vendorId    = metaVendorId;
+        c.meta.deviceId    = metaDeviceId;
+        c.strings[pipelinekeys::kMetaShaderDir] = metaShaderDir;
+        c.strings[pipelinekeys::kMetaAdapter]   = metaAdapter;
+        c.strings[pipelinekeys::kMetaDriver]    = metaDriver;
+        c.strings[pipelinekeys::kMetaOS]        = metaOS;
 
         // Which render states the records carry, so a reader never has to guess.
-        for (uint32_t i = 0; i < kNumRS; i++)
+        c.rsTypes.reserve(kNumRS);
+        for (uint32_t i = 0; i < kNumRS; i++) c.rsTypes.push_back((uint32_t)kTrackedRS[i].rs);
+
+        c.decls = declTable;
+        c.keys  = records;
+        c.shaders = shaderBlobs;
+
+        // Write beside the target and rename, so a crash mid-write cannot leave a
+        // contributor with a half-file that still has a valid header.
+        const std::string finalPath = OutDir() + bundleBin;
+        const std::string tmpPath   = finalPath + ".tmp";
+        if (!pipelinekeys::WriteCache(tmpPath, c))
         {
-            uint32_t rs = (uint32_t)kTrackedRS[i].rs;
-            fwrite(&rs, 4, 1, f);
-        }
-
-        for (auto& d : declTable)
-        {
-            uint32_t n = (uint32_t)d.size();
-            fwrite(&n, 4, 1, f);
-            fwrite(d.data(), sizeof(D3DVERTEXELEMENT9), n, f);
-        }
-
-        if (recCount) fwrite(records.data(), sizeof(KeyRecord), recCount, f);
-        fclose(f);
-    }
-
-    // ---- shader bytecode sidecar ---------------------------------------
-    // Only shaders that actually appear in a DRAW are stored. A shader nobody draws
-    // with has no key referencing it, so its bytecode would be dead weight -- which
-    // matters here because the precompiler creates RAGE's whole 1734-shader database
-    // through this same device, and capture is normally left on while it does.
-    static std::string ShaderSidecarPath() { return OutPath(pipelinekeys::ShaderSidecarName()); }
-
-    static void LoadShaderBlobs()
-    {
-        pipelinekeys::ShaderBlobMap existing;
-        if (!pipelinekeys::ReadShaderSidecar(ShaderSidecarPath(), existing))
-        {
-            Log("no shader bytecode sidecar yet - starting a new one");
+            Log("could not write %s", tmpPath.c_str());
             return;
         }
-        blobsMergedIn = existing.size();
-        for (auto& [h, b] : existing) shaderBlobs.emplace(h, std::move(b));
-        Log("merged %zu shaders from the existing bytecode sidecar", blobsMergedIn);
+        remove(finalPath.c_str());
+        if (rename(tmpPath.c_str(), finalPath.c_str()) != 0)
+            Log("could not replace %s", finalPath.c_str());
     }
 
-    static void WriteShaderBlobs()
-    {
-        if (!blobsDirty) return;
+    // Shader bytecode now lives in the same container as the keys that name it. Only
+    // shaders that actually appear in a DRAW are stored: a shader nobody draws with has
+    // no key referencing it, so its bytecode would be dead weight -- which matters
+    // here because the precompiler creates RAGE's whole 1734-shader database through
+    // this same device, and capture is normally left on while it does.
 
-        size_t bytes = 0;
-        for (auto& [h, b] : shaderBlobs) bytes += b.code.size();
-        if (!pipelinekeys::WriteShaderSidecar(ShaderSidecarPath(), shaderBlobs)) return;
 
-        blobsDirty = false;
-        Log("wrote %zu shaders (%zu KiB of bytecode) to %s",
-            shaderBlobs.size(), bytes / 1024, pipelinekeys::ShaderSidecarName());
-    }
-
-    // Count distinct keys under a reduced field set, so we can tell genuine
-    // pipeline variation apart from dynamic state that inflates the strict key.
-    static uint32_t CountReducedKeys()
-    {
-        std::vector<uint64_t> hashes;
-        hashes.reserve(records.size());
-        for (auto& r : records)
-        {
-            KeyRecord t = r;
-            for (uint32_t i = 0; i < kNumRS; i++)
-                if (!kTrackedRS[i].pipeline) t.rs[i] = 0;
-            t.upDraw = 0;
-            t.count = 0; t.firstFrame = 0;
-            hashes.push_back(fnv1a(&t, offsetof(KeyRecord, count)));
-        }
-        std::sort(hashes.begin(), hashes.end());
-        hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
-        return (uint32_t)hashes.size();
-    }
-
-    static void WriteSummary()
-    {
-        FILE* f = fopen((OutDir() + bundleTxt).c_str(), "w");
-        if (!f) return;
-
-        fprintf(f, "FusionFix D3D9 pipeline-key capture\n");
-        fprintf(f, "===================================\n\n");
-        fprintf(f, "draws recorded      : %llu\n", (unsigned long long)totalDraws);
-        fprintf(f, "frames              : %llu\n", (unsigned long long)frameOrdinal);
-        fprintf(f, "unique strict keys  : %u   (every recorded field)\n", (uint32_t)records.size());
-        fprintf(f, "unique pipeline keys: %u   (dynamic state folded out)\n", CountReducedKeys());
-        fprintf(f, "vertex declarations : %u\n", (uint32_t)declTable.size());
-
-        // distinct shader pairs, and distinct shaders
-        {
-            std::vector<uint64_t> pairs, vss, pss;
-            for (auto& r : records)
-            {
-                pairs.push_back(r.vsHash ^ (r.psHash * 1099511628211ull));
-                vss.push_back(r.vsHash);
-                pss.push_back(r.psHash);
-            }
-            auto uniq = [](std::vector<uint64_t>& v) {
-                std::sort(v.begin(), v.end());
-                v.erase(std::unique(v.begin(), v.end()), v.end());
-                return (uint32_t)v.size();
-            };
-            fprintf(f, "distinct VS         : %u\n", uniq(vss));
-            fprintf(f, "distinct PS         : %u\n", uniq(pss));
-            fprintf(f, "distinct VS/PS pairs: %u\n", uniq(pairs));
-        }
-
-        // Replay can only build a key whose shaders it can resolve, so say how many
-        // of them we are carrying the bytecode for.
-        {
-            size_t bytes = 0;
-            for (auto& [h, b] : shaderBlobs) bytes += b.code.size();
-            fprintf(f, "shader bytecode kept : %zu shaders, %zu KiB (%s)\n",
-                    shaderBlobs.size(), bytes / 1024, pipelinekeys::ShaderSidecarName());
-        }
-
-        // render-target format combinations
-        {
-            std::vector<uint64_t> combos;
-            for (auto& r : records)
-            {
-                uint64_t h = fnv1a(r.rtFmt, sizeof(r.rtFmt));
-                h = fnv1a(&r.dsFmt, sizeof(r.dsFmt), h);
-                combos.push_back(h);
-            }
-            std::sort(combos.begin(), combos.end());
-            combos.erase(std::unique(combos.begin(), combos.end()), combos.end());
-            fprintf(f, "RT/depth combos     : %u\n", (uint32_t)combos.size());
-        }
-
-        fprintf(f, "\n-- how many render states actually vary --\n");
-        for (uint32_t i = 0; i < kNumRS; i++)
-        {
-            std::vector<uint32_t> vals;
-            for (auto& r : records) vals.push_back(r.rs[i]);
-            std::sort(vals.begin(), vals.end());
-            vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
-            if (vals.size() > 1)
-            {
-                fprintf(f, "  %-26s %2u values :", kTrackedRS[i].name, (uint32_t)vals.size());
-                for (size_t v = 0; v < vals.size() && v < 12; v++) fprintf(f, " %u", vals[v]);
-                if (vals.size() > 12) fprintf(f, " ...");
-                fprintf(f, "%s\n", kTrackedRS[i].pipeline ? "" : "   [dynamic]");
-            }
-        }
-
-        fprintf(f, "\n-- top 40 keys by draw count --\n");
-        std::vector<uint32_t> order(records.size());
-        for (uint32_t i = 0; i < order.size(); i++) order[i] = i;
-        std::sort(order.begin(), order.end(), [](uint32_t a, uint32_t b) { return records[a].count > records[b].count; });
-        for (size_t i = 0; i < order.size() && i < 40; i++)
-        {
-            auto& r = records[order[i]];
-            fprintf(f, "  %8u draws  vs=%016llx ps=%016llx decl=%d fvf=%u prim=%u rt0=%u ds=%u frame=%u\n",
-                    r.count, (unsigned long long)r.vsHash, (unsigned long long)r.psHash,
-                    (int)r.declIndex, r.fvf, r.primType, r.rtFmt[0], r.dsFmt, r.firstFrame);
-        }
-
-        fprintf(f, "\n-- vertex declarations --\n");
-        for (size_t i = 0; i < declTable.size(); i++)
-        {
-            fprintf(f, "  [%zu] %zu elements:", i, declTable[i].size());
-            for (auto& e : declTable[i])
-            {
-                if (e.Stream == 0xFF) { fprintf(f, " END"); break; }
-                fprintf(f, " (s%u+%u t%u u%u%u)", e.Stream, e.Offset, e.Type, e.Usage, e.UsageIndex);
-            }
-            fprintf(f, "\n");
-        }
-
-        fclose(f);
-    }
+    // There used to be a .txt summary written alongside the cache. A contribution has
+    // to be ONE file, and every number it held (reduced key count, distinct shaders,
+    // RT/depth combos, which render states vary, the heaviest keys, the declarations)
+    // is derivable from the container by an external tool -- which is where it belongs,
+    // since that tool has to read a thousand contributions anyway.
 
     // Merge an existing cache in at startup.
     //
@@ -734,50 +671,47 @@ class ShaderCapture
             Log("no existing cache for this configuration - starting a new one");
     }
 
-    // Merge one bundle file. Returns false if it is absent or unusable, so the caller
-    // can simply try every candidate.
+    // Merge one cache file. Returns false if it is absent or unusable.
     static bool MergeBundleFile(const std::string& path, const char* label)
     {
-        FILE* f = fopen(path.c_str(), "rb");
-        if (!f) return false;
+        pipelinekeys::CacheContents c;
+        if (!pipelinekeys::ReadCache(path, c)) return false;
+
         // Records READ and keys the file actually ADDED are different numbers, and
         // only the second says whether a file was worth merging: the pre-bundle
         // contributed 11234 records and zero new keys, being a strict subset.
         const size_t uniqueBefore = records.size();
 
-        uint32_t magic = 0, version = 0, numRS = 0, numSamplers = 0, declCount = 0, recCount = 0;
-        if (fread(&magic, 4, 1, f) != 1 || magic != 0x4B504646u) { fclose(f); return false; }
-        if (fread(&version, 4, 1, f) != 1 || fread(&numRS, 4, 1, f) != 1 ||
-            fread(&numSamplers, 4, 1, f) != 1 || fread(&declCount, 4, 1, f) != 1 ||
-            fread(&recCount, 4, 1, f) != 1) { fclose(f); return false; }
-
-        // A cache recorded against a different version or state set cannot be merged
-        // field for field. Keep it rather than silently corrupting it: bail and start
-        // fresh. There is deliberately no migration path (see kVersion).
-        if (version != pipelinekeys::kVersion || numRS != kNumRS || numSamplers != kNumSamplers)
+        // A cache recorded against a different state set cannot be merged field for
+        // field. Keep it rather than silently corrupting it: bail and start fresh.
+        // There is deliberately no migration path (see kVersion).
+        if (c.meta.numRS != kNumRS || c.meta.numSamplers != kNumSamplers ||
+            c.rsTypes.size() != kNumRS)
         {
-            Log("%s is v%u tracking %u states / %u samplers (this build: v%u, %u / %u) - not merging",
-                label, version, numRS, numSamplers, pipelinekeys::kVersion, kNumRS, kNumSamplers);
-            fclose(f);
+            Log("%s tracks %u states / %u samplers (this build: %u / %u) - not merging",
+                label, c.meta.numRS, c.meta.numSamplers, kNumRS, kNumSamplers);
+            return false;
+        }
+        for (uint32_t i = 0; i < kNumRS; i++)
+            if (c.rsTypes[i] != (uint32_t)kTrackedRS[i].rs) return false;
+
+        // A capture from a different shader directory names shaders this install will
+        // never create, so its keys are noise here. This is the check that keeps a
+        // pooled cache honest; see the container comment in pipelinekeys.h.
+        if (!c.strings[pipelinekeys::kMetaShaderDir].empty() &&
+            c.strings[pipelinekeys::kMetaShaderDir] != metaShaderDir)
+        {
+            Log("%s was captured against shader dir '%s', this install uses '%s' - not merging",
+                label, c.strings[pipelinekeys::kMetaShaderDir].c_str(), metaShaderDir.c_str());
             return false;
         }
 
-        std::vector<uint32_t> rsTypes(numRS);
-        if (fread(rsTypes.data(), 4, numRS, f) != numRS) { fclose(f); return false; }
-        for (uint32_t i = 0; i < numRS; i++)
-            if (rsTypes[i] != (uint32_t)kTrackedRS[i].rs) { fclose(f); return false; }
-
         // Declaration indices are file-local, so they must be remapped into our
         // table before a record's key is hashed -- declIndex is part of the key.
-        std::vector<uint32_t> remap(declCount, 0);
-        for (uint32_t i = 0; i < declCount; i++)
+        std::vector<uint32_t> remap(c.decls.size(), 0);
+        for (size_t i = 0; i < c.decls.size(); i++)
         {
-            uint32_t n = 0;
-            if (fread(&n, 4, 1, f) != 1 || n == 0 || n > MAXD3DDECLLENGTH + 1) { fclose(f); return false; }
-            std::vector<D3DVERTEXELEMENT9> elems(n);
-            if (fread(elems.data(), sizeof(D3DVERTEXELEMENT9), n, f) != n) { fclose(f); return false; }
-
-            uint64_t h = fnv1a(elems.data(), elems.size() * sizeof(D3DVERTEXELEMENT9));
+            uint64_t h = fnv1a(c.decls[i].data(), c.decls[i].size() * sizeof(D3DVERTEXELEMENT9));
             auto it = declIndexByHash.find(h);
             if (it != declIndexByHash.end())
             {
@@ -787,18 +721,16 @@ class ShaderCapture
             {
                 remap[i] = (uint32_t)declTable.size();
                 declIndexByHash.emplace(h, remap[i]);
-                declTable.push_back(std::move(elems));
+                declTable.push_back(c.decls[i]);
             }
         }
 
-        for (uint32_t i = 0; i < recCount; i++)
+        for (auto& rec : c.keys)
         {
-            KeyRecord k{};
-            if (fread(&k, sizeof(k), 1, f) != 1)
-                break;   // short file: keep what is whole
+            KeyRecord k = rec;
             if (k.declIndex != 0xFFFFFFFFu)
             {
-                if (k.declIndex >= declCount) continue;
+                if (k.declIndex >= remap.size()) continue;
                 k.declIndex = remap[k.declIndex];
             }
 
@@ -820,9 +752,14 @@ class ShaderCapture
             }
             mergedIn++;
         }
-        fclose(f);
 
-        Log("  %s: %u records read, %zu keys new", label, recCount, records.size() - uniqueBefore);
+        // The bytecode travels in the same file as the keys that name it, so a
+        // contribution can never arrive with keys whose shaders are missing.
+        for (auto& [h, b] : c.shaders)
+            if (shaderBlobs.emplace(h, b).second) blobsMergedIn++;
+
+        Log("  %s: %zu records read, %zu keys new, %zu shaders",
+            label, c.keys.size(), records.size() - uniqueBefore, c.shaders.size());
         return true;
     }
 
@@ -837,9 +774,8 @@ class ShaderCapture
         // Writing walks the same tables RecordDraw mutates, and runs on a different
         // thread (EndScene) than the loading-screen draws.
         if (lockReady) EnterCriticalSection(&lock);
-        WriteBinary();
-        WriteSummary();
-        WriteShaderBlobs();
+        WriteCacheFile();
+        blobsDirty = false;
         if (lockReady) LeaveCriticalSection(&lock);
 
         tLastFlush = now;
