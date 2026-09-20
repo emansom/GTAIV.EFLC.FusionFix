@@ -36,12 +36,27 @@ module;
 // wait follows it; only then does the loading screen go (see WaitUntilIdle,
 // HoldForVulkanReplay). No dxvk.conf change is required or made.
 //
-// INTEGRATION (W2): a FusionFix ASI module. Injection anchor is the render-thread
-// per-frame loading-screen render function FUN_005cc760 (GTA IV 1.2.0.59), found
-// by Ghidra: it runs on the render thread, only while bLoadscreenShown, after the
-// device+swapchain are created and before any gameplay scene render. On its first
-// call we run the whole (blocking) precompile there, driving our own Clear +
-// overlay + Present frames, then hand the loading screen back untouched.
+// WHERE IT RUNS (rewritten; the old anchor is now the fail-safe). The gate is the
+// RETURN of rageBoot_InitSession 0x005C1360 -- main thread, once per session
+// start, AFTER the main menu and the episode/DLC menu, with the game's own
+// loading screen up and one instruction before the call that would take it down.
+// That is the first point in the boot cycle at which RAGE's render phases and
+// targets can be read at all (08-boot-gate.md: the engine builds them 0.7 s AFTER
+// it tears the loading screen down, so no loading screen ever has them -- but the
+// viewport tick's own guard lets a mod ask for them early and the engine then
+// skips its own build). The old anchor, the first loading-screen render, is the
+// LEGALS screen at t+2.2 s, before CGame_InitSystems has finished; it is kept
+// only as the fail-safe for a build whose addresses do not validate.
+//
+// HOW IT SHARES THE THREAD. While a loading screen is up a dedicated thread
+// free-runs it at ~7 kHz through FUN_005cc760. Blocking that thread freezes the
+// artwork, so the pass runs in SLICES on a FIBER of it: the engine draws its
+// frame, we take a few milliseconds, we give it back. The game's own loading
+// screen keeps animating, our progress bar and text are drawn INTO its frame with
+// its own primitive (bootgate.h), and there is no backdrop, no blur and no
+// Present of ours anywhere. Every slice is bracketed by a full device state save
+// and restore, because RAGE's device wrapper filters redundant sets and would
+// otherwise hand the engine's own draws our leftovers.
 // ===========================================================================
 
 #include <common.hxx>
@@ -121,6 +136,11 @@ struct PrecompileConfig
     // baseline. Off for players -- it costs a file write and they have nothing to
     // contribute that their own capture does not already hold.
     bool    exportBaseline = false; // PrecompileExportBaseline
+    bool    emitLog       = false;  // PrecompileEmitLog: write every emitted identity for the scorer
+    int     sliceMs       = 8;      // PrecompileSliceMs: warm work per loading-screen frame
+    int     gateMaxSeconds = 0;     // PrecompileGateMaxSeconds: 0 = hold until the pass is done
+    bool    reuseStamp    = true;   // PrecompileReuseWarmCache
+    int     reflectionMsaa = 0;     // EXPERIMENTAL/ReflectionMSAAQuality, read for the sample count
     // The engine walk (enginewarm.h). 0 = off, 1 = the tied coordinate, 2 = the
     // tied coordinate plus the secondary ones. Everything it enumerates comes
     // from RAGE's own live tables, so it needs no recording at all -- see the
@@ -878,9 +898,14 @@ class ShaderPrecompiler
                 if (pp.BackBufferFormat) bbFmt = pp.BackBufferFormat;
             }
             IDirect3DSurface9* bb = nullptr;
-            if (SUCCEEDED(sc->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb)
+            // NO BACKDROP AT THE BOOT GATE. The game's own loading screen is up
+            // and its own thread keeps drawing it, animated, for as long as the
+            // pass runs; snapshotting a frame and compositing over it is
+            // exactly the hijack this round exists to remove. The progress bar
+            // is drawn INTO the engine's frame instead (bootgate::DrawProgress).
+            if (!gateFromBoot &&
+                SUCCEEDED(sc->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb)
             {
-                // Snapshot the current loading-screen frame to composite our bar over.
                 if (SUCCEEDED(dev->CreateRenderTarget(bbW, bbH, bbFmt, D3DMULTISAMPLE_NONE, 0, FALSE, &backdrop, nullptr)) && backdrop)
                     dev->StretchRect(bb, nullptr, backdrop, nullptr, D3DTEXF_NONE);
                 bb->Release();
@@ -888,7 +913,7 @@ class ShaderPrecompiler
             sc->Release();
         }
 
-        if (cfg.overlay)
+        if (cfg.overlay && !gateFromBoot)
         {
             D3DXCreateFontW(dev, 22, 0, FW_NORMAL, 1, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial", &font);
@@ -1072,8 +1097,21 @@ class ShaderPrecompiler
 
     static inline uint32_t overlayBaseRebuilds = 0;
 
-    // Present a progress frame (throttled). frac in [0,1].
+    // Where the pass asks for a frame.
+    //
+    // On the boot gate there is nothing to present: the game's own loading
+    // screen is up and its own thread is drawing it, so the right thing to do
+    // is hand that thread back and let it. Everywhere else -- the fail-safe
+    // loading-screen gate, and any build where fibers are unavailable -- the
+    // pass presents its own frame exactly as it always did.
     static void PresentOverlay(bool force)
+    {
+        if (passFiber) { YieldToLoadscreen(force); return; }
+        PresentOwnOverlay(force);
+    }
+
+    // Present a progress frame of our own (throttled). frac in [0,1].
+    static void PresentOwnOverlay(bool force)
     {
         // Always pump — keeps the window alive even on throttled (skipped) frames.
         PumpMessages();
@@ -2887,11 +2925,13 @@ class ShaderPrecompiler
         int level;
         enginewarm::Plan* out;
         D3DFORMAT backBuffer;
+        const std::vector<bootgate::PhaseSet>* phases;
+        const std::vector<bootgate::Target>*   registry;
     };
     static void DoBuildTables(void* a)
     {
         auto* b = static_cast<BuildArgs*>(a);
-        enginewarm::BuildTables(*b->out, b->db, b->backBuffer);
+        enginewarm::BuildTables(*b->out, b->db, *b->phases, *b->registry, b->backBuffer);
     }
     static void DoBuildJobs(void* a)
     {
@@ -2926,6 +2966,11 @@ class ShaderPrecompiler
             dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + i, nullptr);
     }
 
+    // A phase callback pushes exactly this much that DXVK can bake: the four
+    // write masks, blending on or off, alpha test on or off. The blend
+    // FACTORS stay where the engine's default block put them, because that is
+    // where they come from in gameplay -- the callbacks do not touch them and
+    // the pass's own delta does (enginewarm::ResolveRS).
     static void ApplyStateVec(const enginewarm::StateVec& v)
     {
         dev->SetRenderState(D3DRS_COLORWRITEENABLE,  v.cwe[0]);
@@ -2933,12 +2978,7 @@ class ShaderPrecompiler
         dev->SetRenderState(D3DRS_COLORWRITEENABLE2, v.cwe[2]);
         dev->SetRenderState(D3DRS_COLORWRITEENABLE3, v.cwe[3]);
         dev->SetRenderState(D3DRS_ALPHABLENDENABLE, v.blendEnable);
-        dev->SetRenderState(D3DRS_SRCBLEND, v.srcBlend);
-        dev->SetRenderState(D3DRS_DESTBLEND, v.dstBlend);
-        dev->SetRenderState(D3DRS_BLENDOP, v.blendOp);
-        dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
         dev->SetRenderState(D3DRS_ALPHATESTENABLE, v.alphaTest);
-        dev->SetRenderState(D3DRS_ZWRITEENABLE, v.zWrite);
     }
 
     // References taken on the engine's own shader objects for the duration of
@@ -2975,7 +3015,8 @@ class ShaderPrecompiler
         struct Info
         {
             std::vector<std::pair<uint8_t, uint8_t>> sig;
-            uint8_t dim[16]{};
+            uint8_t  dim[16]{};
+            uint64_t hash = 0;
             bool ok = false;
         };
         std::unordered_map<void*, Info> byObj;
@@ -2995,9 +3036,18 @@ class ShaderPrecompiler
                 read++;
                 ShaderIO io{};
                 ParseShaderIO(buf.data(), size, isVS, io);
+                // The bytecode hash is the name every recorded key and the
+                // containment scorer know a shader by, so the emission log can
+                // be joined to either without a .fxc lookup.
+                info.hash = pipelinekeys::Fnv1a(buf.data(), size);
                 if (isVS)
                 {
                     for (auto& in : io.inputs) info.sig.push_back({ in.usage, in.index });
+                    // A vertex shader declares s0..s3, which are
+                    // D3DVERTEXTEXTURESAMPLER0..3 and are the low byte of
+                    // DXVK's specialization constant 3.
+                    for (int s = 0; s < 4; s++)
+                        info.dim[s] = io.usesSampler[s] ? (io.samplerDim[s] ? io.samplerDim[s] : 2) : 0;
                     auto* sh = static_cast<IDirect3DVertexShader9*>(obj);
                     sh->AddRef();
                     engineShaderRefs.push_back(sh);
@@ -3022,8 +3072,10 @@ class ShaderPrecompiler
             const Info* v = resolve(pass.vs, true);
             if (!v) { pass.vs = nullptr; continue; }
             pass.sig = v->sig;
+            pass.vsHash = v->hash;
+            memcpy(pass.vsDim, v->dim, sizeof(pass.vsDim));
             const Info* p = resolve(pass.ps, false);
-            if (p) memcpy(pass.psDim, p->dim, sizeof(pass.psDim));
+            if (p) { memcpy(pass.psDim, p->dim, sizeof(pass.psDim)); pass.psHash = p->hash; }
             else   pass.ps = nullptr;        // no bytecode, no binding
         }
         const size_t before = plan.passes.size();
@@ -3082,7 +3134,27 @@ class ShaderPrecompiler
 
         dev->SetVertexShader(pass.vs);
         dev->SetPixelShader(pass.ps);
-        BindSamplersDim(pass.psDim);
+        // The material's binding pattern: every declared slot, or one of them
+        // left null, or none of them. It is the axis the engine cannot answer
+        // -- which of the slots a shader declares actually receives a texture
+        // is decided by the .wtd a model references -- and it is the residue
+        // the render-target axis is not (10-key-spec.md §7).
+        {
+            uint8_t dim[16];
+            memcpy(dim, pass.psDim, sizeof(dim));
+            if (j.psVariant == enginewarm::kPSV_NoneBound) memset(dim, 0, sizeof(dim));
+            else if (j.psVariant != enginewarm::kPSV_AllBound) dim[j.psVariant - 1] = 0;
+            BindSamplersDim(dim);
+        }
+        for (int s = 0; s < 4; s++)
+        {
+            IDirect3DBaseTexture9* t = nullptr;
+            if ((j.flags & enginewarm::kJF_VSSampler) && pass.vsDim[s])
+                t = (pass.vsDim[s] == 3) ? (IDirect3DBaseTexture9*)texCube
+                  : (pass.vsDim[s] == 4) ? (IDirect3DBaseTexture9*)texVol
+                                         : (IDirect3DBaseTexture9*)tex2D;
+            dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + s, t);
+        }
 
         // Phase vector, then the pass's own delta: the order gameplay uses.
         ApplyStateVec(SV);
@@ -3093,12 +3165,20 @@ class ShaderPrecompiler
             if (key < enginewarm::kRageStates && enginewarm::RSReaches(plan.stateToRS[key]))
                 dev->SetRenderState((D3DRENDERSTATETYPE)plan.stateToRS[key], val);
         }
-        if (j.flags & enginewarm::kJF_AlphaTest) dev->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
-        if (j.flags & enginewarm::kJF_ClipPlane) dev->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
+        // DXVK counts the clip planes that are ENABLED **and non-zero**
+        // (UpdateClipPlanes, d3d9_device.cpp:6107), so setting the enable
+        // without a plane equation produces count 0 and warms the wrong
+        // pipeline. The equation has to be real.
+        if (j.flags & enginewarm::kJF_ClipPlane)
+        {
+            static const float kPlane[4] = { 0.0f, 1.0f, 0.0f, 0.0f };
+            dev->SetClipPlane(0, kPlane);
+            dev->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
+        }
 
         static const D3DPRIMITIVETYPE kTopo[3] =
             { D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DPT_TRIANGLEFAN };
-        const uint32_t ti = (j.flags & enginewarm::kJF_TopoMask) >> enginewarm::kJF_TopoShift;
+        const uint32_t ti = j.flags & enginewarm::kJF_TopoMask;
         d->failed = FAILED(dev->DrawIndexedPrimitive(kTopo[ti < 3 ? ti : 0], 0, 0, 3, 0, 1));
 
         // grcEffectPass::RestoreState: put the pass's own keys back to the
@@ -3109,55 +3189,133 @@ class ShaderPrecompiler
             if (key < enginewarm::kRageStates && enginewarm::RSReaches(plan.stateToRS[key]))
                 dev->SetRenderState((D3DRENDERSTATETYPE)plan.stateToRS[key], plan.defaultRS[key]);
         }
-        if (j.flags & enginewarm::kJF_ClipPlane) dev->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+        if (j.flags & enginewarm::kJF_ClipPlane)
+        {
+            static const float kZero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            dev->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+            dev->SetClipPlane(0, kZero);
+        }
         if (D.instanced) { dev->SetStreamSourceFreq(0, 1); dev->SetStreamSourceFreq(1, 1); }
+    }
+
+    // -------------------------------------------------------------------
+    //  Don't redo the long pass when nothing has changed.
+    //
+    //  The expensive half of this feature is not the draws, it is the driver
+    //  compiles behind them, and those land in the driver's OWN on-disk cache
+    //  and survive the session. So: write down what was enumerated and on what
+    //  rig; on a later launch, if all of that still matches, check whether the
+    //  driver still has them -- by drawing a small sample and counting how many
+    //  of the pipelines behind it took the driver >= 5 ms. A warm driver cache
+    //  answers in microseconds. That is a measurement of the thing that
+    //  matters rather than a guess about a file on disk.
+    // -------------------------------------------------------------------
+    struct WarmStamp
+    {
+        uint32_t version = 2;
+        uint64_t enumeration = 0;   // level + contexts + every identity emitted
+        uint64_t rig = 0;           // adapter, Vulkan driver, DXVK build, back buffer, MSAA
+        uint64_t shaders = 0;       // the install's .fxc set
+        uint32_t jobs = 0;
+        uint32_t pipelines = 0;     // creations the pass caused last time
+    };
+
+    static std::string StampPath() { return ModuleDir() + "FusionFix.enginewarm.stamp"; }
+
+    static bool ReadStamp(WarmStamp& s)
+    {
+        FILE* f = nullptr;
+        if (fopen_s(&f, StampPath().c_str(), "rb") != 0 || !f) return false;
+        WarmStamp in{};
+        const size_t n = fread(&in, 1, sizeof(in), f);
+        fclose(f);
+        if (n != sizeof(in) || in.version != s.version) return false;
+        const uint32_t want = s.version;
+        s = in;
+        s.version = want;
+        return true;
+    }
+
+    static void WriteStamp(const WarmStamp& s)
+    {
+        FILE* f = nullptr;
+        if (fopen_s(&f, StampPath().c_str(), "wb") != 0 || !f) return;
+        fwrite(&s, 1, sizeof(s), f);
+        fclose(f);
+    }
+
+    // Everything outside the enumeration that decides whether a pipeline the
+    // pass built is still usable: the adapter, the Vulkan driver that compiled
+    // it, the exact DXVK build that produced the SPIR-V and the state, the
+    // back-buffer format and the one option that changes the sample count.
+    static uint64_t RigFingerprint()
+    {
+        // NOT the level: that is part of the enumeration, and counting it here
+        // too would make the log say the rig changed when only the setting did.
+        uint64_t h = pipelinekeys::Fnv1a(&bbFmt, sizeof(bbFmt));
+        h = pipelinekeys::Fnv1a(&cfg.reflectionMsaa, sizeof(cfg.reflectionMsaa), h);
+
+        IDirect3D9* d3d = nullptr;
+        if (dev && SUCCEEDED(dev->GetDirect3D(&d3d)) && d3d)
+        {
+            D3DADAPTER_IDENTIFIER9 id{};
+            if (SUCCEEDED(d3d->GetAdapterIdentifier(D3DADAPTER_DEFAULT, 0, &id)))
+            {
+                h = pipelinekeys::Fnv1a(id.Description, strnlen(id.Description, sizeof(id.Description)), h);
+                h = pipelinekeys::Fnv1a(&id.VendorId, sizeof(id.VendorId), h);
+                h = pipelinekeys::Fnv1a(&id.DeviceId, sizeof(id.DeviceId), h);
+            }
+            d3d->Release();
+        }
+        FusionFixDxvkInfo dxvk{};
+        if (dev && FusionFixQueryDxvk(dev, &dxvk) && dxvk.haveDriver)
+        {
+            h = pipelinekeys::Fnv1a(dxvk.driverName, strlen(dxvk.driverName), h);
+            h = pipelinekeys::Fnv1a(dxvk.driverInfo, strlen(dxvk.driverInfo), h);
+        }
+        // The DXVK build: its SPIR-V and its pipeline state change between
+        // builds, so a pipeline warmed by one is not one the next can use.
+        const std::string build = dev ? FusionFixDxvkBuild(dev) : std::string();
+        if (!build.empty()) h = pipelinekeys::Fnv1a(build.data(), build.size(), h);
+        return h;
+    }
+
+    static uint64_t ShaderSetFingerprint()
+    {
+        std::vector<uint64_t> all(pipelinekeys::InstalledFxcHashes().begin(),
+                                  pipelinekeys::InstalledFxcHashes().end());
+        std::sort(all.begin(), all.end());
+        return all.empty() ? 0 : pipelinekeys::Fnv1a(all.data(), all.size() * sizeof(uint64_t));
     }
 
     static void EngineWarmPass(fxc_db* db)
     {
         using namespace enginewarm;
 
-        // Wait, briefly, for RAGE to build its render phases.
-        //
-        // MEASURED, and it is the one thing about this design that did not go
-        // as the research predicted. 06-phases found 29 phases with every
-        // render target already created on the startup loading screen, and
-        // built the whole render-target axis on reading them. But its probe
-        // attached about thirty seconds in; FusionFix's gate fires about three
-        // seconds in, and there the phase list is EMPTY and exactly one named
-        // target exists. Holding the loading screen for a further twenty
-        // seconds did not change that (live: "0 render phases after waiting
-        // 20000 ms"), so phase creation is not merely late, it is behind
-        // something this gate is in front of.
-        //
-        // So the probe is kept short -- long enough to win if creation happens
-        // to be about to run, not long enough to cost loading time for nothing
-        // -- and the render-target axis falls back to the shipped sets, which
-        // the log labels 'shipped' rather than passing them off as engine
-        // reads. Moving the gate later would get the real thing; that is a
-        // bigger change than this one and it is written up, not attempted.
-        curLabel = "waiting for the engine's render phases";
-        const auto tPhaseWait = std::chrono::steady_clock::now();
-        auto waitedMs = [&] {
-            return (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-                       std::chrono::steady_clock::now() - tPhaseWait).count();
-        };
-        while (enginewarm::PhaseCount() == 0 && waitedMs() < 2000 && !BudgetSpent())
-        {
-            PresentOverlay(false);
-            Sleep(5);
-        }
-        const uint32_t phaseWaitMs = waitedMs();
-        const uint16_t phasesNow = enginewarm::PhaseCount();
-        Log("engine: %u render phases after waiting %u ms for the engine to build them",
-            phasesNow, phaseWaitMs);
+        // The render phases and the target registry, as the boot gate read
+        // them. They are not probed for here: at the gate the engine has
+        // already been asked to build its phases and it has, synchronously,
+        // with its own code (bootgate::BuildRenderPhases). If this pass is
+        // running from the legacy loading-screen gate instead -- the fail-safe
+        // -- both are empty, the shipped stand-ins fire, and the log says so.
+        Log("engine: %zu target-bearing render phases and %zu registry targets from the %s",
+            gatePhases.size(), gateTargets.size(),
+            gateFromBoot ? "boot gate" : "FALLBACK gate (no engine contexts: the stand-in "
+                                         "table will be used and every set it supplies is "
+                                         "marked 'shipped' below)");
 
         // The enumeration reads engine memory through Readable() checks, but a
         // build this does not know could still put a bad pointer where a table
         // belongs. Contain a fault here rather than losing the whole pass.
-        BuildArgs args{ db, cfg.engineWarm, nullptr, bbFmt };
+        BuildArgs args{ db, cfg.engineWarm, nullptr, bbFmt, &gatePhases, &gateTargets };
         Plan plan;
         args.out = &plan;
+        // The sample count cannot be read from a render target at this gate --
+        // there is no D3D texture behind one yet -- and it IS in the pipeline
+        // key. It comes from the option that puts one there.
+        plan.msType = (uint32_t)cfg.reflectionMsaa;
+        plan.msQuality = 0;
+        plan.keepKeys = cfg.emitLog;
         if (!GuardedCall(&DoBuildTables, &args))
         {
             curLabel.clear();
@@ -3196,11 +3354,12 @@ class ShaderPrecompiler
             return;
         }
 
-        // Only now, with a plan that will actually draw, is the backdrop
-        // softened: blurring it before the fail-safe has had its say left the
-        // loading screen soft for the rest of the load with nothing running
-        // behind it, which happened on the very first live run of this feature.
-        BlurBackdrop();
+        // On the FALLBACK gate the pass still composites over a snapshot of the
+        // loading screen, and softening it is what says "this is not the game
+        // yet" while the game's own shaders are drawn behind it. On the boot
+        // gate there is no snapshot to soften: the engine is drawing its real
+        // loading screen the whole time.
+        if (!gateFromBoot) BlurBackdrop();
 
         const Census& c = plan.census;
         Log("engine: enumerated %u effects (%u joined to .fxc), %u techniques (%u named: "
@@ -3210,17 +3369,23 @@ class ShaderPrecompiler
         Log("engine: read %u of %u distinct shader objects with GetFunction "
             "(%u refused, %u passes dropped for it)",
             c.shaderRead, c.shaderObjects, c.shaderFailed, c.passesDropped);
-        Log("engine: %u render phases declare %u targets, %u more named targets read directly -> "
-            "%zu distinct render-target/depth/sample sets (%u from phases, %u derived single-colour, "
-            "%u shipped fallback)",
-            c.phases, c.phaseTargets, c.namedTargets, plan.contexts.size(),
-            c.contextsFromPhases, c.contextsDerived, c.contextsShipped);
+        Log("engine: passes by group: deferred %u, deferredbs %u, deferredalphaclip %u, "
+            "forward %u, named %u",
+            c.groupPasses[kG_Deferred], c.groupPasses[kG_DeferredBS], c.groupPasses[kG_DeferredClip],
+            c.groupPasses[kG_Forward], c.groupPasses[kG_Named]);
+        Log("engine: %u render phases bind %u targets; the factory registry holds %u targets "
+            "(%u with a live texture) -> %zu contexts (%u from phases, %u from the registry, "
+            "%u SHIPPED STAND-IN)",
+            c.phases, c.phaseTargets, c.registryTargets, c.registryTextured, plan.contexts.size(),
+            c.contextsFromPhases, c.contextsFromRegistry, c.contextsShipped);
         for (size_t i = 0; i < plan.contexts.size(); i++)
         {
             const Context& x = plan.contexts[i];
-            Log("engine:   set %zu '%s': %u colour (%u/%u/%u/%u) depth %u samples %u",
-                i, x.name.c_str(), x.mrt, (uint32_t)x.color[0], (uint32_t)x.color[1],
-                (uint32_t)x.color[2], (uint32_t)x.color[3], (uint32_t)x.depth, x.msType);
+            Log("engine:   ctx %zu %-12s %-14s %u colour (%u/%u/%u/%u) depth %u samples %u%s",
+                i, KindName(x.kind), x.name.c_str(), x.mrt,
+                (uint32_t)x.color[0], (uint32_t)x.color[1], (uint32_t)x.color[2],
+                (uint32_t)x.color[3], (uint32_t)x.depth, x.msType,
+                x.fromEngine ? "" : "   <- SHIPPED, not read from the engine");
         }
         Log("engine: %u vertex declarations (%u shipped, %u from the live registry which holds %u), "
             "%u state vectors, mean %.2f declaration projections per pass",
@@ -3228,8 +3393,23 @@ class ShaderPrecompiler
             (uint32_t)kSV_Count, c.projectionsPerPass100 / 100.0);
         const char* capped = c.jobsCapped ? ", STOPPED AT THE JOB CAP - raise it or lower the level"
                                           : "";
-        Log("engine: %u jobs after dedup (%u collapsed onto an identity already emitted%s), level %d",
-            c.jobsEmitted, c.jobsDeduped, capped, cfg.engineWarm);
+        Log("engine: level %d emits %u jobs after dedup (%u collapsed onto an identity already "
+            "emitted%s)", cfg.engineWarm, c.jobsEmitted, c.jobsDeduped, capped);
+        // What the enumeration VARIES, per axis of the DXVK pipeline key, said
+        // before a single draw is issued. An axis at 1 is an axis this level
+        // does not reach at all, which is the thing worth seeing in a log.
+        Log("engine: per axis: vs+ps %u, proj %u, rt %u, blend %u, prim %u, spec0 %u, "
+            "psTypes %u, vsTypes %u, clip %u",
+            c.axisShaders, c.axisProj, c.axisRT, c.axisBlend, c.axisPrim,
+            c.axisSpec0, c.axisPSTypes, c.axisVSTypes, c.axisClip);
+
+        if (cfg.emitLog)
+        {
+            const std::string path = ModuleDir() + "FusionFix.enginewarm.emitted.jsonl";
+            Log("engine: emission log -> %s (%s)", path.c_str(),
+                enginewarm::WriteEmissionLog(plan, path, cfg.engineWarm)
+                    ? "written" : "COULD NOT BE WRITTEN");
+        }
 
         // The declarations, on the real device. The element bytes are what
         // DXVK keys on, so an object we create is the same pipeline as one the
@@ -3271,14 +3451,40 @@ class ShaderPrecompiler
         bool stopped = false;
         const char* stopWhy = "";
 
+        // Which path this launch takes, and why -- see WarmStamp. The probe is
+        // the first `probeN` jobs of the plan, which are its highest-ranked
+        // ones, so a cold driver cache is caught on the work that matters most.
+        WarmStamp stamp{};
+        const bool stampRead = cfg.reuseStamp && ReadStamp(stamp);
+        const uint64_t fpEnum = EnumerationFingerprint(plan, cfg.engineWarm);
+        const uint64_t fpRig = RigFingerprint(), fpShaders = ShaderSetFingerprint();
+        const bool stampMatches = stampRead && stamp.enumeration == fpEnum &&
+                                  stamp.rig == fpRig && stamp.shaders == fpShaders;
+        const size_t probeN = stampMatches ? (std::min)((size_t)512, plan.jobs.size()) : 0;
+        const uint32_t compiles0 = pipelinekeys::VulkanReplay().compiles.load();
+        bool skippedWarm = false;
+        if (!stampRead)
+            Log("engine: no warm stamp beside the ASI - this is the full pass");
+        else if (!stampMatches)
+            Log("engine: the warm stamp does not match (enumeration %s, rig %s, shader set %s) "
+                "- this is the full pass",
+                stamp.enumeration == fpEnum ? "same" : "CHANGED",
+                stamp.rig == fpRig ? "same" : "CHANGED",
+                stamp.shaders == fpShaders ? "same" : "CHANGED");
+        else
+            Log("engine: the warm stamp matches (%u jobs, %u pipelines last time) - sampling "
+                "%zu jobs to see whether the driver still has them",
+                stamp.jobs, stamp.pipelines, probeN);
+
         // The overlay establishes its own render state to get a 2D quad on the
         // screen (SetOverlayState), so any iteration that presented a frame has
         // left the device somewhere other than RAGE's default block. Put it
         // back exactly then, rather than paying 48 SetRenderState calls per job.
         uint32_t framesAtBase = overlayFrames;
 
-        for (const Job& j : plan.jobs)
+        for (size_t ji = 0; ji < plan.jobs.size(); ji++)
         {
+            const Job& j = plan.jobs[ji];
             if (overlayFrames != framesAtBase) { ApplyDefaultBlock(plan); framesAtBase = overlayFrames; }
 
             const Context& C = plan.contexts[j.ctx];
@@ -3340,10 +3546,36 @@ class ShaderPrecompiler
                     break;
                 }
             }
-            if (cfg.budgetSeconds > 0 && BudgetSpent())
+            if (BudgetSpent())
             {
-                stopped = true; stopWhy = " [PrecompileBudgetSeconds reached]";
+                stopped = true;
+                stopWhy = gateAbort.load() ? " [the gate asked the pass to stop]"
+                                           : " [PrecompileBudgetSeconds reached]";
                 break;
+            }
+            // The cheap path. A fence first, so every pipeline the sample
+            // needed has been created -- with graphics pipeline libraries off
+            // DXVK builds them on its CS thread as the draws execute, and a
+            // drained event query is exactly the point at which that is done.
+            if (probeN && ji + 1 == probeN)
+            {
+                if (sinceFence) { FenceChunk(fence); workDone += sinceFence; sinceFence = 0; }
+                else FenceChunk(fence);
+                const uint32_t made = pipelinekeys::VulkanReplay().compiles.load() - compiles0;
+                const bool warm = made * 20 <= (uint32_t)probeN;
+                Log("engine: probe drew %zu of %zu jobs; the driver compiled %u of them >= 5 ms "
+                    "-> its cache is %s. %s",
+                    probeN, plan.jobs.size(), made, warm ? "WARM" : "COLD",
+                    warm ? "Skipping the rest: everything this enumeration builds is already on "
+                           "disk and nothing would be compiled."
+                         : "Running the whole pass.");
+                if (warm)
+                {
+                    skippedWarm = true;
+                    stopped = true;
+                    stopWhy = " [driver cache already warm, stamp matched]";
+                    break;
+                }
             }
             PresentOverlay(false);
         }
@@ -3376,6 +3608,26 @@ class ShaderPrecompiler
             "%u no declaration)",
             drawn, plan.jobs.size(), (long long)(elapsedMs() / 1000), stopWhy,
             failedDraw, faulted, skippedRT, skippedDecl);
+        Log("engine: PATH = %s", skippedWarm
+                ? "CHEAP - the stamp matched and the driver cache is warm"
+                : (stampMatches ? "FULL - the stamp matched but the driver cache had gone cold"
+                                : "FULL - first run of this enumeration on this rig"));
+
+        // Only a pass that went all the way through gets to say it is done.
+        // A stopped one would otherwise let the next launch take the cheap
+        // path over a plan it never finished.
+        if (!stopped || skippedWarm)
+        {
+            WarmStamp out{};
+            out.enumeration = fpEnum;
+            out.rig = fpRig;
+            out.shaders = fpShaders;
+            out.jobs = (uint32_t)plan.jobs.size();
+            out.pipelines = skippedWarm
+                ? stamp.pipelines
+                : pipelinekeys::VulkanReplay().creations.load();
+            WriteStamp(out);
+        }
         {
             std::string per = "engine: per render-target set:";
             for (size_t i = 0; i < plan.contexts.size() && i < 16; i++)
@@ -3398,8 +3650,13 @@ class ShaderPrecompiler
     //  Completion gate (W4) — nothing may still be compiling when the loading
     //  screen goes.
     // -------------------------------------------------------------------
+    // Also the abort: every loop in the pass already asks this before it
+    // carries on, so wiring the gate's "stop now" into it is what makes the
+    // pass unwind from wherever it is rather than being left on a fiber
+    // nothing will schedule again.
     static bool BudgetSpent()
     {
+        if (gateAbort.load()) return true;
         return cfg.budgetSeconds > 0 && std::chrono::steady_clock::now() - tStart > std::chrono::seconds(cfg.budgetSeconds);
     }
 
@@ -3465,7 +3722,12 @@ class ShaderPrecompiler
             most = (std::max)(most, inFlight);
             const int64_t quietFor = inFlight > 0 ? 0 : now - (std::max)(vr.lastActivityUs.load(), cpuAt);
             if (quietFor >= kSettleUs) break;
-            if (BudgetSpent()) { ended = "stopped by PrecompileBudgetSeconds"; break; }
+            if (BudgetSpent())
+            {
+                ended = gateAbort.load() ? "stopped by PrecompileGateMaxSeconds"
+                                         : "stopped by PrecompileBudgetSeconds";
+                break;
+            }
             if (now - d0 >= kGiveUpUs) { ended = "NOT quiet, gave up"; break; }
 
             // The bar fills as the quiet second does, and starts over whenever DXVK
@@ -3488,7 +3750,7 @@ class ShaderPrecompiler
                 curLabel = text;
             }
             PresentOverlay(false);
-            Sleep(5);
+            PassSleep(5);
         }
         const int64_t end = pipelinekeys::ClockUs(), last = vr.lastActivityUs.load();
         Log("wait after %s: %s at t=%.3f after %.2fs (GPU drain %.2fs) - DXVK started %u creations (at most %d at once), "
@@ -3553,7 +3815,7 @@ class ShaderPrecompiler
                 curLabel = label;
             }
             PresentOverlay(false);
-            Sleep(5);
+            PassSleep(5);
         }
         vr.holding = false;
         Log("held the loading screen %.1fs for the Vulkan replay (%u of %u entries), t=%.3f%s",
@@ -3593,6 +3855,371 @@ class ShaderPrecompiler
         // the compiled stage libraries persist for the whole session.
     }
 
+    // ===================================================================
+    //  THE BOOT GATE
+    //
+    //  WHERE. The return of rageBoot_InitSession 0x005C1360: main thread,
+    //  once per session start, after the frontend AND the episode/DLC flow,
+    //  with the game's own loading screen up, and one instruction before the
+    //  CALL that would take it down. Everything the warm pass needs to read
+    //  exists there except one thing (the D3D textures behind the render
+    //  targets, which it does not need); nothing that matters exists at the
+    //  loading screen the pass used to fire on, which is the legals screen at
+    //  t+2.2 s. The evidence, the timeline and the counter-experiments are in
+    //  re/rage-shader-precompile/08-boot-gate.md.
+    //
+    //  HOW IT KEEPS THE GAME'S OWN LOADING SCREEN ALIVE. While a loading
+    //  screen is up, a dedicated thread free-runs it: it calls
+    //  rageBoot_LoadscreenRenderTick 0x005CC760 in a spin, ~7 kHz, and the
+    //  tick draws a frame whenever its own 15.67 ms timer has elapsed. That
+    //  is the thread the pass runs on -- but it must not BLOCK it, or the
+    //  artwork freezes. So the pass runs in SLICES on a fiber of that same
+    //  thread: the tick draws its frame, we switch to the pass fiber for a
+    //  few milliseconds, we switch back, and the pump loop carries on. One
+    //  thread, so nothing about the device is concurrent; the engine's frame
+    //  finds the device exactly as its last one left it, because the slice is
+    //  bracketed by a full state save and restore.
+    //
+    //  WHY THE STATE SAVE IS NOT OPTIONAL. RAGE's device wrapper FILTERS
+    //  redundant sets (02-draw §1.1: the 0x60-0xA0 byte "cached" methods) and
+    //  grcState keeps shadow globals of its own. Our draws go to DXVK's real
+    //  device and never through either, so the engine's beliefs stay true --
+    //  as long as what it finds when it draws again is what it left. That is
+    //  what the state block guarantees, per slice.
+    // ===================================================================
+    static inline bootgate::Validation gateCheck{};
+    static inline bool gateArmed = false;                 // the boot-gate hooks are in
+    static inline std::atomic<bool> gateOpen{ false };    // the main thread is holding at it
+    static inline std::atomic<bool> gateDone{ false };    // the pass has finished
+    static inline std::atomic<bool> gateAbort{ false };   // it has been asked to stop
+    static inline std::atomic<bool> gateFailed{ false };  // fall back to the loading-screen gate
+    static inline bool gateFromBoot = false;              // this pass IS the boot-gate one
+    static inline std::vector<bootgate::PhaseSet> gatePhases;
+    static inline std::vector<bootgate::Target>   gateTargets;
+    static inline SafetyHookInline shInitSession{};
+    static inline SafetyHookInline shDrawLayers{};
+
+    // The slice mechanism.
+    static inline void* pumpFiber = nullptr;
+    static inline void* passFiber = nullptr;
+    static inline int64_t sliceDeadlineUs = 0;
+    static inline int64_t passResumeUs = 0;
+    static inline uint32_t sliceCount = 0;
+    static inline IDirect3DStateBlock9* engineSB = nullptr;
+    static inline IDirect3DSurface9* engineRT[4] = {};
+    static inline IDirect3DSurface9* engineDS = nullptr;
+    static inline D3DVIEWPORT9 engineVP{};
+    static inline bool engineStateOK = false;
+
+    // The device, even after the pass has released its own reference: the
+    // LAST restore happens after RunBlocking has returned, and handing the
+    // engine back a device it did not leave is exactly the bug this bracket
+    // exists to prevent.
+    static IDirect3DDevice9* SliceDevice()
+    {
+        return dev ? dev : AcquireDevice();
+    }
+
+    static void SaveEngineState()
+    {
+        IDirect3DDevice9* dv = SliceDevice();
+        if (!dv) return;
+        if (!engineSB)
+        {
+            HRESULT hr = dv->CreateStateBlock(D3DSBT_ALL, &engineSB);
+            if (FAILED(hr) || !engineSB)
+            {
+                engineSB = nullptr;
+                static bool warned = false;
+                if (!warned)
+                {
+                    warned = true;
+                    Log("gate: CreateStateBlock failed (hr=0x%08lX) - the loading screen's own "
+                        "frames will see whatever the warm draws left; watch for artefacts",
+                        (unsigned long)hr);
+                }
+            }
+        }
+        if (engineSB) engineStateOK = SUCCEEDED(engineSB->Capture());
+        for (int i = 0; i < 4; i++)
+        {
+            SAFE_RELEASE(engineRT[i]);
+            dv->GetRenderTarget(i, &engineRT[i]);
+        }
+        SAFE_RELEASE(engineDS);
+        dv->GetDepthStencilSurface(&engineDS);
+        dv->GetViewport(&engineVP);
+    }
+
+    static void RestoreEngineState()
+    {
+        IDirect3DDevice9* dv = SliceDevice();
+        if (!dv) return;
+        // Slots 1..3 go first: D3D9 refuses an RT0 smaller than a bound
+        // secondary target, and our scratch targets are 64x64.
+        for (int i = 1; i < 4; i++) dv->SetRenderTarget(i, nullptr);
+        dv->SetRenderTarget(0, engineRT[0]);
+        for (int i = 1; i < 4; i++) if (engineRT[i]) dv->SetRenderTarget(i, engineRT[i]);
+        dv->SetDepthStencilSurface(engineDS);
+        dv->SetViewport(&engineVP);
+        if (engineSB && engineStateOK) engineSB->Apply();
+    }
+
+    static void ReleaseEngineState()
+    {
+        for (int i = 0; i < 4; i++) SAFE_RELEASE(engineRT[i]);
+        SAFE_RELEASE(engineDS);
+        SAFE_RELEASE(engineSB);
+        engineStateOK = false;
+    }
+
+    // What the loading screen shows. Uppercase and stripped, because the only
+    // text engine available at this gate is the 5x7 glyph set in bootgate.h --
+    // CFont faults here (its textures are unloaded between the frontend and
+    // the first gameplay frame) and an ID3DXFont would draw through the device
+    // immediately, which is not where this frame is being recorded.
+    static inline int64_t lastProgressUs = 0;
+
+    static void PublishProgress()
+    {
+        if (!bootgate::Prog().active) return;
+        // Called from inside the job loop, so once every frame is plenty and
+        // a snprintf per job is not.
+        const int64_t now = pipelinekeys::ClockUs();
+        if (now - lastProgressUs < 100000) return;
+        lastProgressUs = now;
+        float frac = (float)workDone.load() / (float)(workTotal ? workTotal : 1);
+        frac = std::clamp(frac, 0.0f, 1.0f);
+        char line[48];
+        const auto secs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - tPhase).count() / 1000.0;
+        if (secs >= 3.0 && frac >= 0.03f)
+        {
+            double eta = secs * (1.0 - frac) / frac;
+            if (eta > 5999.0) eta = 5999.0;
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "%s  %d%%  ETA %d:%02d",
+                        curWhat, (int)(frac * 100.0f), (int)eta / 60, (int)eta % 60);
+        }
+        else
+        {
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "%s  %d%%", curWhat, (int)(frac * 100.0f));
+        }
+        for (char* c = line; *c; c++)
+            if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);
+        bootgate::SetProgress(frac, line);
+    }
+
+    // Called from the pass fiber wherever the pass used to present a frame of
+    // its own. Hands the thread back to the loading screen when this slice's
+    // time is up, so the game's artwork keeps animating.
+    static void YieldToLoadscreen(bool force)
+    {
+        PumpMessages();
+        PublishProgress();
+        if (!passFiber || !pumpFiber) return;
+        if (!force && pipelinekeys::ClockUs() < sliceDeadlineUs) return;
+        SwitchToFiber(pumpFiber);
+    }
+
+    // The pass's Sleep: never block the loading-screen thread, hand it back
+    // and ask not to be scheduled again for a while.
+    static void PassSleep(int ms)
+    {
+        if (!passFiber || !pumpFiber) { Sleep(ms); return; }
+        passResumeUs = pipelinekeys::ClockUs() + (int64_t)ms * 1000;
+        SwitchToFiber(pumpFiber);
+    }
+
+    static void FinishPass()
+    {
+        pipelinekeys::PassThread() = 0;
+        auto& vr = pipelinekeys::VulkanReplay();
+        vr.passDone = true;
+        vr.holding = false;
+        vr.recordPaused = false;
+        finished = true;
+        gateDone = true;
+    }
+
+    static void WINAPI PassFiberProc(void*)
+    {
+        __try { RunBlocking(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("precompile faulted - continuing to game"); }
+        FinishPass();
+        // Never scheduled again: the slice driver checks gateDone first.
+        for (;;) SwitchToFiber(pumpFiber);
+    }
+
+    // One slice, from the loading-screen thread, after the engine's own tick.
+    static void RunSlice()
+    {
+        if (gateDone.load()) return;
+        const int64_t now = pipelinekeys::ClockUs();
+        if (now < passResumeUs) return;
+
+        if (!pumpFiber)
+        {
+            pumpFiber = ConvertThreadToFiber(nullptr);
+            if (!pumpFiber)
+            {
+                Log("gate: ConvertThreadToFiber failed (%lu) - running the pass blocking, "
+                    "with its own overlay, as it used to", GetLastError());
+                gateFromBoot = false;   // keep the contexts; lose the native screen
+            }
+        }
+        if (pumpFiber && !passFiber)
+        {
+            passFiber = CreateFiber(1 << 20, &PassFiberProc, nullptr);
+            if (!passFiber)
+                Log("gate: CreateFiber failed (%lu) - running the pass blocking", GetLastError());
+        }
+        if (!passFiber)
+        {
+            // Fail-safe: no fibers, so do it the old way -- one blocking call
+            // that presents its own frames.
+            pipelinekeys::PassThread() = GetCurrentThreadId();
+            __try { RunBlocking(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { Log("precompile faulted - continuing to game"); }
+            FinishPass();
+            return;
+        }
+
+        // Taken here rather than inside the pass, so the FIRST slice -- which
+        // loads the .fxc database and creates every shader object -- is
+        // bracketed by the same save and restore as the rest.
+        if (!dev)
+        {
+            dev = AcquireDevice();
+            if (dev) dev->AddRef();
+        }
+
+        SaveEngineState();
+        sliceDeadlineUs = now + (int64_t)(cfg.sliceMs > 0 ? cfg.sliceMs : 8) * 1000;
+        sliceCount++;
+        SwitchToFiber(passFiber);
+        RestoreEngineState();
+        if (gateDone.load()) ReleaseEngineState();
+    }
+
+    // -------------------------------------------------------------------
+    //  The gate itself, on the main thread.
+    // -------------------------------------------------------------------
+    static void OpenBootGate()
+    {
+        const int64_t t0 = pipelinekeys::ClockUs();
+        if (!bootgate::LoadscreenShown())
+            Log("gate: rageBoot_InitSession returned but no loading screen is up - "
+                "running anyway; there may be nothing on the screen while it works");
+
+        // One byte, and the guard puts it back on every path including a fault
+        // inside the pass. If it is ever left in place the loading screen never
+        // comes down and the game is dead, so it is the first thing set up and
+        // the last thing undone.
+        bootgate::LoadscreenPin pin;
+        if (!pin.Acquire())
+        {
+            Log("gate: could not pin rageBoot_LoadscreenEnd - leaving the boot gate alone");
+            gateFailed = true;
+            return;
+        }
+
+        void* vp = bootgate::FindGameViewport();
+        const uint16_t had = bootgate::PhaseCount(vp);
+        const uint16_t phases = bootgate::BuildRenderPhases(vp);
+        Log("gate: game viewport %p, render phases %u -> %u (%s)", vp, had, phases,
+            had ? "the engine had already built them"
+                : "built here, by the engine's own vtable slot 12; its own build is now "
+                  "suppressed by the viewport's word[+0x404] guard");
+        if (!vp || !phases)
+        {
+            Log("gate: the engine built no render phase - falling back to the loading-screen "
+                "gate, which behaves as this mod always did");
+            gateFailed = true;
+            return;
+        }
+
+        bootgate::ReadPhaseSets(vp, gatePhases);
+        bootgate::ReadTargetRegistry(gateTargets);
+        gateFromBoot = true;
+        bootgate::Prog().active = true;
+        bootgate::SetProgress(0.0f, "PREPARING SHADERS");
+        gateOpen = true;
+
+        // Hold. The loading-screen thread picks the pass up on its next tick
+        // and runs it in slices between the frames it draws; nothing else runs
+        // on this thread, so the OS and Steam-overlay pump has to come from
+        // here -- which is exactly what the game's own legals spin does with
+        // the same function.
+        const int64_t startBy = t0 + 5 * 1000000ll;
+        int64_t abortAt = 0;
+        bool sawStart = false;
+        for (;;)
+        {
+            if (gateDone.load()) break;
+            bootgate::PumpOs();
+            Sleep(1);
+            const int64_t now = pipelinekeys::ClockUs();
+            if (!sawStart) sawStart = started.load();
+            if (!sawStart && now > startBy)
+            {
+                Log("gate: the loading-screen thread did not pick the pass up in %.1f s - "
+                    "releasing; the loading-screen gate will run it instead",
+                    (now - t0) / 1e6);
+                gateOpen = false;
+                gateFailed = true;
+                break;
+            }
+            if (!abortAt && cfg.gateMaxSeconds > 0 &&
+                now - t0 > (int64_t)cfg.gateMaxSeconds * 1000000ll)
+            {
+                Log("gate: PrecompileGateMaxSeconds (%d) reached after %.1f s - asking the pass "
+                    "to stop and unwind", cfg.gateMaxSeconds, (now - t0) / 1e6);
+                gateAbort = true;
+                abortAt = now;
+            }
+            if (abortAt && now - abortAt > 120 * 1000000ll)
+            {
+                Log("gate: the pass did not unwind 120 s after being asked to - releasing the "
+                    "loading screen anyway. The device may not have been handed back.");
+                break;
+            }
+        }
+        bootgate::Prog().active = false;
+        Log("gate: released after %.1f s, %u slices", (pipelinekeys::ClockUs() - t0) / 1e6,
+            sliceCount);
+        // The pin is released here, and the very next instruction the engine
+        // executes after this hook returns is its own CALL to
+        // rageBoot_LoadscreenEnd -- so the loading screen comes down exactly
+        // when and how it would have.
+    }
+
+    static void __fastcall InitSessionDetour(char a, int edx)
+    {
+        shInitSession.fastcall<void>(a, edx);
+        // Act on the RETURN, and latch to the first fire: the episode flow can
+        // call rageBoot_LoadEpisodeAndStartSession twice.
+        static std::atomic<bool> fired{ false };
+        if (!cfg.enabled || finished.load() || started.load()) return;
+        if (fired.exchange(true)) return;
+        OpenBootGate();
+    }
+
+    // The progress overlay rides the loading screen's own draw. The leave of
+    // rageBoot_LoadscreenDrawLayers is the last thing in a frame the loading
+    // screen actually drew -- the tick's own leave is not, because it is
+    // called ~7 kHz and 99.9 % of those calls draw nothing.
+    static void __fastcall DrawLayersDetour(char cl, int edx)
+    {
+        shDrawLayers.fastcall<void>(cl, edx);
+        if (!bootgate::Prog().active) return;
+        __try { bootgate::DrawProgress(); }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            bootgate::Prog().active = false;
+            Log("gate: the progress overlay faulted - it is off for the rest of the load");
+        }
+    }
+
     // -------------------------------------------------------------------
     //  Orchestration — the whole blocking pass, on the render thread.
     // -------------------------------------------------------------------
@@ -3609,9 +4236,16 @@ class ShaderPrecompiler
         tPhase = tStart;
         tLastPresent = tStart - std::chrono::milliseconds(1000);
 
-        dev = AcquireDevice();
-        if (!dev) { Log("no device — aborting precompile"); return; }
-        dev->AddRef();
+        // The slice driver may already have taken the device, so that the very
+        // first slice -- the one that loads the .fxc database and creates every
+        // shader object -- is bracketed by the same state save and restore as
+        // all the others. One reference either way.
+        if (!dev)
+        {
+            dev = AcquireDevice();
+            if (!dev) { Log("no device — aborting precompile"); return; }
+            dev->AddRef();
+        }
         DetectBackend();
         Log("backend = %s, device = %p", backend == Backend::DXVK ? "DXVK" : "native", (void*)dev);
         ResolveOverlayInterval();
@@ -3986,34 +4620,49 @@ class ShaderPrecompiler
         }
     }
 
-    // ---- injection anchor: FUN_005cc760 (render-thread loadscreen render) -----
+    // ---- injection anchor: FUN_005cc760 (loadscreen-thread render tick) ------
+    //
+    // The ORIGINAL RUNS FIRST now. On the boot gate this detour is a slice
+    // driver, not a gate: the engine draws its own loading-screen frame, then
+    // we lend the thread to the pass for a few milliseconds, then the pump
+    // loop that called us carries on. Doing it the other way round would mean
+    // the pass ran before the frame it is meant to be drawn over.
     static void __cdecl LoadscreenRenderDetour()
     {
-        if (cfg.enabled && !finished.load() && !started.load())
-        {
-            loadscreenFramesSeen++;
-            if (GateReady())
-            {
-                started = true;   // guard against any re-entry
-                // Our own draws from here on are not the game's: capture skips them.
-                pipelinekeys::PassThread() = GetCurrentThreadId();
-                __try { RunBlocking(); }
-                __except (EXCEPTION_EXECUTE_HANDLER) { Log("precompile faulted - continuing to game"); }
-                pipelinekeys::PassThread() = 0;
-                // However the pass ended, the Vulkan replay must not wait for it any
-                // longer, the loading screen is no longer held for it, and vkcapture
-                // records again.
-                auto& vr = pipelinekeys::VulkanReplay();
-                vr.passDone = true;
-                vr.holding = false;
-                vr.recordPaused = false;
-                finished = true;
-                Log("gate: ran after %d loadscreen frames at %ux%u", loadscreenFramesSeen, gateW, gateH);
-            }
-        }
         shLoadscreenRender.call<void>();
 
-        // After the original, so we overwrite what it just drew.
+        if (cfg.enabled && !finished.load())
+        {
+            if (gateOpen.load())
+            {
+                if (!started.exchange(true))
+                {
+                    // Our own draws from here on are not the game's: capture skips them.
+                    pipelinekeys::PassThread() = GetCurrentThreadId();
+                    Log("gate: the boot gate is open - starting the pass on the "
+                        "loading-screen thread, in slices, with the game's own screen up");
+                }
+                RunSlice();
+            }
+            else if (gateFailed.load() && !started.load())
+            {
+                // The fail-safe: the boot gate could not be used on this build,
+                // so the pass runs where it always did -- one blocking call on
+                // a loading screen, presenting its own frames.
+                loadscreenFramesSeen++;
+                if (GateReady())
+                {
+                    started = true;
+                    pipelinekeys::PassThread() = GetCurrentThreadId();
+                    __try { RunBlocking(); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { Log("precompile faulted - continuing to game"); }
+                    FinishPass();
+                    Log("gate: FALLBACK - ran after %d loadscreen frames at %ux%u",
+                        loadscreenFramesSeen, gateW, gateH);
+                }
+            }
+        }
+
         if (cfg.flashProbe > 0) FlashProbe();
     }
 
@@ -4033,6 +4682,15 @@ class ShaderPrecompiler
         cfg.specVariants  = ini.ReadInteger("SHADERS", "PrecompileSpecVariants", 1) != 0;
         cfg.exportBaseline = ini.ReadInteger("SHADERS", "PrecompileExportBaseline", 0) != 0;
         cfg.engineWarm    = ini.ReadInteger("SHADERS", "PrecompileEngineWarm", 0);
+        cfg.emitLog       = ini.ReadInteger("SHADERS", "PrecompileEmitLog", 0) != 0;
+        cfg.sliceMs       = ini.ReadInteger("SHADERS", "PrecompileSliceMs", 8);
+        cfg.gateMaxSeconds = ini.ReadInteger("SHADERS", "PrecompileGateMaxSeconds", 0);
+        cfg.reuseStamp    = ini.ReadInteger("SHADERS", "PrecompileReuseWarmCache", 1) != 0;
+        // Not ours, but it is the only thing that can put a sample count on a
+        // render target, and the sample count is in the pipeline key. The
+        // engine cannot be asked at the gate (no D3D texture exists behind a
+        // target yet), so the setting is the source.
+        cfg.reflectionMsaa = ini.ReadInteger("EXPERIMENTAL", "ReflectionMSAAQuality", 0);
     }
 
 public:
@@ -4059,6 +4717,42 @@ public:
                 Log("armed at loadscreen render %p (breadth=%d, overlay=%d, gate=%d frames)", target, cfg.breadth, cfg.overlay, kStableFramesNeeded);
             else
                 Log("FAILED to hook loadscreen render at %p", target);
+
+            // The boot gate. Every address it needs is above 0x004FB000, so it
+            // is readable now, before the game has decrypted its RAGE core --
+            // and it is fingerprinted now, so a build this does not know never
+            // gets a 0xC3 written into it. On any mismatch this says so once
+            // and the loading-screen gate above carries the feature exactly as
+            // it always did.
+            gateCheck = bootgate::ValidateCode();
+            if (!gateCheck.ok)
+            {
+                gateFailed = true;
+                Log("boot gate OFF: %s. Falling back to the loading-screen gate - the warm "
+                    "pass still runs, but its render-target and phase contexts come from the "
+                    "shipped stand-in table.", gateCheck.why.c_str());
+            }
+            else
+            {
+                void* init = reinterpret_cast<void*>(RebaseVA(bootgate::kVA_InitSession));
+                void* lay  = reinterpret_cast<void*>(RebaseVA(bootgate::kVA_LoadscreenLayers));
+                shInitSession = safetyhook::create_inline(init, reinterpret_cast<void*>(&InitSessionDetour));
+                shDrawLayers  = safetyhook::create_inline(lay,  reinterpret_cast<void*>(&DrawLayersDetour));
+                gateArmed = (bool)shInitSession;
+                if (!gateArmed)
+                {
+                    gateFailed = true;
+                    Log("boot gate: FAILED to hook rageBoot_InitSession at %p - falling back "
+                        "to the loading-screen gate", init);
+                }
+                else
+                {
+                    Log("boot gate armed at rageBoot_InitSession %p (progress overlay %s at "
+                        "rageBoot_LoadscreenDrawLayers %p, %d ms of warm work per "
+                        "loading-screen frame)",
+                        init, shDrawLayers ? "on" : "OFF - could not hook", lay, cfg.sliceMs);
+                }
+            }
             // The whole Vulkan replay waits for this pass, and then runs with the loading
             // screen held; without the pass -- off, or no hook to run it from -- it runs
             // in the background from the start.

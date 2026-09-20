@@ -484,6 +484,12 @@ namespace pipelinekeys
         std::atomic<bool> watching{ false };
         std::atomic<int32_t> inFlight{ 0 };
         std::atomic<uint32_t> creations{ 0 };
+        // Of those creations, the ones that took >= 5 ms, i.e. the ones the
+        // driver really compiled rather than found in its own on-disk cache.
+        // It is the only signal available in-process for "is the driver cache
+        // warm for these pipelines", which is what lets a second launch skip a
+        // pass whose whole output is already on disk.
+        std::atomic<uint32_t> compiles{ 0 };
         std::atomic<int64_t> lastActivityUs{ 0 };
         uint64_t (*compilerCpuUs)(uint32_t* threads, uint64_t* csUs) = nullptr;
         std::atomic<bool> recordPaused{ false };

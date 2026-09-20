@@ -14,16 +14,26 @@
 //      * the vertex declaration                              -> model geometry
 //      * the sampler-binding pattern                         -> material
 //
-//  All four are enumerable from the engine at the loading-screen gate, and
-//  this header is that enumeration. The evidence is in
-//  re/rage-shader-precompile/{06-phases,07-geometry}.md; every address below
-//  is named there and every one is validated at run time before it is used.
+//  All four are enumerable from the engine AT A LATE ENOUGH GATE, and this
+//  header is that enumeration. The evidence is in
+//  re/rage-shader-precompile/{06-phases,07-geometry,08-boot-gate,
+//  09-phase-contexts,10-key-spec}.md; every address below is named there and
+//  every one is validated at run time before it is used.
+//
+//  WHAT CHANGED, and it is the whole point of this revision: the contexts are
+//  no longer walked out of the render-phase singleton at whatever moment the
+//  first loading screen happens to render. bootgate.h puts the pass at the
+//  return of rageBoot_InitSession, asks the engine to build its phases there,
+//  and hands this header the phase sets and the texture factory's whole
+//  render-target registry. What used to come from a shipped constant table --
+//  12 of 14 render-target sets and nearly all the phase state -- now comes
+//  from the engine, and the three sets that still cannot are logged as
+//  'shipped' rather than passed off as engine reads.
 //
 //  THE TIMING RULE. Everything in 0x00401000-0x004FB000 is SecuROM-encrypted
-//  at rest, so nothing here may be touched at ASI load. Resolve() must be
-//  called from the loading-screen gate (inside RunBlocking), where 04-poc
-//  proved the region is plaintext. Nothing in this header is a static
-//  initializer for that reason.
+//  at rest, so nothing here may be touched at ASI load. BuildTables() must be
+//  called from the gate, where 04-poc proved the region is plaintext. Nothing
+//  in this header is a static initializer for that reason.
 //
 //  WHAT IT DOES NOT DO. It reads. It never writes an engine global, never
 //  calls into the encrypted range, and never touches RAGE's device wrapper at
@@ -44,6 +54,7 @@
 #include <algorithm>
 #include "fxc_parse.h"
 #include "pipelinekeys.h"
+#include "bootgate.h"
 
 namespace enginewarm
 {
@@ -56,27 +67,11 @@ namespace enginewarm
     constexpr uintptr_t kVA_EffectExtra    = 0x018DD508;  // the gta_im outside the array
     constexpr uintptr_t kVA_RageStateToRS  = 0x01111978;  // u32[43] rage state id -> D3DRENDERSTATETYPE
     constexpr uintptr_t kVA_DefaultRS      = 0x0106B420;  // u32[43] engine-wide default block
-    constexpr uintptr_t kVA_PhaseList      = 0x0118D7F0;  // +0x38 CRenderPhase**, +0x3C u16 count
-    constexpr uintptr_t kVA_GBuffer3       = 0x0154E17C;  // _DEFERRED_GBUFFER_3_ (INTZ)
-    constexpr uintptr_t kVA_StencilBuffer  = 0x0154E180;  // _STENCIL_BUFFER_ -- the REAL MRT3
-    // Named engine render targets the PHASE LIST does not reach. The post-FX
-    // phases bind theirs inside DrawList and the shadow phases only declare the
-    // point pair, so walking +0x890 alone misses the single-colour sets that
-    // carry a quarter of the recorded draws. These are the creators' own
-    // globals: ragePhase_CreateShadowTargets 0x00925430 and
-    // ragePhase_CreateGBufferTargets 0x00AD1410.
-    constexpr uintptr_t kVA_NamedTargets[] = {
-        0x0119CFE8,  // SHADOW_MAP_COLOUR_POINT
-        0x0119CFEC,  // SHADOW_MAP_DEPTH_POINT
-        0x0119CFF0,  // SHADOW_MAP_COLOUR_CACHE
-        0x0119CFF4,  // SHADOW_MAP_COLOUR_HEMI_CUBE
-        0x0154E170,  // _DEFERRED_GBUFFER_0_
-        0x0154E174,  // _DEFERRED_GBUFFER_1_
-        0x0154E178,  // _DEFERRED_GBUFFER_2_
-        0x0154E17C,  // _DEFERRED_GBUFFER_3_ (INTZ)
-        0x0154E180,  // _STENCIL_BUFFER_
-        0x0154E184,  // _BACK_ZBUFFER_
-    };
+    // The render targets and the render phases now come from bootgate.h, which
+    // reads them at a gate where the engine has actually built them. The
+    // 0x0118D7F0 singleton this file used to walk is a TRAP before the first
+    // frame: it holds pointers to uninitialised memory, and reading through
+    // them faults (09-phase-contexts §1.3).
     constexpr uintptr_t kVA_DeclMapBuckets = 0x018DDE9C;  // node**
     constexpr uintptr_t kVA_DeclMapCount   = 0x018DDEA0;  // u16 bucket count
     constexpr uintptr_t kVA_DeclMapSize    = 0x018DDEA2;  // u16 entries
@@ -104,8 +99,6 @@ namespace enginewarm
     constexpr uint32_t kPass_Stride     = 0x20, kPass_Vs = 0x00, kPass_Ps = 0x0C;
     constexpr uint32_t kPass_States     = 0x18, kPass_StateCount = 0x1C;
     constexpr uint32_t kProg_Stride     = 0x0C, kProg_D3D = 0x08;
-    constexpr uint32_t kPhase_Slot0     = 0x890, kPhase_SlotStride = 0x10, kPhase_DepthDelta = 0x08;
-    constexpr uint32_t kRT_Name         = 0x30, kRT_Tex = 0x34, kRT_W = 0x3C, kRT_H = 0x3E, kRT_Fmt = 0x40;
     constexpr uint32_t kDecl_D3D        = 0x00, kDecl_Ref = 0x04, kDecl_Elems = 0x0C;
 
     constexpr uint32_t kRageStates = 43;
@@ -155,218 +148,204 @@ namespace enginewarm
         return 32769u * ((9u * h) ^ ((9u * h) >> 11));
     }
 
-    // ---------------------------------------------------------------------
-    //  Safe reads. Nothing here may fault: an enumeration that crashes the
-    //  loading screen is far worse than one that gives up.
-    // ---------------------------------------------------------------------
-    inline uintptr_t Rebase(uintptr_t va)
-    {
-        static uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
-        return va - 0x400000u + base;
-    }
-
-    inline bool Readable(const void* p, size_t n)
-    {
-        if (!p || n == 0) return false;
-        MEMORY_BASIC_INFORMATION mbi{};
-        auto at = (const uint8_t*)p;
-        const uint8_t* end = at + n;
-        while (at < end)
-        {
-            if (!VirtualQuery(at, &mbi, sizeof(mbi))) return false;
-            if (mbi.State != MEM_COMMIT) return false;
-            const DWORD bad = PAGE_NOACCESS | PAGE_GUARD;
-            if (mbi.Protect & bad) return false;
-            const DWORD ok = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                             PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-            if (!(mbi.Protect & ok)) return false;
-            at = (const uint8_t*)mbi.BaseAddress + mbi.RegionSize;
-        }
-        return true;
-    }
-
-    template <typename T> inline bool Peek(uintptr_t p, T& out)
-    {
-        if (!Readable((const void*)p, sizeof(T))) return false;
-        memcpy(&out, (const void*)p, sizeof(T));
-        return true;
-    }
-
-    // A C string that is actually a name: printable, bounded, NUL-terminated.
-    inline bool PeekName(uintptr_t p, std::string& out, size_t cap = 64)
-    {
-        if (!Readable((const void*)p, 1)) return false;
-        auto s = (const char*)p;
-        out.clear();
-        for (size_t i = 0; i < cap; i++)
-        {
-            if (!Readable(s + i, 1)) return false;
-            char c = s[i];
-            if (c == 0) return !out.empty();
-            if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7E) return false;
-            out.push_back(c);
-        }
-        return false;
-    }
+    // Safe reads: one implementation, in bootgate.h. Nothing here may fault --
+    // an enumeration that crashes the loading screen is far worse than one that
+    // gives up and says why.
+    using bootgate::Rebase;
+    using bootgate::Readable;
+    using bootgate::Peek;
+    using bootgate::PeekName;
 
     // ---------------------------------------------------------------------
-    //  Axis 1 — render-target / depth / sample-count contexts, read from the
-    //  live render-phase list (06-phases §5.1).
+    //  Axis 1 — render-target / depth / sample-count contexts.
+    //
+    //  READ FROM THE ENGINE, at a gate late enough to have them (bootgate.h):
+    //  the texture factory's own registry of every render target it has ever
+    //  created is the format axis, and the render phases say which targets are
+    //  bound TOGETHER, which is the only source for the MRT sets. The shipped
+    //  table below is a fail-safe that should never fire, and when it does the
+    //  log names every set it stood in for.
+    //
+    //  A CONTEXT KIND is the vocabulary the group->context tie speaks. The
+    //  names are 10-key-spec.md §5's RT table; what makes them right is that
+    //  each one is matched against what the engine actually declared rather
+    //  than assumed to exist.
     // ---------------------------------------------------------------------
+    enum CtxKind : uint8_t
+    {
+        kCtx_GBuffer = 0,   // [A8R8G8B8 x3, R16F] + INTZ -- the deferred set
+        kCtx_Scene,         // the fp16 scene RT + INTZ
+        kCtx_Cascade,       // R32F + INTZ (cascade / warp shadows)
+        kCtx_Point,         // G16R16F + INTZ (point shadows)
+        kCtx_Height,        // R16F + INTZ (the height map)
+        kCtx_Ldr,           // A8R8G8B8 + INTZ
+        kCtx_Water,         // two colour, NO depth (the water surface pair)
+        kCtx_Scene2,        // fp16 + A8R8G8B8 + INTZ (the UI-layer composite)
+        kCtx_Reflect,       // the fp16 scene set with a user clip plane
+        kCtx_LdrNoDepth,
+        kCtx_Fp16NoDepth,
+        kCtx_R32NoDepth,
+        kCtx_R16NoDepth,
+        kCtx_L8,
+        kCtx_G16R16FNoDepth,
+        kCtx_Other,
+        kCtx_KindCount
+    };
+
+    inline const char* KindName(uint8_t k)
+    {
+        static const char* kNames[kCtx_KindCount] = {
+            "gbuffer", "scene", "cascade", "point", "height", "ldr", "water", "scene2",
+            "reflect", "ldrnodepth", "fp16nodepth", "r32nodepth", "r16", "l8", "g16r16f", "other"
+        };
+        return k < kCtx_KindCount ? kNames[k] : "?";
+    }
+
     struct Context
     {
-        std::string name;           // for the log: the phase target that produced it
+        std::string name;           // for the log: the engine target that produced it
         D3DFORMAT color[4]{};       // D3DFMT_UNKNOWN = slot unbound
         int       mrt = 0;
         D3DFORMAT depth = D3DFMT_UNKNOWN;
         uint32_t  msType = 0, msQuality = 0;
-        uint32_t  weight = 0;       // draw-order rank; lower is warmed first
-        bool      fromPhase = false;
+        uint8_t   kind = kCtx_Other;
+        bool      clip = false;     // the phase runs with a user clip plane
+        bool      fromEngine = false;   // false = shipped stand-in, and the log says so
     };
 
-    // How many render phases the list holds right now. FusionFix's gate fires
-    // about three seconds into the loading screen, which is EARLIER than
-    // ragePhase_CreateAllPhasesAndTargets (0x00B00B60) runs: measured live, the
-    // list is empty there and exactly one named target exists, although
-    // 06-phases' probe found 29 phases and every target already created on the
-    // same loading screen thirty seconds later -- and holding the screen for a
-    // further twenty seconds did not make them appear. So the walk probes for
-    // the list rather than assuming it, and falls back to the shipped sets
-    // when it is not there, saying which in the log.
-    inline uint16_t PhaseCount()
-    {
-        uintptr_t listBase = 0, arr = 0; uint16_t n = 0;
-        if (!Peek(Rebase(kVA_PhaseList), listBase) || !listBase) return 0;
-        if (!Peek(listBase + 0x38, arr) || !arr) return 0;
-        if (!Peek<uint16_t>(listBase + 0x3C, n) || n > 256) return 0;
-        return n;
-    }
-
     // ---------------------------------------------------------------------
-    //  Axis 2 — the blend / colour-write / depth-stencil vector a render
+    //  Axis 2 — the write-mask / blend-enable / alpha-test vector a render
     //  phase establishes before it emits any bucket draw.
     //
-    //  These are the six render-thread callbacks 06-phases §3.4 decoded, in
-    //  the D3D9 terms they reach the device in. They are engine CODE, not
-    //  engine data, so they cannot be read at run time -- they are written out
-    //  here with their addresses, and the live vector at 0x017F5848 is logged
-    //  beside them so a drift shows up as a number rather than a guess.
+    //  MUCH SMALLER THAN IT LOOKS, and that is a measurement, not a
+    //  simplification. With a depth target bound, DXVK 3.1.1 makes cull mode,
+    //  front face, depth bias, depth test/write/compare and the WHOLE stencil
+    //  block dynamic (dxvk_graphics.cpp:776-804), and there is no DxvkDsInfo in
+    //  the tree at all, so depth and stencil cannot fork a pipeline even in a
+    //  depth-less context (10-key-spec.md §3, correcting 09-phase-contexts
+    //  §4.4). What is left of a phase callback's push is:
     //
-    //  The measured marginal cost of each, at a fixed target set over 526
-    //  passes (06-phases §5.2): none 403 new pipelines, ForwardAllChannels 9,
-    //  ForwardStencil 0, GBufferStandard 0, GBufferAlphaClip 85,
-    //  DepthOnlyAlphaTest 85. ForwardStencil and GBufferStandard collapse onto
-    //  what is already built -- DXVK treats the stencil enable/ref/func this
-    //  engine sets as dynamic state -- so they are not emitted separately.
+    //      COLORWRITEENABLE0..3, ALPHABLENDENABLE, ALPHATESTENABLE
+    //
+    //  and everything else -- the blend factors, the blend op, the alpha
+    //  compare func -- comes from the engine's own default block at
+    //  0x0106B420 and then from the PASS's own PASS_VALUE delta, which is read
+    //  live. That is why this table has 8 entries where the previous one had
+    //  33: the other 25 were blend triples that belong to the pass, not to the
+    //  phase, and crossing them emitted pipelines no phase can produce.
+    //
+    //  The three write-mask vectors are the ones the 15 phase-state callbacks
+    //  actually push (09-phase-contexts §4.2), each crossed with blend on/off
+    //  and alpha test on/off, because all three sources (callback, default
+    //  block, pass delta) reach both values.
     // ---------------------------------------------------------------------
     struct StateVec
     {
         const char* name;
-        DWORD  cwe[4];          // COLORWRITEENABLE 0..3
-        BOOL   blendEnable;
-        DWORD  srcBlend, dstBlend, blendOp;
-        BOOL   alphaTest;
-        BOOL   zWrite;
+        DWORD cwe[4];           // COLORWRITEENABLE 0..3
+        BOOL  blendEnable;      // D3DRS_ALPHABLENDENABLE
+        BOOL  alphaTest;        // D3DRS_ALPHATESTENABLE
     };
 
-    // 0x00AD1980 State_ForwardAllChannels — CW F/F/F/F, blend off.
-    // 0x00AD2510 State_GBufferStandard    — CW 7/7/7/F, blend off, alpha test off.
-    // 0x00AD2430 State_GBufferAlphaClip   — CW 7/0/3/F, blend ON, depth write OFF.
-    // 0x00AD23F0 State_DepthOnlyAlphaTest — CW 7 on RT0, alpha test ON.
-    // 0x00AD1890 State_ForwardRT0Only     — CW F on RT0, the rest untouched.
-    // The three blend presets below GBufferAlphaClip's are preset 0
-    // (SRCALPHA/INVSRCALPHA/ADD), 1 (ONE/ONE/ADD) and 7 (SRCALPHA/ONE/ADD) of
-    // the 14 the engine's SetState id 2 selects -- the transparency, additive
-    // and glow vectors a forward phase reaches.
-    //
-    // WHY EVERY SLOT THE PHASE DOES NOT TOUCH IS 15, NOT 0. D3D9's four
-    // COLORWRITEENABLE states are sticky device state, and a phase that renders
-    // to one target only sets the one it cares about; the other three keep
-    // whatever the last MRT phase left, which for this engine is 15. DXVK does
-    // NOT normalise that away: BindBlendState writes omBlend[0..3] from all four
-    // render states unconditionally (d3d9_device.cpp:6995) and the pipeline
-    // lookup is a bcmpeq over the whole state struct (dxvk_graphics_state.h:748),
-    // so a 0 where gameplay has 15 is a DIFFERENT pipeline. Measured over this
-    // rig's 14543-key recording: COLORWRITEENABLE3 is 15 in 100 % of keys, and
-    // the 20 vectors that occur are exactly the masks below with 15 in every
-    // slot the phase left alone. The first version of this table wrote 0 there
-    // and every one of its level-2 coordinates was therefore unreachable.
     static const StateVec kStateVecs[] = {
-        { "forward",        { 15, 15, 15, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "gbuf_std",       {  7,  7,  7, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "gbuf_alphaclip", {  7,  0,  3, 15 }, TRUE,  D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, FALSE },
-        { "depthonly",      {  7,  7,  7, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, TRUE,  TRUE  },
-        { "forward_rt0",    { 15,  0,  0, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "fwd_blend",      { 15, 15, 15, 15 }, TRUE,  D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, FALSE },
-        { "fwd_add",        { 15, 15, 15, 15 }, TRUE,  D3DBLEND_ONE,      D3DBLEND_ONE,         D3DBLENDOP_ADD, FALSE, FALSE },
-        { "fwd_glow",       { 15, 15, 15, 15 }, TRUE,  D3DBLEND_SRCALPHA, D3DBLEND_ONE,         D3DBLENDOP_ADD, FALSE, FALSE },
-        // ---- level-2 extras ------------------------------------------------
-        // Every one of these is a (colour-write vector, blend preset) pair from
-        // the statically-mined domain of all 514 grcState::SetState call sites
-        // (README §3.1: COLORWRITEENABLE0 {0,5,7,8,0xF}, 1 {0,7,0xF}, 2
-        // {0,3,7,0xF}, 3 {0xF}; blend presets 0,1,2,4,5,6,8 of the 14). Note the
-        // mined domain of slot 3 is {0xF} alone, which is the same thing the
-        // recording says and the reason every vector here ends in 15.
-        //
-        // The colour-write vectors are now the 20 the 14543-key recording holds,
-        // exactly: the seven gbuf_* are its MRT vectors and the mask_* / rt0_*
-        // its single-target ones. Tied below: the MRT ones only to the G-buffer
-        // coordinate, the single-channel ones only to the passes the engine
-        // reaches by name.
-        { "gbuf_v1",        {  7,  7, 15, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "gbuf_v2",        {  7,  7,  3, 15 }, TRUE,  D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "gbuf_v3",        {  7, 15, 15, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "gbuf_v4",        {  7,  7,  7, 15 }, TRUE,  D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "gbuf_v5",        {  0,  7,  0, 15 }, TRUE,  D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "gbuf_v6",        {  8,  0,  0, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        // The five (15, ...) MRT vectors the recording holds that the mined
-        // domain also allows. gbuf_v7 used to be {15,15,0,0}, which occurs in
-        // none of the 14543 keys -- slot 3 is never masked off.
-        { "gbuf_v7",        { 15,  7, 15, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "gbuf_v8",        { 15,  7,  3, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "gbuf_v9",        { 15,  7,  7, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "gbuf_v10",       { 15,  7,  0, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "gbuf_v11",       { 15,  0,  3, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "mask_ra",        {  5, 15, 15, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "mask_ra_blend",  {  5, 15, 15, 15 }, TRUE,  D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "mask_none",      {  0, 15, 15, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "mask_r",         {  1, 15, 15, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "mask_r_blend",   {  1, 15, 15, 15 }, TRUE,  D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "mask_g",         {  2, 15, 15, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "mask_b_blend",   {  4, 15, 15, 15 }, TRUE,  D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "mask_a",         {  8, 15, 15, 15 }, FALSE, D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "mask_a_blend",   {  8, 15, 15, 15 }, TRUE,  D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "rt0_destalpha",  {  7, 15, 15, 15 }, TRUE,  D3DBLEND_DESTALPHA, D3DBLEND_INVDESTALPHA, D3DBLENDOP_ADD, FALSE, TRUE },
-        { "rt0_destone",    {  7, 15, 15, 15 }, TRUE,  D3DBLEND_DESTALPHA, D3DBLEND_ONE,        D3DBLENDOP_ADD, FALSE, TRUE  },
-        { "fwd_destalpha",  { 15, 15, 15, 15 }, TRUE,  D3DBLEND_DESTALPHA, D3DBLEND_INVDESTALPHA, D3DBLENDOP_ADD, FALSE, FALSE },
-        { "fwd_destone",    { 15, 15, 15, 15 }, TRUE,  D3DBLEND_DESTALPHA, D3DBLEND_ONE,        D3DBLENDOP_ADD, FALSE, FALSE },
-        { "fwd_oneinv",     { 15, 15, 15, 15 }, TRUE,  D3DBLEND_ONE,      D3DBLEND_INVSRCALPHA, D3DBLENDOP_ADD, FALSE, FALSE },
+        // the G-buffer callbacks: ragePhase_State_GBufferStandard 0x00AD2510
+        { "gbuf_std",     { 7, 7, 7, 15 }, FALSE, FALSE },
+        { "gbuf_alpha",   { 7, 7, 7, 15 }, FALSE, TRUE  },
+        // ragePhase_State_GBufferAlphaClip 0x00AD2430
+        { "gbuf_clip",    { 7, 0, 3, 15 }, TRUE,  FALSE },
+        { "gbuf_clipa",   { 7, 0, 3, 15 }, TRUE,  TRUE  },
+        // every forward phase: all channels, and the default block's own
+        // ALPHABLENDENABLE = 1 / SRCALPHA / INVSRCALPHA underneath
+        { "fwd",          { 15, 15, 15, 15 }, FALSE, TRUE  },
+        { "fwd_noalpha",  { 15, 15, 15, 15 }, FALSE, FALSE },
+        { "fwd_blend",    { 15, 15, 15, 15 }, TRUE,  TRUE  },
+        { "fwd_blend_na", { 15, 15, 15, 15 }, TRUE,  FALSE },
     };
-    // mask_a_opaque is gone: it was mask_a's colour-write vector with blending
-    // ON and ONE/ZERO/ADD, and DxvkBlendMode::normalize turns exactly that into
-    // blending OFF (dxvk_constant_state.cpp:93-117), so it was the same pipeline
-    // drawn twice. BuildJobs now normalises the blend triple into the job
-    // identity the same way, so any future duplicate of that shape dedups away
-    // instead of costing a draw.
-    enum { kSV_Forward = 0, kSV_GBufStd, kSV_GBufClip, kSV_DepthOnly, kSV_ForwardRT0,
-           kSV_FwdBlend, kSV_FwdAdd, kSV_FwdGlow,
-           kSV_GBufV1, kSV_GBufV2, kSV_GBufV3, kSV_GBufV4, kSV_GBufV5, kSV_GBufV6,
-           kSV_GBufV7, kSV_GBufV8, kSV_GBufV9, kSV_GBufV10, kSV_GBufV11,
-           kSV_MaskRA, kSV_MaskRABlend, kSV_MaskNone, kSV_MaskR, kSV_MaskRBlend, kSV_MaskG,
-           kSV_MaskBBlend, kSV_MaskA, kSV_MaskABlend,
-           kSV_RT0DestAlpha, kSV_RT0DestOne, kSV_FwdDestAlpha, kSV_FwdDestOne, kSV_FwdOneInv,
-           kSV_Count };
+    enum { kSV_GBufStd = 0, kSV_GBufAlpha, kSV_GBufClip, kSV_GBufClipA,
+           kSV_Fwd, kSV_FwdNoAlpha, kSV_FwdBlend, kSV_FwdBlendNA, kSV_Count };
 
-    // Level-2 extras, per group, all emitted at that group's FIRST coordinate
-    // only, so they add a bounded number of jobs instead of multiplying the
-    // whole walk.
-    static const uint8_t kExtraDeferred[] = { kSV_GBufV1, kSV_GBufV2, kSV_GBufV3, kSV_GBufV4,
-                                              kSV_GBufV5, kSV_GBufV6, kSV_GBufV7, kSV_GBufV8,
-                                              kSV_GBufV9, kSV_GBufV10, kSV_GBufV11 };
-    static const uint8_t kExtraNamed[]    = { kSV_MaskRA, kSV_MaskRABlend, kSV_MaskNone, kSV_MaskR,
-                                              kSV_MaskRBlend, kSV_MaskG, kSV_MaskBBlend, kSV_MaskA,
-                                              kSV_MaskABlend, kSV_RT0DestAlpha, kSV_RT0DestOne };
-    static const uint8_t kExtraForward[]  = { kSV_FwdDestAlpha, kSV_FwdDestOne, kSV_FwdOneInv };
+    // ---------------------------------------------------------------------
+    //  D3D9 -> Vulkan, the pieces of DXVK 3.1.1 that decide the key.
+    //
+    //  The warm pass has to know what pipeline a job WILL build, not just how
+    //  to draw it: that is what makes dedup honest, and it is what the
+    //  emission log carries so the containment scorer can be run against this
+    //  implementation rather than against a model of it.
+    // ---------------------------------------------------------------------
+    inline uint32_t VkBlendFactor(uint32_t d3d)
+    {
+        switch (d3d)
+        {
+        case 1: return 0;  case 2: return 1;  case 3: return 2;  case 4: return 3;
+        case 5: return 4;  case 6: return 5;  case 7: return 6;  case 8: return 7;
+        case 9: return 8;  case 10: return 9; case 11: return 14; case 14: return 10;
+        case 15: return 11; case 16: return 12; case 17: return 13;
+        default: return d3d;
+        }
+    }
+    inline uint32_t VkBlendOp(uint32_t d3d)
+    {
+        return (d3d >= 1 && d3d <= 5) ? d3d - 1 : 0;
+    }
+    inline uint32_t VkCompareOp(uint32_t d3d)
+    {
+        return (d3d >= 1 && d3d <= 8) ? d3d - 1 : 5;
+    }
+
+    // DXVK's alpha-test precision is a pure function of the RT0 format
+    // (d3d9_device.cpp GetAlphaTestPrecision), so it rides in specialization
+    // constant 0 and is TIED to the render-target set, never crossed.
+    inline uint32_t AlphaPrecision(D3DFORMAT rt0)
+    {
+        switch ((uint32_t)rt0)
+        {
+        case 111: case 112: case 113: return 0x7;   // R16F, G16R16F, A16B16G16R16F
+        case 34: case 36: case 60: case 81: case 110: return 0x8;
+        case 114: case 115: case 116: return 0xF;   // R32F, G32R32F, A32B32G32R32F
+        default: return 0;
+        }
+    }
+
+    // DxvkBlendMode::normalize (dxvk_constant_state.cpp:69). A blend that
+    // cannot change the result is recorded as no blend at all, a zero write
+    // mask turns it off, and the factors of a channel nobody writes are
+    // zeroed -- so two D3D9 states that differ only in a factor no one reads
+    // are ONE pipeline, and one job, not two.
+    struct BlendKey
+    {
+        uint8_t enable, cs, cd, co, sa, da, oa, wm;
+        bool operator==(const BlendKey& o) const
+        { return memcmp(this, &o, sizeof(o)) == 0; }
+    };
+
+    inline BlendKey NormaliseBlend(uint32_t enable, uint32_t src, uint32_t dst, uint32_t op,
+                                   uint32_t sep, uint32_t srcA, uint32_t dstA, uint32_t opA,
+                                   uint32_t wm)
+    {
+        uint32_t cs = VkBlendFactor(src), cd = VkBlendFactor(dst), co = VkBlendOp(op);
+        uint32_t sa = cs, da = cd, oa = co;
+        if (sep) { sa = VkBlendFactor(srcA); da = VkBlendFactor(dstA); oa = VkBlendOp(opA); }
+        bool en = enable != 0;
+        wm &= 0xF;
+        if (!wm) en = false;
+        if (en)
+        {
+            if (co == 0 && cs == 0 && cd == 1) wm &= ~0x7u;
+            if (oa == 0 && sa == 0 && da == 1) wm &= ~0x8u;
+            bool need = false;
+            if (wm & 0x7) need = need || (cs != 1 || cd != 0 || co != 0);
+            if (wm & 0x8) need = need || (sa != 1 || da != 0 || oa != 0);
+            if (!need) en = false;
+        }
+        if (!en || !(wm & 0x7)) { cs = cd = co = 0; }
+        if (!en || !(wm & 0x8)) { sa = da = oa = 0; }
+        BlendKey k{};
+        k.enable = (uint8_t)(en ? 1 : 0);
+        k.cs = (uint8_t)cs; k.cd = (uint8_t)cd; k.co = (uint8_t)co;
+        k.sa = (uint8_t)sa; k.da = (uint8_t)da; k.oa = (uint8_t)oa;
+        k.wm = (uint8_t)wm;
+        return k;
+    }
 
     // ---------------------------------------------------------------------
     //  Axis 3 — vertex declarations.
@@ -474,37 +453,51 @@ namespace enginewarm
     // ---------------------------------------------------------------------
     enum GroupClass : uint8_t
     {
-        kG_Deferred = 0,     // deferred, deferredbs, imposterdeferred
+        kG_Deferred = 0,     // deferred, imposterdeferred
+        kG_DeferredBS,       // deferredbs
         kG_DeferredClip,     // deferredalphaclip
-        kG_Shadow,           // paraboloid + the named shadow techniques
-        kG_Reflection,       // reflection
-        kG_Forward,          // wd*, lightweight*, imposter, bs, default, unlit
-        kG_Named,            // everything reached only by LookupTechnique: post-fx, lighting, blits
+        kG_Forward,          // every OTHER grouped technique: entity geometry
+        kG_Named,            // reached only by LookupTechnique: post-fx, lighting, blits, HUD
         kG_Count
     };
 
+    // A technique is GROUPED when its name is "<group>_draw", "_drawskinned" or
+    // "_drawblit" -- that suffix is what the technique-group selector matches,
+    // and it is the only thing that decides whether a phase's bucket emitter
+    // can reach the pass at all. Everything else is reached by name from
+    // inside a phase's DrawList: post-FX, the lighting resolve, blits, the HUD.
+    //
+    // ONE CORRECTION, and it changes which pipelines get warmed: `paraboloid`
+    // is the dual-paraboloid REFLECTION group and draws into the fp16 scene
+    // set, not into the shadow set 06-phases §6 sent it to -- measured, 76,500
+    // draws at A16B16G16R16F/INTZ over a route (09-phase-contexts §6). It is a
+    // forward group here, along with `reflection`, and the shadow contexts are
+    // reached the way every other forward group reaches them: because a shadow
+    // phase binds them.
     inline GroupClass ClassifyTechnique(const char* name)
     {
-        if (!name) return kG_Named;
-        auto is = [&](const char* g) {
-            size_t n = strlen(g);
-            if (strncmp(name, g, n) != 0) return false;
-            const char* rest = name + n;
-            return strcmp(rest, "_draw") == 0 || strcmp(rest, "_drawskinned") == 0 ||
-                   strcmp(rest, "_drawblit") == 0;
-        };
-        if (strcmp(name, "draw") == 0 || strcmp(name, "drawskinned") == 0 || strcmp(name, "drawblit") == 0)
-            return kG_Forward;                       // the group literally named "default"
-        if (is("deferredalphaclip"))                  return kG_DeferredClip;
-        if (is("deferred") || is("deferredbs") || is("imposterdeferred")) return kG_Deferred;
-        if (is("paraboloid"))                         return kG_Shadow;
-        if (is("reflection"))                         return kG_Reflection;
-        if (is("wd") || is("wd_masked") || is("wd_local") || is("wd_local_masked") ||
-            is("lightweight0") || is("lightweight4") || is("imposter") || is("bs") || is("unlit"))
-            return kG_Forward;
-        // Instancing rides the forward scene set: DrawInstancedBatch forces no group.
-        if (strcmp(name, "draw_inst") == 0 || strcmp(name, "unlit_draw_inst") == 0) return kG_Forward;
-        return kG_Named;
+        if (!name || !*name) return kG_Named;
+        const size_t n = strlen(name);
+        const char* suffix = nullptr;
+        for (const char* s : { "_drawskinned", "_drawblit", "_draw" })
+        {
+            const size_t sn = strlen(s);
+            if (n > sn && strcmp(name + n - sn, s) == 0) { suffix = s; break; }
+        }
+        // The group literally named "default": its techniques carry no prefix.
+        if (!suffix)
+        {
+            if (strcmp(name, "draw") == 0 || strcmp(name, "drawskinned") == 0 ||
+                strcmp(name, "drawblit") == 0 || strcmp(name, "draw_inst") == 0 ||
+                strcmp(name, "unlit_draw_inst") == 0)
+                return kG_Forward;
+            return kG_Named;
+        }
+        const std::string g(name, n - strlen(suffix));
+        if (g == "deferredalphaclip")                    return kG_DeferredClip;
+        if (g == "deferredbs")                           return kG_DeferredBS;
+        if (g == "deferred" || g == "imposterdeferred")  return kG_Deferred;
+        return kG_Forward;
     }
 
     // ---------------------------------------------------------------------
@@ -523,10 +516,14 @@ namespace enginewarm
         uint16_t stateCount = 0;
         // Read from the LIVE shader objects with GetFunction, not joined from a
         // .fxc file by array index: the VS input signature the declaration is
-        // projected onto, and the sampler slots the PS declares with their
-        // texture dimension (0 = not declared).
+        // projected onto, the sampler slots the PS declares with their texture
+        // dimension (0 = not declared), the same for the VS's four vertex
+        // samplers, and the bytecode hash of each -- which is the name the
+        // containment scorer and every recorded key know a shader by.
         std::vector<std::pair<uint8_t, uint8_t>> sig;
         uint8_t  psDim[16]{};
+        uint8_t  vsDim[4]{};
+        uint64_t vsHash = 0, psHash = 0;
         uint8_t  group = kG_Named;
         uint16_t effect = 0;                // index into effectNames
     };
@@ -534,11 +531,18 @@ namespace enginewarm
     // Job::flags
     enum : uint8_t
     {
-        kJF_AlphaTest = 0x01,   // cross D3DRS_ALPHATESTENABLE on
-        kJF_TopoMask  = 0x06,   // 0 = list, 1 = strip, 2 = fan (shifted by 1)
-        kJF_TopoShift = 1,
+        kJF_TopoMask  = 0x03,   // 0 = list, 1 = strip, 2 = fan
+        kJF_VSSampler = 0x04,   // bind the VS's declared vertex samplers
         kJF_ClipPlane = 0x08,   // one user clip plane enabled (DXVK spec constant 0)
     };
+    // Job::psVariant: 0 = every declared slot bound, 1..16 = that slot left
+    // null, 17 = none bound. The material's binding pattern is the residue the
+    // render-target axis is not (10-key-spec.md §7): of 271 observed (PS,
+    // psSamplerTypes) pairs in a route, 223 bind every declared slot, 32 leave
+    // exactly one null and 2 leave all null -- so the family is LINEAR in the
+    // slot count and covers 94.8 % of what occurs. Crossing subsets would be
+    // exponential and buys the last 5 %.
+    constexpr uint8_t kPSV_AllBound = 0, kPSV_NoneBound = 17;
 
     // NOT an axis, and the evidence for leaving it out, because it looks like
     // one: DXVK's per-sampler MODE (spec ids 4/5, psSamplerModes) can only be
@@ -560,7 +564,26 @@ namespace enginewarm
         uint8_t  ctx;
         uint8_t  state;
         uint8_t  flags;     // kJF_*
+        uint8_t  psVariant; // kPSV_*
         uint32_t rank;      // ascending draw order
+    };
+
+    // The pipeline identity a job intends to build, in DXVK 3.1.1's own terms
+    // (10-key-spec.md §2). It is the dedup key AND what the emission log
+    // carries, so the containment scorer measures what this code emits rather
+    // than a model of it.
+    struct JobKey
+    {
+        uint64_t vs, ps;
+        uint64_t proj;                  // the declaration projected onto the VS signature
+        uint32_t rt[4], ds;
+        BlendKey blend[4];
+        uint32_t prim;                  // D3DPRIMITIVETYPE
+        uint32_t spec0;                 // alpha compare op | precision << 4
+        uint32_t psTypes, vsTypes;      // specialization constants 4 and 3
+        uint32_t clip;                  // enabled, non-zero user clip planes
+        uint32_t freq[4];               // SetStreamSourceFreq per stream
+        uint32_t srgb;
     };
 
     struct Census
@@ -568,14 +591,17 @@ namespace enginewarm
         uint32_t effects = 0, techniques = 0, passes = 0, vs = 0, ps = 0;
         uint32_t effectsJoined = 0, techniquesJoined = 0;
         uint32_t techByIndex = 0, techByHash = 0, techUnmatched = 0;
-        uint32_t phases = 0, phaseTargets = 0, namedTargets = 0;
-        uint32_t contextsFromPhases = 0, contextsDerived = 0, contextsShipped = 0;
-        uint32_t phaseWaitMs = 0;
+        uint32_t phases = 0, phaseTargets = 0, registryTargets = 0, registryTextured = 0;
+        uint32_t contextsFromPhases = 0, contextsFromRegistry = 0, contextsShipped = 0;
         uint32_t declsShipped = 0, declsLive = 0, declsTotal = 0;
         uint32_t liveRegistryEntries = 0;
         uint32_t jobsEmitted = 0, jobsDeduped = 0, jobsCapped = 0;
         uint32_t shaderObjects = 0, shaderRead = 0, shaderFailed = 0, passesDropped = 0;
         uint32_t projectionsPerPass100 = 0;   // mean x100
+        uint32_t groupPasses[kG_Count] = {};
+        // per-axis multiplicity of the emission, for the log
+        uint32_t axisProj = 0, axisRT = 0, axisBlend = 0, axisPrim = 0;
+        uint32_t axisSpec0 = 0, axisPSTypes = 0, axisVSTypes = 0, axisClip = 0, axisShaders = 0;
     };
 
     struct Plan
@@ -586,11 +612,20 @@ namespace enginewarm
         std::vector<Context>  contexts;
         std::vector<Decl>     decls;
         std::vector<Job>      jobs;
+        // Parallel to jobs, and kept only when the emission log is on: a
+        // JobKey is 120 bytes and there can be a third of a million of them,
+        // which is 40 MB of a 32-bit process that already holds GTA IV's heap.
+        // The fingerprint below is accumulated as they are emitted instead, so
+        // the "has anything changed" test costs nothing.
+        bool                  keepKeys = false;
+        std::vector<JobKey>   keys;
+        uint64_t              enumFingerprint = 1469598103934665603ull;
         std::vector<uint32_t> stateWords;   // (key, value) pairs, PassInfo::stateOff
         std::vector<std::string> effectNames;
         uint32_t stateToRS[kRageStates]{};
         uint32_t defaultRS[kRageStates]{};
         uint32_t liveState[0x25]{};
+        uint32_t msType = 0, msQuality = 0; // from FusionFix's own setting, not the engine
         Census   census;
     };
 
@@ -629,45 +664,68 @@ namespace enginewarm
     }
 
     // ---------------------------------------------------------------------
-    //  Axis 1 — walk the render-phase list for every target set that exists.
+    //  Axis 1 — the contexts, classified.
     // ---------------------------------------------------------------------
-    inline D3DFORMAT TargetFormat(uintptr_t rt, uint32_t& msType, uint32_t& msQuality, std::string& name)
-    {
-        msType = msQuality = 0;
-        if (!rt) return D3DFMT_UNKNOWN;
-        uintptr_t nameP = 0;
-        if (Peek(rt + kRT_Name, nameP) && nameP) PeekName(nameP, name);
+    inline bool IsLdr(D3DFORMAT f) { return f == D3DFMT_A8R8G8B8 || f == D3DFMT_X8R8G8B8; }
 
-        // The authoritative format is the texture's, NOT the rage format byte:
-        // rage 14 says D24S8 but the texture is always created as INTZ.
-        IDirect3DTexture9* tex = nullptr;
-        if (!Peek(rt + kRT_Tex, tex) || !tex) return D3DFMT_UNKNOWN;
-        D3DSURFACE_DESC sd{};
-        IDirect3DSurface9* surf = nullptr;
-        if (FAILED(tex->GetSurfaceLevel(0, &surf)) || !surf) return D3DFMT_UNKNOWN;
-        HRESULT hr = surf->GetDesc(&sd);
-        surf->Release();
-        if (FAILED(hr)) return D3DFMT_UNKNOWN;
-        msType = (uint32_t)sd.MultiSampleType;
-        msQuality = sd.MultiSampleQuality;
-        return sd.Format;
+    inline uint8_t ClassifyContext(const Context& c)
+    {
+        const bool depth = c.depth != D3DFMT_UNKNOWN;
+        if (c.mrt >= 3) return kCtx_GBuffer;
+        if (c.mrt == 2) return depth ? kCtx_Scene2 : kCtx_Water;
+        if (depth)
+        {
+            if (c.color[0] == D3DFMT_A16B16G16R16F) return c.clip ? kCtx_Reflect : kCtx_Scene;
+            if (c.color[0] == D3DFMT_R32F)          return kCtx_Cascade;
+            if (c.color[0] == D3DFMT_G16R16F)       return kCtx_Point;
+            if (c.color[0] == D3DFMT_R16F)          return kCtx_Height;
+            if (IsLdr(c.color[0]))                  return kCtx_Ldr;
+            return kCtx_Other;
+        }
+        if (IsLdr(c.color[0]))                      return kCtx_LdrNoDepth;
+        if (c.color[0] == D3DFMT_A16B16G16R16F)     return kCtx_Fp16NoDepth;
+        if (c.color[0] == D3DFMT_R32F)              return kCtx_R32NoDepth;
+        if (c.color[0] == D3DFMT_R16F)              return kCtx_R16NoDepth;
+        if (c.color[0] == D3DFMT_L8)                return kCtx_L8;
+        if (c.color[0] == D3DFMT_G16R16F)           return kCtx_G16R16FNoDepth;
+        return kCtx_Other;
     }
 
-    inline bool AddContext(Plan& p, std::unordered_set<uint64_t>& seen, const Context& c)
+    inline bool AddContext(Plan& p, std::unordered_set<uint64_t>& seen, Context c)
     {
-        if (c.mrt == 0) return false;
+        if (c.mrt == 0 || c.color[0] == D3DFMT_UNKNOWN) return false;
+        c.kind = ClassifyContext(c);
         uint64_t key = pipelinekeys::Fnv1a(c.color, sizeof(c.color));
         key = pipelinekeys::Fnv1a(&c.depth, sizeof(c.depth), key);
         key = pipelinekeys::Fnv1a(&c.msType, sizeof(c.msType), key);
+        const uint32_t clip = c.clip ? 1u : 0u;
+        key = pipelinekeys::Fnv1a(&clip, sizeof(clip), key);
         if (!seen.insert(key).second) return false;
-        p.contexts.push_back(c);
+        p.contexts.push_back(std::move(c));
         return true;
     }
 
-    inline void EnumContexts(Plan& p, D3DFORMAT backBuffer)
+    // Every context the engine declares at the gate, plus the ones it can only
+    // be asked for indirectly.
+    //
+    //   * The PHASE SETS say which targets are bound TOGETHER. That is the only
+    //     source for the G-buffer MRT, the water-surface pair and the fp16 +
+    //     A8R8G8B8 composite -- no table and no registry walk can tell you that
+    //     four targets share a frame.
+    //   * The FACTORY REGISTRY is the whole format axis: 73 named targets in
+    //     gameplay, of which only 11 are reachable from any phase's +0x890
+    //     block. FullScreenTex_temp1/2, the post-FX chain, SMAA's edgesTex and
+    //     blendTex, SSAO's AOTex, CASCADE_ATLAS and script_rt live only there.
+    //   * The one thing the engine cannot answer here is the SAMPLE COUNT:
+    //     there is no D3D texture behind a target at this gate, and the sample
+    //     count is not in the rage struct. It comes from FusionFix's own
+    //     ReflectionMSAAQuality, which is the setting that puts one there.
+    inline void EnumContexts(Plan& p, const std::vector<bootgate::PhaseSet>& phases,
+                             const std::vector<bootgate::Target>& registry,
+                             D3DFORMAT backBuffer)
     {
         std::unordered_set<uint64_t> seen;
-        std::vector<D3DFORMAT> singleColour;   // every colour format the engine renders to
+        std::vector<D3DFORMAT> singleColour;
         D3DFORMAT engineDepth = D3DFMT_UNKNOWN;
 
         auto noteColour = [&](D3DFORMAT f) {
@@ -675,136 +733,113 @@ namespace enginewarm
             if (std::find(singleColour.begin(), singleColour.end(), f) == singleColour.end())
                 singleColour.push_back(f);
         };
+        auto isDepth = [](D3DFORMAT f) {
+            return f == (D3DFORMAT)FOURCC_INTZ_EW || f == D3DFMT_D24S8 || f == D3DFMT_D16 ||
+                   f == D3DFMT_D24X8 || f == D3DFMT_D32;
+        };
+        // A target whose phase clips the world against a reflection plane. The
+        // mirror and the two reflection phases do, so every draw in them
+        // carries a non-zero clipPlaneCount in specialization constant 0 -- 75
+        // route keys, all in the reflection group and in named techniques. It
+        // is a property of the CONTEXT, not a free axis.
+        auto clipped = [](const std::string& n) {
+            return n.find("REFLECTION") != std::string::npos ||
+                   n.find("MIRROR") != std::string::npos;
+        };
 
-        // The MRT3 trap: the G-buffer phase struct lists _DEFERRED_GBUFFER_3_
-        // (INTZ) in COLOUR slot 3, but ragePhase_GBuffer_RT_PreDrawList_CB
-        // (0x00AD2280) binds _STENCIL_BUFFER_ there. Taking the struct at face
-        // value emits a coordinate the game never draws; this substitution is
-        // load-bearing and is keyed on the target POINTER, not on a vtable, so
-        // it survives a phase-list reorder.
-        uintptr_t gbuf3 = 0, stencil = 0;
-        Peek(Rebase(kVA_GBuffer3), gbuf3);
-        Peek(Rebase(kVA_StencilBuffer), stencil);
-
-        // A phase list we cannot read is not fatal: the named targets below
-        // still give the single-colour sets, which is most of the coverage.
-        uintptr_t listBase = 0, arr = 0;
-        uint16_t count = 0;
-        if (Peek(Rebase(kVA_PhaseList), listBase) && listBase)
+        // --- the phase sets: which targets are bound together ---------------
+        p.census.phases = (uint32_t)phases.size();
+        for (const bootgate::PhaseSet& s : phases)
         {
-            uintptr_t a = 0; uint16_t n = 0;
-            if (Peek(listBase + 0x38, a) && Peek<uint16_t>(listBase + 0x3C, n) && a && n && n <= 256)
-            { arr = a; count = n; }
-        }
-        p.census.phases = count;
-
-        for (uint16_t i = 0; i < count; i++)
-        {
-            uintptr_t phase = 0;
-            if (!Peek(arr + i * 4, phase) || !phase) continue;
-            if (!Readable((const void*)(phase + kPhase_Slot0), 4 * kPhase_SlotStride)) continue;
-
             Context c;
-            for (int s = 0; s < 4; s++)
+            c.name = s.name;
+            c.mrt = s.mrt;
+            for (int i = 0; i < 4; i++)
             {
-                uintptr_t col = 0, dep = 0;
-                Peek(phase + kPhase_Slot0 + s * kPhase_SlotStride, col);
-                Peek(phase + kPhase_Slot0 + s * kPhase_SlotStride + kPhase_DepthDelta, dep);
-                if (col && gbuf3 && stencil && col == gbuf3 && s == 3) col = stencil;
-
-                uint32_t mt = 0, mq = 0; std::string n;
-                D3DFORMAT f = TargetFormat(col, mt, mq, n);
-                if (f != D3DFMT_UNKNOWN)
-                {
-                    c.color[s] = f;
-                    if (s + 1 > c.mrt) c.mrt = s + 1;
-                    if (c.name.empty()) c.name = n;
-                    if (mt) { c.msType = mt; c.msQuality = mq; }
-                    noteColour(f);
-                    p.census.phaseTargets++;
-                }
-                uint32_t dmt = 0, dmq = 0; std::string dn;
-                D3DFORMAT df = TargetFormat(dep, dmt, dmq, dn);
-                if (df != D3DFMT_UNKNOWN && c.depth == D3DFMT_UNKNOWN)
-                {
-                    c.depth = df;
-                    if (engineDepth == D3DFMT_UNKNOWN) engineDepth = df;
-                    if (dmt) { c.msType = dmt; c.msQuality = dmq; }
-                    p.census.phaseTargets++;
-                }
+                c.color[i] = s.colour[i].fmt;
+                if (c.color[i] != D3DFMT_UNKNOWN) { noteColour(c.color[i]); p.census.phaseTargets++; }
             }
-            c.fromPhase = true;
+            if (s.hasDepth)
+            {
+                c.depth = s.depth.fmt;
+                if (engineDepth == D3DFMT_UNKNOWN) engineDepth = c.depth;
+                p.census.phaseTargets++;
+            }
+            c.fromEngine = true;
+            c.clip = clipped(s.name);
+            if (c.msType == 0 && c.clip) { c.msType = p.msType; c.msQuality = p.msQuality; }
             AddContext(p, seen, c);
         }
         p.census.contextsFromPhases = (uint32_t)p.contexts.size();
 
-        // The phase list is not the whole picture: the post-fx phases bind
-        // their targets inside DrawList, and the shadow phases declare only the
-        // point pair. So also read the creators' own named globals, and form
-        // the single-colour sets from every colour format the engine renders
-        // to -- with and without depth, since a post-fx step usually has none.
-        //
-        // Measured against this rig's own 14543-key recording: the phase walk
-        // alone reaches the two dominant sets (10718 keys, 74 %); adding these
-        // reaches 11 of the 14 sets the recording holds (~96 % of its keys).
-        // What it still misses is fp16+A8R8G8B8 and A32B32G32R32F x2, both
-        // post-fx MRT pairs that only the DrawList-bound targets would give.
-        for (uintptr_t va : kVA_NamedTargets)
+        // --- the registry: every colour format the engine renders to --------
+        p.census.registryTargets = (uint32_t)registry.size();
+        for (const bootgate::Target& t : registry)
         {
-            uintptr_t rt = 0;
-            if (!Peek(Rebase(va), rt) || !rt) continue;
-            uint32_t mt = 0, mq = 0; std::string n;
-            D3DFORMAT f = TargetFormat(rt, mt, mq, n);
-            if (f == D3DFMT_UNKNOWN) continue;
-            p.census.namedTargets++;
-            if (f == (D3DFORMAT)FOURCC_INTZ_EW || f == D3DFMT_D24S8)
+            if (t.hasTexture) p.census.registryTextured++;
+            if (isDepth(t.fmt))
             {
-                if (engineDepth == D3DFMT_UNKNOWN) engineDepth = f;
-                continue;   // a depth target is not a colour format
+                if (engineDepth == D3DFMT_UNKNOWN) engineDepth = t.fmt;
+                continue;
             }
-            noteColour(f);
+            noteColour(t.fmt);
         }
         if (backBuffer != D3DFMT_UNKNOWN) noteColour(backBuffer);
-
         if (engineDepth == D3DFMT_UNKNOWN) engineDepth = (D3DFORMAT)FOURCC_INTZ_EW;
+
         for (D3DFORMAT f : singleColour)
         {
-            Context a; a.mrt = 1; a.color[0] = f; a.depth = engineDepth; a.name = "derived+depth";
+            Context a; a.mrt = 1; a.color[0] = f; a.depth = engineDepth;
+            a.name = "engine+depth"; a.fromEngine = true;
             AddContext(p, seen, a);
-            Context b; b.mrt = 1; b.color[0] = f; b.depth = D3DFMT_UNKNOWN; b.name = "derived";
+            Context b; b.mrt = 1; b.color[0] = f; b.name = "engine"; b.fromEngine = true;
             AddContext(p, seen, b);
         }
-        p.census.contextsDerived = (uint32_t)p.contexts.size() - p.census.contextsFromPhases;
+        // The reflection context: the scene set with a clip plane. It exists as
+        // a separate coordinate because clipPlaneCount is in the key and
+        // nothing else in the enumeration can reach it.
+        {
+            Context r; r.mrt = 1; r.color[0] = D3DFMT_A16B16G16R16F; r.depth = engineDepth;
+            r.clip = true; r.name = "engine reflect"; r.fromEngine = true;
+            r.msType = p.msType; r.msQuality = p.msQuality;
+            AddContext(p, seen, r);
+        }
+        p.census.contextsFromRegistry =
+            (uint32_t)p.contexts.size() - p.census.contextsFromPhases;
 
-        // The fallback layer. These are SHIPPED CONSTANTS, not engine reads,
-        // and the log says so: they exist because the gate can be earlier than
-        // phase creation, and a walk that only ever saw the back-buffer format
-        // would warm one target set out of the eleven the game uses. They are
-        // the same sets FusionFix's own coverage table has always carried,
-        // cross-checked against this rig's 14543-key recording: the phase walk
-        // plus these reach 11 of the 14 sets it holds, 99 % of its keys. Any
-        // set the engine really did declare is already in the list above and is
-        // not duplicated here.
-        struct FB { int mrt; D3DFORMAT c0, c1, c2, c3, d; };
+        // --- the fail-safe --------------------------------------------------
+        // SHIPPED CONSTANTS, and every one the log prints as 'shipped' rather
+        // than passing it off as an engine read. With the gate where it now is
+        // these should not fire at all: if any of them does, the engine did not
+        // declare a set the game is known to use, and that is worth seeing.
+        // Two of them cannot come from the engine at any gate -- the
+        // A32B32G32R32F pair is the GPU-particle target the factory only makes
+        // when particles first run, and the fp16+A8R8G8B8 composite is bound
+        // from inside a DrawList.
+        struct FB { int mrt; D3DFORMAT c0, c1, c2, c3; bool depth; };
         static const FB kFallback[] = {
-            { 1, D3DFMT_A16B16G16R16F, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, (D3DFORMAT)FOURCC_INTZ_EW },
-            { 4, D3DFMT_A8R8G8B8, D3DFMT_A8R8G8B8, D3DFMT_A8R8G8B8, D3DFMT_R16F,       (D3DFORMAT)FOURCC_INTZ_EW },
-            { 1, D3DFMT_G16R16F,       D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, (D3DFORMAT)FOURCC_INTZ_EW },
-            { 1, D3DFMT_R32F,          D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, (D3DFORMAT)FOURCC_INTZ_EW },
-            { 1, D3DFMT_R16F,          D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, (D3DFORMAT)FOURCC_INTZ_EW },
-            { 1, D3DFMT_A16B16G16R16F, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN },
-            { 1, D3DFMT_R32F,          D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN },
-            { 1, D3DFMT_G16R16F,       D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN },
-            { 1, D3DFMT_L8,            D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN },
-            { 1, D3DFMT_A2B10G10R10,   D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN },
-            { 1, D3DFMT_A8B8G8R8,      D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN },
-            { 2, D3DFMT_A16B16G16R16F, D3DFMT_A16B16G16R16F, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, (D3DFORMAT)FOURCC_INTZ_EW },
+            { 1, D3DFMT_A16B16G16R16F, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, true  },
+            { 4, D3DFMT_A8R8G8B8, D3DFMT_A8R8G8B8, D3DFMT_A8R8G8B8, D3DFMT_R16F,       true  },
+            { 1, D3DFMT_G16R16F,       D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, true  },
+            { 1, D3DFMT_R32F,          D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, true  },
+            { 1, D3DFMT_R16F,          D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, true  },
+            { 1, D3DFMT_A8R8G8B8,      D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, true  },
+            { 1, D3DFMT_A16B16G16R16F, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, false },
+            { 1, D3DFMT_R32F,          D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, false },
+            { 1, D3DFMT_G16R16F,       D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, false },
+            { 1, D3DFMT_R16F,          D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, false },
+            { 1, D3DFMT_L8,            D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, false },
+            { 1, D3DFMT_A8R8G8B8,      D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, false },
+            { 2, D3DFMT_A8R8G8B8, D3DFMT_A8R8G8B8, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN,     false },
+            { 2, D3DFMT_A16B16G16R16F, D3DFMT_A8R8G8B8, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, true },
+            { 2, D3DFMT_A32B32G32R32F, D3DFMT_A32B32G32R32F, D3DFMT_UNKNOWN, D3DFMT_UNKNOWN, false },
         };
         for (const FB& f : kFallback)
         {
             Context c;
             c.mrt = f.mrt; c.color[0] = f.c0; c.color[1] = f.c1; c.color[2] = f.c2; c.color[3] = f.c3;
-            c.depth = f.d; c.name = "shipped";
+            c.depth = f.depth ? engineDepth : D3DFMT_UNKNOWN;
+            c.name = "shipped";
             if (AddContext(p, seen, c)) p.census.contextsShipped++;
         }
     }
@@ -920,12 +955,13 @@ namespace enginewarm
     //  declarations that agree on what a shader READS are one pipeline, which
     //  is why the axis costs ~4.9x per pass and not 29x.
     // ---------------------------------------------------------------------
-    inline bool Project(const std::vector<std::pair<uint8_t, uint8_t>>& sig, const Decl& d,
-                        uint64_t& out, uint32_t& matched)
+    struct ProjSlot { uint8_t stream, type; uint16_t offset; };   // stream 0xFF = null binding
+
+    inline uint32_t ProjectSlots(const std::vector<std::pair<uint8_t, uint8_t>>& sig,
+                                 const Decl& d, ProjSlot* slots, size_t cap)
     {
-        struct Slot { uint8_t stream, type; uint16_t offset; } slots[32]{};
-        matched = 0;
-        const size_t n = (std::min)(sig.size(), (size_t)32);
+        uint32_t matched = 0;
+        const size_t n = (std::min)(sig.size(), cap);
         for (size_t i = 0; i < n; i++)
         {
             uint8_t want = sig[i].first;
@@ -943,69 +979,75 @@ namespace enginewarm
                 }
             }
         }
-        out = pipelinekeys::Fnv1a(slots, n * sizeof(Slot));
+        return matched;
+    }
+
+    inline bool Project(const std::vector<std::pair<uint8_t, uint8_t>>& sig, const Decl& d,
+                        uint64_t& out, uint32_t& matched)
+    {
+        ProjSlot slots[32]{};
+        const size_t n = (std::min)(sig.size(), (size_t)32);
+        matched = ProjectSlots(sig, d, slots, 32);
+        out = pipelinekeys::Fnv1a(slots, n * sizeof(ProjSlot));
         return matched == n;
     }
 
     // ---------------------------------------------------------------------
-    //  The coordinate tie: which (context, state) pairs a group can be drawn
-    //  at. Index 0 is the primary; the rest are level-2 extras.
+    //  The coordinate tie: which (render-target set, state vector) pairs a
+    //  group's passes can actually be drawn at.
+    //
+    //  Source: ragePhase_EmitRenderListDrawCommands -> ragePhase_EmitBucketDraw
+    //  -> the forward (0x00AE38B0) / deferred (0x00AE2B70) emitters. Only the
+    //  deferred emitter installs state; the forward one installs nothing that
+    //  can fork a pipeline. So the deferred groups are pinned to the G-buffer
+    //  set and its two write-mask vectors, and every forward group can occur on
+    //  any forward target set a phase binds.
+    //
+    //  The two lists are CROSSED, because a phase binds its targets and pushes
+    //  its vector independently. They are level-ordered: the head of each list
+    //  is what that group's own phase always does, the tail is what other
+    //  phases can also draw it at. 10-key-spec.md §5.
     // ---------------------------------------------------------------------
-    struct Coord { int ctxKind; uint8_t state; };
-    // ctxKind selects a context by shape rather than by index, because which
-    // phases exist depends on the game state at the gate. kCtxAllSingle is not
-    // a shape but an instruction: emit at EVERY single-colour context, which is
-    // what the post-fx / lighting / blit passes need -- their target is
-    // whatever step of the chain they are, and the chain visits most of the
-    // engine's formats.
-    enum { kCtxGBuffer = 0, kCtxScene, kCtxShadow, kCtxWaterSurface, kCtxOther };
-    constexpr int kCtxAllSingle = -2;
+    struct Tie { const uint8_t* rts; uint8_t nRts; const uint8_t* svs; uint8_t nSvs; };
 
-    inline int ContextKind(const Context& c)
-    {
-        if (c.mrt >= 3) return kCtxGBuffer;
-        if (c.mrt == 2 && c.depth == D3DFMT_UNKNOWN) return kCtxWaterSurface;
-        if (c.mrt == 1 && c.color[0] == D3DFMT_A16B16G16R16F) return kCtxScene;
-        if (c.mrt == 1 && (c.color[0] == D3DFMT_G16R16F || c.color[0] == D3DFMT_R32F ||
-                           c.color[0] == D3DFMT_R16F))
-            return kCtxShadow;
-        return kCtxOther;
-    }
+    static const uint8_t kRT_Deferred[] = { kCtx_GBuffer };
+    static const uint8_t kRT_Forward[]  = { kCtx_Scene, kCtx_Cascade, kCtx_Point, kCtx_Ldr,
+                                            kCtx_Reflect, kCtx_Height, kCtx_Water, kCtx_Scene2 };
+    // A named technique binds its own target from inside DrawList rather than
+    // declaring it in the phase's +0x890 block: post-FX, the lighting resolve,
+    // the blits, the HUD. These are the single-colour sets those targets have.
+    static const uint8_t kRT_Named[]    = { kCtx_Scene, kCtx_LdrNoDepth, kCtx_Fp16NoDepth,
+                                            kCtx_R32NoDepth, kCtx_Ldr, kCtx_Reflect, kCtx_Cascade,
+                                            kCtx_R16NoDepth, kCtx_L8, kCtx_G16R16FNoDepth,
+                                            kCtx_Scene2, kCtx_Point };
 
-    // Which (context kind, state vector) pairs each group is emitted at. The
-    // first entry of a row is the primary coordinate -- the one gameplay
-    // reaches on the common path -- and is emitted at every level; the rest
-    // are the level-2 extras (the depth-only prepass, the RT0-only forward
-    // pass, and the three transparency blend vectors).
-    static const Coord kTie[kG_Count][4] = {
-        /* deferred      */ { { kCtxGBuffer, kSV_GBufStd   }, { kCtxShadow, kSV_DepthOnly }, { kCtxGBuffer, kSV_DepthOnly }, { -1, 0 } },
-        /* deferredclip  */ { { kCtxGBuffer, kSV_GBufClip  }, { kCtxShadow, kSV_DepthOnly }, { -1, 0 },                      { -1, 0 } },
-        /* shadow        */ { { kCtxShadow,  kSV_DepthOnly }, { kCtxShadow, kSV_ForwardRT0 }, { -1, 0 },                     { -1, 0 } },
-        /* reflection    */ { { kCtxScene,   kSV_Forward   }, { kCtxScene,  kSV_FwdBlend  }, { -1, 0 },                      { -1, 0 } },
-        /* forward       */ { { kCtxScene,   kSV_Forward   }, { kCtxScene,  kSV_FwdBlend  }, { kCtxScene, kSV_FwdAdd },      { kCtxScene, kSV_ForwardRT0 } },
-        /* named         */ { { kCtxAllSingle, kSV_Forward }, { kCtxAllSingle, kSV_FwdBlend }, { kCtxScene, kSV_Forward }, { -1, 0 } },
+    static const uint8_t kSV_DeferredList[]  = { kSV_GBufStd, kSV_GBufAlpha, kSV_Fwd, kSV_FwdNoAlpha };
+    static const uint8_t kSV_DeferredBSList[]= { kSV_GBufStd, kSV_GBufAlpha };
+    static const uint8_t kSV_DeferredClipL[] = { kSV_GBufClip, kSV_GBufClipA, kSV_GBufStd, kSV_GBufAlpha };
+    static const uint8_t kSV_ForwardList[]   = { kSV_Fwd, kSV_FwdBlend, kSV_FwdNoAlpha, kSV_FwdBlendNA };
+
+#define EW_TIE(r, s) { r, (uint8_t)(sizeof(r) / sizeof(r[0])), s, (uint8_t)(sizeof(s) / sizeof(s[0])) }
+    static const Tie kTie[kG_Count] = {
+        /* deferred     */ EW_TIE(kRT_Deferred, kSV_DeferredList),
+        /* deferredbs   */ EW_TIE(kRT_Deferred, kSV_DeferredBSList),
+        /* deferredclip */ EW_TIE(kRT_Deferred, kSV_DeferredClipL),
+        /* forward      */ EW_TIE(kRT_Forward,  kSV_ForwardList),
+        /* named        */ EW_TIE(kRT_Named,    kSV_ForwardList),
     };
+#undef EW_TIE
 
-    // Render states a pass's own PASS_VALUE delta can move that DXVK bakes
-    // into the pipeline. Used only to fingerprint the delta for dedup -- the
-    // draw applies every entry of the delta, exactly as grcEffectPass::Apply
-    // does (01-effects §4.3).
-    inline bool IsPipelineRS(uint32_t rs)
-    {
-        switch (rs)
-        {
-        case D3DRS_ZWRITEENABLE: case D3DRS_ALPHATESTENABLE: case D3DRS_SRCBLEND:
-        case D3DRS_DESTBLEND: case D3DRS_ALPHAREF: case D3DRS_ALPHAFUNC:
-        case D3DRS_ALPHABLENDENABLE: case D3DRS_BLENDOP: case D3DRS_COLORWRITEENABLE:
-        case D3DRS_COLORWRITEENABLE1: case D3DRS_COLORWRITEENABLE2: case D3DRS_COLORWRITEENABLE3:
-        case D3DRS_SEPARATEALPHABLENDENABLE: case D3DRS_SRCBLENDALPHA:
-        case D3DRS_DESTBLENDALPHA: case D3DRS_BLENDOPALPHA:
-        case D3DRS_FOGENABLE: case D3DRS_CLIPPLANEENABLE:
-            return true;
-        default:
-            return false;
-        }
-    }
+    // Budget levels: how many render-target sets and how many state vectors are
+    // taken from the head of those lists, and whether the material's
+    // sampler-binding family is emitted. 10-key-spec.md §6 measured what each
+    // costs and what each contains; the ini text carries the same numbers.
+    struct LevelSpec { uint8_t nRts, nSvs; bool samplerVariants; };
+    static const LevelSpec kLevels[] = {
+        { 1,  1, false },   // 0 legacy   -- one context per pass
+        { 2,  4, false },   // 1 core     -- the contexts that group's own phase binds
+        { 2,  4, true  },   // 2 material -- core + the sampler-binding variants
+        { 12, 4, true  },   // 3 wide     -- every context any phase can bind, + variants
+    };
+    constexpr int kMaxLevel = 3;
 
     // ---------------------------------------------------------------------
     //  Walk RAGE's own effect registry. The .fxc database supplies the
@@ -1170,60 +1212,141 @@ namespace enginewarm
     }
 
     // ---------------------------------------------------------------------
+    //  The effective render state one (phase state vector, pass) pair
+    //  produces: the engine's own default block at 0x0106B420, then the phase
+    //  callback's overrides, then the pass's own PASS_VALUE delta.
+    //
+    //  The order matters. The default block has ALPHABLENDENABLE = 1 with
+    //  SRCALPHA/INVSRCALPHA, most phase callbacks turn it off, and a pass can
+    //  turn it back on -- which is why one technique group shows both a
+    //  blending and a non-blending pipeline in a trace, and why the blend
+    //  triple belongs to the PASS and not to a table of phase vectors.
+    // ---------------------------------------------------------------------
+    struct EffectiveRS
+    {
+        uint32_t wm[4]{ 15, 15, 15, 15 };
+        uint32_t blendEnable = 1, src = D3DBLEND_SRCALPHA, dst = D3DBLEND_INVSRCALPHA;
+        uint32_t op = D3DBLENDOP_ADD, sep = 0;
+        uint32_t srcA = D3DBLEND_ONE, dstA = D3DBLEND_ZERO, opA = D3DBLENDOP_ADD;
+        uint32_t alphaTest = 1, alphaFunc = D3DCMP_NOTEQUAL;
+    };
+
+    inline EffectiveRS ResolveRS(const Plan& p, const int* rsIdx,
+                                 const PassInfo& pass, const StateVec& sv)
+    {
+        EffectiveRS e;
+        auto get = [&](uint32_t rs, uint32_t fallback) {
+            return rsIdx[rs] >= 0 ? p.defaultRS[rsIdx[rs]] : fallback;
+        };
+        e.wm[0] = get(D3DRS_COLORWRITEENABLE, 15);
+        e.wm[1] = get(D3DRS_COLORWRITEENABLE1, 15);
+        e.wm[2] = get(D3DRS_COLORWRITEENABLE2, 15);
+        e.wm[3] = get(D3DRS_COLORWRITEENABLE3, 15);
+        e.blendEnable = get(D3DRS_ALPHABLENDENABLE, 1);
+        e.src  = get(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        e.dst  = get(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        e.op   = get(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+        e.sep  = get(D3DRS_SEPARATEALPHABLENDENABLE, 0);
+        e.srcA = get(D3DRS_SRCBLENDALPHA, D3DBLEND_ONE);
+        e.dstA = get(D3DRS_DESTBLENDALPHA, D3DBLEND_ZERO);
+        e.opA  = get(D3DRS_BLENDOPALPHA, D3DBLENDOP_ADD);
+        e.alphaTest = get(D3DRS_ALPHATESTENABLE, 1);
+        e.alphaFunc = get(D3DRS_ALPHAFUNC, D3DCMP_NOTEQUAL);
+
+        // the phase callback
+        for (int i = 0; i < 4; i++) e.wm[i] = sv.cwe[i];
+        e.blendEnable = sv.blendEnable ? 1u : 0u;
+        e.alphaTest   = sv.alphaTest ? 1u : 0u;
+
+        // the pass's own delta
+        for (uint16_t s = 0; s < pass.stateCount; s++)
+        {
+            const uint32_t key = p.stateWords[pass.stateOff + s * 2];
+            const uint32_t val = p.stateWords[pass.stateOff + s * 2 + 1];
+            if (key >= kRageStates || !RSReaches(p.stateToRS[key])) continue;
+            switch (p.stateToRS[key])
+            {
+            case D3DRS_COLORWRITEENABLE:  e.wm[0] = val; break;
+            case D3DRS_COLORWRITEENABLE1: e.wm[1] = val; break;
+            case D3DRS_COLORWRITEENABLE2: e.wm[2] = val; break;
+            case D3DRS_COLORWRITEENABLE3: e.wm[3] = val; break;
+            case D3DRS_ALPHABLENDENABLE:  e.blendEnable = val; break;
+            case D3DRS_SRCBLEND:          e.src = val; break;
+            case D3DRS_DESTBLEND:         e.dst = val; break;
+            case D3DRS_BLENDOP:           e.op = val; break;
+            case D3DRS_SEPARATEALPHABLENDENABLE: e.sep = val; break;
+            case D3DRS_SRCBLENDALPHA:     e.srcA = val; break;
+            case D3DRS_DESTBLENDALPHA:    e.dstA = val; break;
+            case D3DRS_BLENDOPALPHA:      e.opA = val; break;
+            case D3DRS_ALPHATESTENABLE:   e.alphaTest = val; break;
+            case D3DRS_ALPHAFUNC:         e.alphaFunc = val; break;
+            default: break;
+            }
+        }
+        return e;
+    }
+
+    // Specialization constants 3 and 4: two bits per slot, 3 = null or unused.
+    // DXVK folds nullOrUnusedMask = ~usedSamplerMask | ~usedTextureMask into
+    // type 3 (d3d9_state.h updateSamplers), so an undeclared slot is 3 whatever
+    // is bound and a declared slot with no texture is 3 as well.
+    inline uint32_t SamplerSpec(const uint8_t* dim, int slots, bool bind, int nullSlot)
+    {
+        uint32_t v = 0;
+        for (int s = 0; s < slots; s++)
+        {
+            uint32_t t = 3;
+            if (bind && dim[s] && s != nullSlot)
+                t = (dim[s] == 3) ? 2u : (dim[s] == 4 ? 1u : 0u);   // CUBE, VOLUME, else 2D
+            v |= (t & 3u) << (2 * s);
+        }
+        return v;
+    }
+
+    // ---------------------------------------------------------------------
     //  Build the cross product that can actually occur.
+    //
+    //  One job = one (pass, projection, context, topology, PS sampler pattern,
+    //  VS sampler pattern), and therefore one intended pipeline identity. The
+    //  job CARRIES that identity, so dedup is over what DXVK will key on
+    //  rather than over the axes we happened to vary -- and the same identity
+    //  is what the emission log hands the containment scorer.
     // ---------------------------------------------------------------------
     inline void BuildJobs(Plan& p, int level)
     {
-        // Resolve each context kind to the contexts that HAVE that shape --
-        // plural, because keeping only the first silently dropped the second
-        // shadow format. kCtxShadow matches G16R16F, R32F and R16F alike, and
-        // R32F+INTZ is 767 keys and 48.2 M draws in this rig's recording, the
-        // second-heaviest set in the game; with one context per kind the
-        // cascade-shadow techniques were never warmed at it at all.
-        //
-        // Ordered so a cap sheds the least likely: what a render phase itself
-        // declared, then what was derived from a live engine target, then the
-        // shipped fallbacks, and within each the ones that carry depth (most of
-        // the game's draws do). A kind with no context of its own falls back to
-        // the scene set, which every install has.
-        std::vector<int> order(p.contexts.size());
-        for (size_t i = 0; i < order.size(); i++) order[i] = (int)i;
-        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-            const Context& A = p.contexts[(size_t)a];
-            const Context& B = p.contexts[(size_t)b];
-            if (A.fromPhase != B.fromPhase) return A.fromPhase;
-            const bool as = A.name == "shipped", bs = B.name == "shipped";
-            if (as != bs) return bs;
-            const bool ad = A.depth != D3DFMT_UNKNOWN, bd = B.depth != D3DFMT_UNKNOWN;
-            if (ad != bd) return ad;
-            return a < b;
-        });
+        if (level < 0) level = 0;
+        if (level > kMaxLevel) level = kMaxLevel;
+        const LevelSpec& L = kLevels[level];
 
-        const size_t ctxPerKind = (level >= 2) ? 6 : 3;
-        std::vector<int> byKind[kCtxOther + 1];
-        for (int i : order)
+        int rsIdx[256];
+        for (int i = 0; i < 256; i++) rsIdx[i] = -1;
+        for (uint32_t i = 0; i < kRageStates; i++)
+            if (RSReaches(p.stateToRS[i]) && p.stateToRS[i] < 256)
+                rsIdx[p.stateToRS[i]] = (int)i;
+
+        // Which contexts have each kind. Ordered so that what the engine itself
+        // declared comes before a shipped stand-in, and a set that carries
+        // depth before one that does not -- most of the game's draws do. Two
+        // per kind: one engine set and one stand-in is as far as a kind can
+        // usefully go, and a third is always a duplicate format tuple.
+        std::vector<int> byKind[kCtx_KindCount];
         {
-            std::vector<int>& v = byKind[ContextKind(p.contexts[(size_t)i])];
-            if (v.size() < ctxPerKind) v.push_back(i);
+            std::vector<int> order(p.contexts.size());
+            for (size_t i = 0; i < order.size(); i++) order[i] = (int)i;
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+                const Context& A = p.contexts[(size_t)a];
+                const Context& B = p.contexts[(size_t)b];
+                if (A.fromEngine != B.fromEngine) return A.fromEngine;
+                const bool ad = A.depth != D3DFMT_UNKNOWN, bd = B.depth != D3DFMT_UNKNOWN;
+                if (ad != bd) return ad;
+                return a < b;
+            });
+            for (int i : order)
+            {
+                std::vector<int>& v = byKind[p.contexts[(size_t)i].kind];
+                if (v.size() < 2) v.push_back(i);
+            }
         }
-        if (byKind[kCtxScene].empty() && !order.empty()) byKind[kCtxScene].push_back(order[0]);
-        for (int k = 0; k <= kCtxOther; k++)
-            if (byKind[k].empty()) byKind[k] = byKind[kCtxScene];
-
-        // The single-colour contexts a post-fx / lighting / blit pass is drawn
-        // at. Taken from ALL of them in that order, NOT from the per-kind lists:
-        // going through the lists put a two-target set at the head of kCtxOther
-        // and pushed L8 off the end, so a whole colour format got no job at all
-        // (measured live -- 'shipped=0' against set 10). Capped so neither level
-        // can multiply the whole walk by however many formats happen to exist;
-        // eight covers the eight heaviest single-colour sets this rig's
-        // recording holds.
-        const size_t singleCap = (level >= 2) ? 12 : 8;
-        std::vector<int> singles;
-        for (int i : order)
-            if (p.contexts[(size_t)i].mrt == 1 && singles.size() < singleCap)
-                singles.push_back(i);
-        if (singles.empty() && !p.contexts.empty()) singles.push_back(byKind[kCtxScene][0]);
 
         // Declaration ordering: most-drawn first, so a budget cut sheds the
         // rarest layouts rather than an arbitrary prefix.
@@ -1244,203 +1367,199 @@ namespace enginewarm
         // have dropped real coordinates, starting with the instancing layout
         // and the blit quads, which rank low on draw count but are not
         // optional. What the level changes is the COORDINATE count.
-        const uint32_t declCap = (uint32_t)p.decls.size();
-        const int coordCap = (level >= 2) ? 4 : 1;
 
         // A hard stop, so a plan that goes wrong cannot submit a million draws.
         // It STOPS the walk rather than skipping a push_back: the dedup set is
         // the thing that grows without bound otherwise, and in a 32-bit process
         // that already holds GTA IV's heap that matters more than the jobs do.
         // Jobs are ordered, so a cut sheds the speculative end.
-        constexpr size_t kMaxJobs = 150000;
+        constexpr size_t kMaxJobs = 400000;
         bool capped = false;
 
         std::unordered_set<uint64_t> seen;
-        seen.reserve(p.passes.size() * 8);
+        seen.reserve(p.passes.size() * 16);
         uint64_t projTotal = 0;
 
-        // The coordinates one pass may be drawn at, reused. `extra` carries the
-        // axes that are added AS a coordinate rather than crossed with every
-        // other one, because crossing them would multiply the whole walk.
-        struct CS { int ctx; uint8_t sv; uint8_t extra; bool primary; };
-        std::vector<CS> coords;
+        // Per-axis value sets, so the log can say what the enumeration varies
+        // before a single draw is issued.
+        std::unordered_set<uint64_t> axShaders, axProj, axRT, axBlend;
+        std::unordered_set<uint32_t> axPrim, axSpec0, axPS, axVS, axClip;
+
+        static const D3DPRIMITIVETYPE kTopoOf[3] =
+            { D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DPT_TRIANGLEFAN };
 
         for (uint32_t pi = 0; pi < p.passes.size() && !capped; pi++)
         {
             const PassInfo& pass = p.passes[pi];
-
-            // The pass's own state delta forks the pipeline too, so it is part
-            // of the identity even though it is not part of the coordinate.
-            uint64_t deltaHash = 1469598103934665603ull;
-            for (uint16_t s = 0; s < pass.stateCount; s++)
-            {
-                const uint32_t key = p.stateWords[pass.stateOff + s * 2];
-                const uint32_t val = p.stateWords[pass.stateOff + s * 2 + 1];
-                if (key < kRageStates && RSReaches(p.stateToRS[key]) && IsPipelineRS(p.stateToRS[key]))
-                {
-                    deltaHash = pipelinekeys::Fnv1a(&p.stateToRS[key], 4, deltaHash);
-                    deltaHash = pipelinekeys::Fnv1a(&val, 4, deltaHash);
-                }
-            }
+            if (pass.group < kG_Count) p.census.groupPasses[pass.group]++;
 
             // Which declarations can feed this VS: one per distinct projection,
             // preferring the ones that satisfy the signature outright.
             const std::vector<std::pair<uint8_t, uint8_t>>* sig = pass.sig.empty() ? nullptr : &pass.sig;
 
             std::vector<uint32_t> useDecls;
+            std::vector<uint64_t> useProj;
             if (sig && !sig->empty())
             {
                 std::unordered_set<uint64_t> projSeen;
                 uint32_t bestPartial = 0xFFFFFFFFu, bestMatched = 0;
-                for (uint32_t oi = 0; oi < declCap; oi++)
+                uint64_t bestProj = 0;
+                for (uint32_t oi = 0; oi < declOrder.size(); oi++)
                 {
                     const uint32_t di = declOrder[oi];
                     uint64_t proj = 0; uint32_t matched = 0;
                     const bool full = Project(*sig, p.decls[di], proj, matched);
                     if (!full)
                     {
-                        if (matched > bestMatched) { bestMatched = matched; bestPartial = di; }
+                        if (matched > bestMatched)
+                        { bestMatched = matched; bestPartial = di; bestProj = proj; }
                         continue;
                     }
-                    if (projSeen.insert(proj).second) useDecls.push_back(di);
+                    if (projSeen.insert(proj).second)
+                    { useDecls.push_back(di); useProj.push_back(proj); }
                 }
                 // One VS input signature in 47 is satisfied by no declaration
                 // that exists (07-geometry's open question). Those shaders are
                 // drawn with a null binding in gameplay, so the closest
                 // declaration is still the right pipeline to warm.
-                if (useDecls.empty() && bestPartial != 0xFFFFFFFFu) useDecls.push_back(bestPartial);
+                if (useDecls.empty() && bestPartial != 0xFFFFFFFFu)
+                { useDecls.push_back(bestPartial); useProj.push_back(bestProj); }
             }
-            if (useDecls.empty())
-                useDecls.push_back(declOrder.empty() ? 0u : declOrder[0]);
+            if (useDecls.empty() && !declOrder.empty())
+            {
+                useDecls.push_back(declOrder[0]);
+                useProj.push_back(DeclHash(p.decls[declOrder[0]].elems));
+            }
+            if (useDecls.empty()) continue;
             projTotal += useDecls.size();
 
-            coords.clear();
-            const Coord* row = kTie[pass.group];
-            for (int ci = 0; ci < coordCap; ci++)
-            {
-                if (row[ci].ctxKind == -1) break;
-
-                // A post-fx / lighting / blit pass is emitted at every
-                // single-colour context; everything else at every context that
-                // has its group's shape.
-                if (row[ci].ctxKind == kCtxAllSingle)
-                    for (int q : singles) coords.push_back({ q, row[ci].state, 0, ci == 0 });
-                else
-                    for (int q : byKind[row[ci].ctxKind]) coords.push_back({ q, row[ci].state, 0, ci == 0 });
-            }
+            // --- the contexts this group's passes can be drawn at ---------
+            const Tie& tie = kTie[pass.group < kG_Count ? pass.group : kG_Named];
+            const int nRts = (std::min)((int)tie.nRts, (int)L.nRts);
+            const int nSvs = (std::min)((int)tie.nSvs, (int)L.nSvs);
+            std::vector<std::pair<int, uint8_t>> coords;
+            for (int r = 0; r < nRts; r++)
+                for (int ctx : byKind[tie.rts[r]])
+                    for (int s = 0; s < nSvs; s++)
+                        coords.emplace_back(ctx, tie.svs[s]);
+            // The clipped context, for the groups a reflection or mirror phase
+            // can draw. DXVK packs the number of ENABLED, NON-ZERO user clip
+            // planes into specialization constant 0, so a vertex shader
+            // compiled with one is a different pipeline from the same shader
+            // compiled with none -- 75 route identities, all in the reflection
+            // group and in named techniques of material effects. It is one
+            // coordinate, not a crossed axis: crossing would double the whole
+            // enumeration to reach 8 % of it.
+            if (level >= 1 && (pass.group == kG_Forward || pass.group == kG_Named))
+                for (int ctx : byKind[kCtx_Reflect])
+                    coords.emplace_back(ctx, tie.svs[0]);
             if (coords.empty()) continue;
 
-            // The mined write-mask/blend extras, at the first coordinate only.
-            if (level >= 2)
+            // --- the material's sampler-binding family ---------------------
+            std::vector<int> psNull{ -1 };          // -1 = every declared slot bound
+            if (L.samplerVariants)
             {
-                const uint8_t* ex = nullptr; size_t exN = 0;
-                if (pass.group == kG_Deferred || pass.group == kG_DeferredClip)
-                { ex = kExtraDeferred; exN = sizeof(kExtraDeferred); }
-                else if (pass.group == kG_Named)
-                { ex = kExtraNamed; exN = sizeof(kExtraNamed); }
-                else if (pass.group == kG_Forward || pass.group == kG_Reflection)
-                { ex = kExtraForward; exN = sizeof(kExtraForward); }
-                const int at = coords[0].ctx;
-                for (size_t e = 0; e < exN; e++) coords.push_back({ at, ex[e], 0, false });
+                for (int s = 0; s < 16; s++) if (pass.psDim[s]) psNull.push_back(s);
+                psNull.push_back(16);               // 16 = none bound at all
             }
+            bool vsDeclares = false;
+            for (int s = 0; s < 4; s++) if (pass.vsDim[s]) vsDeclares = true;
 
-            // One user clip plane. DXVK packs the number of ENABLED, non-zero
-            // clip planes into spec constant 0 (UpdateClipPlanes ->
-            // setClipPlaneCount), so a vertex shader compiled with none is a
-            // different pipeline from the same shader compiled with one. The
-            // reflection, mirror and water phases run with one in gameplay:
-            // 473 of this rig's 14543 keys and 4.75 M draws carry
-            // CLIPPLANEENABLE = 1, 443 of them at the scene set. Added as one
-            // extra coordinate at the primary rather than crossed with
-            // everything, because it is one bit of a spec constant.
-            if (pass.group == kG_Forward || pass.group == kG_Reflection || pass.group == kG_Named)
-                coords.push_back({ coords[0].ctx, coords[0].sv, kJF_ClipPlane, false });
+            // Topology bakes into the pipeline: VK_DYNAMIC_STATE_PRIMITIVE_
+            // TOPOLOGY is not among the dynamic states DXVK 3.1.1 uses, so
+            // list, strip and fan are three pipelines for one shader pair. A
+            // GROUPED pass is entity geometry and RAGE draws it as an indexed
+            // triangle list -- every grouped key in the route trace is one. A
+            // named technique is a blit or a sprite batch and uses all three.
+            const int topoN = (pass.group == kG_Named) ? 3 : 1;
 
-            for (const CS& cs : coords)
+            for (const auto& cs : coords)
             {
-                const int ctx = cs.ctx;
-                const Context& C = p.contexts[(size_t)ctx];
-                const StateVec& SV = kStateVecs[cs.sv];
+                const Context& C = p.contexts[(size_t)cs.first];
+                const StateVec& SV = kStateVecs[cs.second];
+                const EffectiveRS rs = ResolveRS(p, rsIdx, pass, SV);
 
-                // Level 2 crosses alpha test 0/1: 724 passes set it, but the
-                // material overrides the pass's value in 13.5 % of draws, so
-                // the pass's own value is not a reliable read (README §3.1).
-                const int alphaN = (level >= 2 && cs.sv != kSV_DepthOnly) ? 2 : 1;
-                // Topology bakes into the pipeline: VK_DYNAMIC_STATE_PRIMITIVE_
-                // TOPOLOGY is not among the dynamic states DXVK 3.1.1 uses
-                // (dxvk_graphics.cpp:774-808), so list, strip and fan are three
-                // pipelines for one shader pair. 1537 of this rig's keys are
-                // strips and 121 fans -- 494 of its 5445 replay identities, and
-                // only 27 identities occur in more than one topology, so these
-                // really are pipelines nothing else warms. The blit / post-fx /
-                // lighting passes the engine reaches only by name are where
-                // they live (04-poc §3.5), so those get all three at every
-                // coordinate and everything else gets the second only at level 2.
-                const int topoN = (pass.group == kG_Named) ? 3 : (level >= 2 ? 2 : 1);
-                for (int a = 0; a < alphaN; a++)
-                for (int tp = 0; tp < topoN; tp++)
+                JobKey k{};
+                k.vs = pass.vsHash; k.ps = pass.psHash;
+                k.ds = (uint32_t)C.depth;
+                k.clip = C.clip ? 1u : 0u;
+                for (int i = 0; i < 4; i++)
                 {
-                    for (uint32_t di : useDecls)
+                    k.rt[i] = (uint32_t)C.color[i];
+                    if (C.color[i] != D3DFMT_UNKNOWN)
+                        k.blend[i] = NormaliseBlend(rs.blendEnable, rs.src, rs.dst, rs.op,
+                                                    rs.sep, rs.srcA, rs.dstA, rs.opA, rs.wm[i]);
+                }
+                // The alpha compare op and the alpha PRECISION share
+                // specialization constant 0, and the precision is a pure
+                // function of the RT0 format -- tied to the context, never a
+                // free axis.
+                k.spec0 = (rs.alphaTest ? VkCompareOp(rs.alphaFunc) : 7u) |
+                          (AlphaPrecision(C.color[0]) << 4);
+
+                for (int tp = 0; tp < topoN && !capped; tp++)
+                for (int vb = 0; vb < (vsDeclares ? 2 : 1) && !capped; vb++)
+                for (int ni = 0; ni < (int)psNull.size() && !capped; ni++)
+                {
+                    k.prim = (uint32_t)kTopoOf[tp];
+                    k.psTypes = SamplerSpec(pass.psDim, 16, psNull[ni] != 16, psNull[ni]);
+                    k.vsTypes = SamplerSpec(pass.vsDim, 4, vb != 0, -1);
+
+                    for (size_t d = 0; d < useDecls.size(); d++)
                     {
-                        uint64_t proj = 0; uint32_t matched = 0;
-                        if (sig && !sig->empty()) Project(*sig, p.decls[di], proj, matched);
-                        else proj = DeclHash(p.decls[di].elems);
+                        const uint32_t di = useDecls[d];
+                        k.proj = useProj[d];
+                        // Stream 1 of the instancing declaration carries
+                        // per-instance data, and DXVK puts the input RATE in
+                        // the key -- so it is part of the identity, not of the
+                        // draw call only. Recorded the way the draw tracer and
+                        // the recorded caches record it: 0 for a stream left at
+                        // the default, and only stream 1's INSTANCEDATA where
+                        // there is instancing. (The draw itself also has to put
+                        // INDEXEDDATA on stream 0, or DXVK draws one instance
+                        // and the pipeline is never the instanced one.)
+                        k.freq[1] = p.decls[di].instanced ? (D3DSTREAMSOURCE_INSTANCEDATA | 1u) : 0u;
 
-                        struct Id
-                        {
-                            void* vs; void* ps; uint64_t proj, delta;
-                            uint32_t color[4], depth, ms, msq;
-                            DWORD cwe[4]; uint32_t blend[4];
-                            uint32_t alpha, zw, topo, inst, clip;
-                        } id;
-                        memset(&id, 0, sizeof(id));
-                        id.vs = pass.vs; id.ps = pass.ps; id.proj = proj; id.delta = deltaHash;
-                        id.topo = (uint32_t)tp; id.inst = p.decls[di].instanced ? 1u : 0u;
-                        id.clip = (cs.extra & kJF_ClipPlane) ? 1u : 0u;
-                        id.depth = (uint32_t)C.depth; id.ms = C.msType; id.msq = C.msQuality;
-                        id.alpha = (a ? 1u : (SV.alphaTest ? 1u : 0u)); id.zw = SV.zWrite;
-                        for (int k = 0; k < 4; k++)
-                        {
-                            id.color[k] = (uint32_t)C.color[k];
-                            id.cwe[k]   = SV.cwe[k];
-                            // Normalise the blend triple the way DxvkBlendMode::
-                            // normalize does before it reaches the pipeline key:
-                            // blending that passes the source through, or that
-                            // writes no channel, is recorded as no blending at
-                            // all. Without this, two vectors that DXVK compiles
-                            // to one pipeline are two jobs and one wasted draw.
-                            const bool passthrough = SV.srcBlend == D3DBLEND_ONE &&
-                                                     SV.dstBlend == D3DBLEND_ZERO &&
-                                                     SV.blendOp  == D3DBLENDOP_ADD;
-                            if (SV.blendEnable && !passthrough && (SV.cwe[k] & 0xF))
-                                id.blend[k] = 1u | ((uint32_t)SV.srcBlend << 1) |
-                                              ((uint32_t)SV.dstBlend << 9) |
-                                              ((uint32_t)SV.blendOp  << 17);
-                        }
+                        if (!seen.insert(pipelinekeys::Fnv1a(&k, sizeof(k))).second)
+                        { p.census.jobsDeduped++; continue; }
+                        if (p.jobs.size() >= kMaxJobs)
+                        { p.census.jobsCapped++; capped = true; break; }
+                        p.enumFingerprint = pipelinekeys::Fnv1a(&k, sizeof(k), p.enumFingerprint);
 
-                        if (!seen.insert(pipelinekeys::Fnv1a(&id, sizeof(id))).second) { p.census.jobsDeduped++; continue; }
-                        if (p.jobs.size() >= kMaxJobs) { p.census.jobsCapped++; capped = true; break; }
+                        axShaders.insert(pipelinekeys::Fnv1a(&k.vs, 16));
+                        axProj.insert(k.proj);
+                        axRT.insert(pipelinekeys::Fnv1a(k.rt, sizeof(k.rt) + sizeof(k.ds)));
+                        axBlend.insert(pipelinekeys::Fnv1a(k.blend, sizeof(k.blend)));
+                        axPrim.insert(k.prim);
+                        axSpec0.insert(k.spec0);
+                        axPS.insert(k.psTypes);
+                        axVS.insert(k.vsTypes);
+                        axClip.insert(k.clip);
 
-                        Job j;
+                        Job j{};
                         j.pass = pi;
                         j.decl = (uint16_t)di;
-                        j.ctx = (uint8_t)ctx;
-                        j.state = cs.sv;
-                        j.flags = (uint8_t)((a ? kJF_AlphaTest : 0) |
-                                            ((uint8_t)tp << kJF_TopoShift) | cs.extra);
-                        // Ascending: primary coordinates first, then by how
-                        // much the declaration is drawn, then by context and
-                        // state. A budget cut therefore sheds the speculative
-                        // end rather than an arbitrary tail.
-                        j.rank = ((uint32_t)((cs.primary && !tp && !cs.extra) ? 0u : 1u) << 30) |
+                        j.ctx = (uint8_t)cs.first;
+                        j.state = cs.second;
+                        j.flags = (uint8_t)((uint8_t)tp |
+                                            (vb ? kJF_VSSampler : 0) |
+                                            (C.clip ? kJF_ClipPlane : 0));
+                        j.psVariant = (uint8_t)(psNull[ni] < 0 ? kPSV_AllBound
+                                                               : (psNull[ni] == 16 ? kPSV_NoneBound
+                                                                                   : psNull[ni] + 1));
+                        // Ascending: the head of each group's context list
+                        // first, then by how much the declaration is drawn,
+                        // then the sampler and topology variants. A budget cut
+                        // therefore sheds the speculative end rather than an
+                        // arbitrary tail.
+                        j.rank = ((uint32_t)((ni || tp || vb) ? 1u : 0u) << 30) |
                                  ((declRank[di] & 0x3FFu) << 20) |
-                                 (((uint32_t)ctx & 0x1Fu) << 15) |
-                                 (((uint32_t)cs.sv & 0x1Fu) << 10) |
-                                 ((uint32_t)a << 9) |
-                                 (pi & 0x1FFu);
+                                 (((uint32_t)cs.first & 0x3Fu) << 14) |
+                                 (((uint32_t)cs.second & 0xFu) << 10) |
+                                 (pi & 0x3FFu);
                         p.jobs.push_back(j);
+                        if (p.keepKeys) p.keys.push_back(k);
                     }
-                    if (capped) break;
                 }
                 if (capped) break;
             }
@@ -1448,8 +1567,31 @@ namespace enginewarm
         p.census.jobsEmitted = (uint32_t)p.jobs.size();
         p.census.projectionsPerPass100 = p.passes.empty() ? 0
             : (uint32_t)((projTotal * 100) / p.passes.size());
+        p.census.axisShaders = (uint32_t)axShaders.size();
+        p.census.axisProj    = (uint32_t)axProj.size();
+        p.census.axisRT      = (uint32_t)axRT.size();
+        p.census.axisBlend   = (uint32_t)axBlend.size();
+        p.census.axisPrim    = (uint32_t)axPrim.size();
+        p.census.axisSpec0   = (uint32_t)axSpec0.size();
+        p.census.axisPSTypes = (uint32_t)axPS.size();
+        p.census.axisVSTypes = (uint32_t)axVS.size();
+        p.census.axisClip    = (uint32_t)axClip.size();
 
-        std::stable_sort(p.jobs.begin(), p.jobs.end(), [](const Job& a, const Job& b) { return a.rank < b.rank; });
+        // Sort jobs and keys together: the key IS the job's identity and the
+        // emission log pairs them by index.
+        std::vector<uint32_t> ord(p.jobs.size());
+        for (uint32_t i = 0; i < ord.size(); i++) ord[i] = i;
+        std::stable_sort(ord.begin(), ord.end(),
+                         [&](uint32_t a, uint32_t b) { return p.jobs[a].rank < p.jobs[b].rank; });
+        std::vector<Job> sortedJobs(p.jobs.size());
+        for (uint32_t i = 0; i < ord.size(); i++) sortedJobs[i] = p.jobs[ord[i]];
+        p.jobs.swap(sortedJobs);
+        if (p.keepKeys && p.keys.size() == ord.size())
+        {
+            std::vector<JobKey> sortedKeys(p.keys.size());
+            for (uint32_t i = 0; i < ord.size(); i++) sortedKeys[i] = p.keys[ord[i]];
+            p.keys.swap(sortedKeys);
+        }
     }
 
     // Two calls, not one. Between them the caller reads every pass's shader
@@ -1457,13 +1599,16 @@ namespace enginewarm
     // declarations -- and AddRefs the objects it will bind, so the walk never
     // depends on a .fxc join by array index and never holds a pointer it has
     // not proved is a live shader. See EngineWarmPass in shaderprecompile.ixx.
-    inline void BuildTables(Plan& p, fxc_db* db, D3DFORMAT backBuffer)
+    inline void BuildTables(Plan& p, fxc_db* db,
+                            const std::vector<bootgate::PhaseSet>& phases,
+                            const std::vector<bootgate::Target>& registry,
+                            D3DFORMAT backBuffer)
     {
         if (!ResolveTables(p)) return;
         EnumPasses(p, db);
         if (p.passes.empty()) { p.why = "RAGE's effect registry holds no usable pass"; return; }
-        EnumContexts(p, backBuffer);
-        if (p.contexts.empty()) { p.why = "the render-phase list declares no render target"; return; }
+        EnumContexts(p, phases, registry, backBuffer);
+        if (p.contexts.empty()) { p.why = "the engine declares no render target"; return; }
         EnumDecls(p);
         if (p.decls.empty()) { p.why = "no vertex declaration could be built"; return; }
         p.ok = true;
@@ -1474,6 +1619,84 @@ namespace enginewarm
         BuildJobs(p, level);
         p.ok = !p.jobs.empty();
         if (!p.ok) p.why = "the tie produced no job";
+    }
+
+    // ---------------------------------------------------------------------
+    //  The emission log.
+    //
+    //  One line per intended pipeline identity, in exactly the fields
+    //  re/rage-shader-precompile/tools/warmspec.py reduces a corpus to. That
+    //  is the point: the containment gate can then be evaluated against what
+    //  this code EMITS rather than against a Python model of what it is
+    //  supposed to emit, and the two can be compared.
+    //
+    //  Off by default: the file is ~200 bytes a job.
+    // ---------------------------------------------------------------------
+    inline bool WriteEmissionLog(const Plan& p, const std::string& path, int level)
+    {
+        FILE* f = nullptr;
+        if (fopen_s(&f, path.c_str(), "wb") != 0 || !f) return false;
+        fprintf(f, "{\"kind\":\"enginewarm-emission\",\"level\":%d,\"jobs\":%zu,"
+                   "\"passes\":%zu,\"contexts\":%zu,\"decls\":%zu}\n",
+                level, p.keys.size(), p.passes.size(), p.contexts.size(), p.decls.size());
+        for (size_t i = 0; i < p.keys.size() && i < p.jobs.size(); i++)
+        {
+            const JobKey& k = p.keys[i];
+            const Job& j = p.jobs[i];
+            fprintf(f, "{\"vs\":%llu,\"ps\":%llu,\"proj\":[",
+                    (unsigned long long)k.vs, (unsigned long long)k.ps);
+            // The projection in full, not as a hash: the scorer compares it
+            // slot by slot against what the route trace's declaration produced
+            // for the same signature.
+            {
+                const PassInfo& pass = p.passes[j.pass];
+                ProjSlot slots[32]{};
+                const size_t n = (std::min)(pass.sig.size(), (size_t)32);
+                if (n && j.decl < p.decls.size())
+                    ProjectSlots(pass.sig, p.decls[j.decl], slots, 32);
+                for (size_t s = 0; s < n; s++)
+                {
+                    if (s) fputc(',', f);
+                    if (slots[s].stream == 0xFF) fputs("null", f);
+                    else fprintf(f, "[%u,%u,%u]", slots[s].stream, slots[s].type, slots[s].offset);
+                }
+            }
+            fprintf(f, "],\"rt\":[%u,%u,%u,%u],\"ds\":%u,\"srgb\":%u,\"blend\":[",
+                    k.rt[0], k.rt[1], k.rt[2], k.rt[3], k.ds, k.srgb);
+            for (int i = 0; i < 4; i++)
+            {
+                if (i) fputc(',', f);
+                if (!k.rt[i]) { fputs("null", f); continue; }
+                const BlendKey& b = k.blend[i];
+                fprintf(f, "[%u,%u,%u,%u,%u,%u,%u,%u]",
+                        b.enable, b.cs, b.cd, b.co, b.sa, b.da, b.oa, b.wm);
+            }
+            fprintf(f, "],\"prim\":%u,\"freq\":[%u,%u,%u,%u],\"spec0\":%u,"
+                       "\"psTypes\":%u,\"vsTypes\":%u,\"clip\":%u}\n",
+                    k.prim, k.freq[0], k.freq[1], k.freq[2], k.freq[3],
+                    k.spec0, k.psTypes, k.vsTypes, k.clip);
+        }
+        fclose(f);
+        return true;
+    }
+
+    // The fingerprint of an enumeration: if this has not changed, and the
+    // driver cache has not been thrown away, nothing the long pass would build
+    // is missing and it does not have to run again. It covers everything that
+    // decides WHICH pipelines the pass emits -- the level, the contexts, the
+    // declarations, and every identity it produced.
+    inline uint64_t EnumerationFingerprint(const Plan& p, int level)
+    {
+        uint64_t h = pipelinekeys::Fnv1a(&level, sizeof(level));
+        for (const Context& c : p.contexts)
+        {
+            h = pipelinekeys::Fnv1a(c.color, sizeof(c.color), h);
+            h = pipelinekeys::Fnv1a(&c.depth, sizeof(c.depth), h);
+            h = pipelinekeys::Fnv1a(&c.msType, sizeof(c.msType), h);
+            const uint32_t flags = (c.clip ? 1u : 0u) | (c.fromEngine ? 2u : 0u) | (c.kind << 2);
+            h = pipelinekeys::Fnv1a(&flags, sizeof(flags), h);
+        }
+        return pipelinekeys::Fnv1a(&p.enumFingerprint, sizeof(p.enumFingerprint), h);
     }
 }
 

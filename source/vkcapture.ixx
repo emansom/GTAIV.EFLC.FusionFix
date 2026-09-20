@@ -572,7 +572,15 @@ class VkCapture
             if (library) libraries++;
             if (link) linked++;
             if (us >= 1000) over1++;
-            if (us >= 5000) { over5++; if (library) slowLibraries++; }
+            if (us >= 5000)
+            {
+                over5++;
+                if (library) slowLibraries++;
+                // Shared, so the warm pass can ask "did the driver actually
+                // compile these, or did it already have them?" without
+                // reaching into this module's own counters.
+                pipelinekeys::VulkanReplay().compiles++;
+            }
             if (us >= 20000) over20++;
             uint64_t w = worstUs.load();
             while (us > w && !worstUs.compare_exchange_weak(w, us)) {}
@@ -1864,13 +1872,22 @@ class VkCapture
         // Nothing is created before the loading-screen pass and everything DXVK
         // compiled for it are done (VulkanReplayState): the D3D9 pass comes first, and
         // then the loading screen is held for this. If the pass never comes, this
-        // goes on in the background after 10 minutes.
+        // goes on in the background.
+        //
+        // The cap used to be 10 minutes, which was longer than any pass could take
+        // when it only replayed a recording. The engine warm phase can legitimately
+        // run for tens of minutes (PrecompileEngineWarm), and a cap that fires while
+        // the pass is still working breaks the one ordering rule that matters: this
+        // replay creates thousands of pipelines on most of the cores, and doing that
+        // WHILE the D3D9 pass is drawing turns the pass's own timings into noise and
+        // makes the two compete for the compiler threads. An hour is past any real
+        // pass and still bounded.
         const auto w0 = std::chrono::steady_clock::now();
         if (vr.passPlanned)
         {
             Log("replay: %u pipeline entries ready (%u own, %u in %zu other file(s)) - waiting for the loading-screen pass",
                 vr.total.load(), ownEntries, foreignEntries, foreign ? inputs.size() : (size_t)0);
-            while (!d->stop && !vr.passDone && since(w0) < 600.0) Sleep(20);
+            while (!d->stop && !vr.passDone && since(w0) < 3600.0) Sleep(20);
         }
         if (d->stop) return;
         const auto t0 = std::chrono::steady_clock::now();
@@ -1878,7 +1895,7 @@ class VkCapture
             vr.holding ? "with the loading screen held" :
             !vr.passPlanned ? "in the background (PrecompileShaders = 0)" :
             vr.passDone ? "in the background (the loading screen was not held)" :
-                          "in the background (no loading-screen pass after 600s)",
+                          "in the background (the loading-screen pass did not finish in an hour)",
             (unsigned long long)(AvailableVA() >> 20));
 
         // While the loading screen is held: most of the cores. Otherwise a few
