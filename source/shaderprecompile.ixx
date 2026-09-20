@@ -151,6 +151,19 @@ static void ParseShaderIO(const uint8_t* bytecode, uint32_t size, bool isVS, Sha
     if (!bytecode || size < 8) return;
     const uint32_t* dw = reinterpret_cast<const uint32_t*>(bytecode);
     uint32_t n = size / 4;
+    // The walk below reads the instruction-length field at bits 24..27, which
+    // exists from SM2 on and is ZERO for every SM1 instruction. On an SM1 token
+    // stream it would therefore step one dword at a time through operand data,
+    // miss real declarations and invent them out of constants -- and since a
+    // missing declaration now MASKS a sampler slot rather than merely being
+    // ignored, a mis-parse MERGES two pipelines into one key, which is the
+    // direction that under-warms and stutters. An absent map entry is safe (no
+    // masking at all); a present, wrong one is not. Nothing on this install is
+    // SM1, but replayBlobs carries bytecode from other PCs' shared caches and
+    // from arbitrary mods, and that is exactly the population the mask is
+    // applied to. So: no version, no mask.
+    const uint32_t major = (dw[0] >> 8) & 0xFF;
+    if (major < 2) return;
     uint32_t i = 1; // skip version token
     while (i < n)
     {
@@ -676,6 +689,24 @@ class ShaderPrecompiler
         dev->CreateCubeTexture(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &texCube, nullptr);
         dev->CreateVolumeTexture(4, 4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &texVol, nullptr);
 
+        // Six non-degenerate user clip planes.
+        //
+        // DXVK counts only the planes that are BOTH enabled in
+        // D3DRS_CLIPPLANEENABLE and not all-zero, and packs that COUNT into spec
+        // constant 0 (UpdateClipPlanes -> setClipPlaneCount, d3d9_device.cpp:6112).
+        // Every plane is zero unless somebody sets one, so setting
+        // CLIPPLANEENABLE without setting a plane compiles clipPlaneCount = 0 --
+        // which is what both the SpecVariants "clip" variant and the recorded
+        // replay were doing, making that whole axis a no-op. 473 of this rig's
+        // 14543 keys and 4.75 M draws carry a clip plane. The state block the
+        // pass takes is D3DSBT_ALL, which covers clip planes, so these are put
+        // back with everything else.
+        for (DWORD i = 0; i < 6; i++)
+        {
+            const float plane[4] = { 0.0f, 0.0f, 1.0f, (float)(i + 1) };
+            dev->SetClipPlane(i, plane);
+        }
+
         // Scratch depth (D24S8) and INTZ (readable-depth FOURCC) surfaces.
         dev->CreateDepthStencilSurface(kRTdim, kRTdim, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, FALSE, &scratchDepthD24S8, nullptr);
         if (SUCCEEDED(dev->CreateTexture(kRTdim, kRTdim, 1, D3DUSAGE_DEPTHSTENCIL, FOURCC_INTZ, D3DPOOL_DEFAULT, &scratchDepthINTZTex, nullptr)) && scratchDepthINTZTex)
@@ -783,6 +814,26 @@ class ShaderPrecompiler
                 case 4: t = texVol;  break; // D3DSTT_VOLUME
                 default: t = tex2D;  break; // D3DSTT_2D / unknown
                 }
+            }
+            dev->SetTexture(s, t);
+        }
+    }
+
+    // The same thing from a declared-dimension array rather than an index into
+    // the .fxc table: the engine walk reads each pixel shader's declarations out
+    // of the live shader object, so it does not need a file to have been parsed
+    // and cannot bind the wrong pattern when the join fails.
+    static void BindSamplersDim(const uint8_t dim[16])
+    {
+        for (int s = 0; s < 16; s++)
+        {
+            IDirect3DBaseTexture9* t = nullptr;
+            switch (dim[s])
+            {
+            case 0: t = nullptr;  break;   // not declared -> leave null
+            case 3: t = texCube;  break;   // D3DSTT_CUBE
+            case 4: t = texVol;   break;   // D3DSTT_VOLUME
+            default: t = tex2D;   break;   // D3DSTT_2D / unknown
             }
             dev->SetTexture(s, t);
         }
@@ -1895,9 +1946,13 @@ class ShaderPrecompiler
     // decrypted itself, so no code there may be read, hooked or fingerprinted -- this
     // walk touches none of it. Addresses and layout:
     // re/rage-shader-precompile/01-effects-static.md §2.1, §2.4, §3.
-    static constexpr uintptr_t kVA_Effects      = 0x017F5638;   // grcEffect* [128]
+    // The addresses and the struct offsets come from enginewarm.h, which is the
+    // one place they are written down: two walks of the same registry that each
+    // spelled the program counts differently is exactly the kind of drift that
+    // survives review because both readings happen to agree on one install.
+    static constexpr uintptr_t kVA_Effects      = enginewarm::kVA_Effects;
     static constexpr uint32_t  kEffectSlots     = 128;
-    static constexpr uintptr_t kVA_ExtraEffect  = 0x018DD508;   // a second gta_im, not in the array
+    static constexpr uintptr_t kVA_ExtraEffect  = enginewarm::kVA_EffectExtra;
     static constexpr uint32_t  kEffMaxPrograms  = 4096;         // sanity bound on a count field
     static constexpr uint32_t  kMaxEnginePrograms = 8192;       // this install has ~1864
 
@@ -1944,9 +1999,10 @@ class ShaderPrecompiler
         if (!named) name = nullptr;
 
         // m_VertexPrograms/+0x1C count, m_FragmentPrograms/+0x24 count; stride 0x0C,
-        // the D3D object at +0x08 (grcProgram).
-        const uint32_t arrOff[2] = { 0x18, 0x20 };
-        const uint32_t cntOff[2] = { 0x1C, 0x24 };
+        // the D3D object at +0x08 (grcProgram) -- all named in enginewarm.h, which
+        // is where the choice of count over total is argued.
+        const uint32_t arrOff[2] = { enginewarm::kEff_VertProgs, enginewarm::kEff_FragProgs };
+        const uint32_t cntOff[2] = { enginewarm::kEff_VsCount,   enginewarm::kEff_PsCount   };
         bool anyArray = false;
         const uint32_t before = s.n;
         for (int stage = 0; stage < 2; stage++)
@@ -1954,11 +2010,12 @@ class ShaderPrecompiler
             auto arr = *reinterpret_cast<uintptr_t const*>(base + arrOff[stage]);
             uint32_t n = *reinterpret_cast<const uint16_t*>(base + cntOff[stage]);
             if (!n || n > kEffMaxPrograms) continue;
-            if (arr < 0x10000 || IsBadReadPtr((void*)arr, n * 0x0C)) continue;
+            if (arr < 0x10000 || IsBadReadPtr((void*)arr, n * enginewarm::kProg_Stride)) continue;
             anyArray = true;
             for (uint32_t i = 0; i < n && s.n < s.cap; i++)
             {
-                void* obj = *reinterpret_cast<void* const*>(arr + i * 0x0C + 0x08);
+                void* obj = *reinterpret_cast<void* const*>(
+                    arr + i * enginewarm::kProg_Stride + enginewarm::kProg_D3D);
                 if (!obj || IsBadReadPtr(obj, 4)) { s.nullPrograms++; continue; }
                 s.out[s.n].obj    = obj;
                 s.out[s.n].isVS   = stage == 0;
@@ -2823,19 +2880,23 @@ class ShaderPrecompiler
 
     // MSVC refuses __try in a function that needs C++ unwinding, so the SEH
     // frame lives in this trivial one and the work that allocates lives in
-    // DoBuildPlan.
+    // the callees.
     struct BuildArgs
     {
         fxc_db* db;
-        const std::vector<std::vector<std::pair<uint8_t, uint8_t>>>* sigs;
         int level;
         enginewarm::Plan* out;
         D3DFORMAT backBuffer;
     };
-    static void DoBuildPlan(void* a)
+    static void DoBuildTables(void* a)
     {
         auto* b = static_cast<BuildArgs*>(a);
-        *b->out = enginewarm::Build(b->db, *b->sigs, b->level, b->backBuffer);
+        enginewarm::BuildTables(*b->out, b->db, b->backBuffer);
+    }
+    static void DoBuildJobs(void* a)
+    {
+        auto* b = static_cast<BuildArgs*>(a);
+        enginewarm::BuildPlanJobs(*b->out, b->level);
     }
     static bool GuardedCall(void (*fn)(void*), void* arg)
     {
@@ -2856,6 +2917,13 @@ class ShaderPrecompiler
         dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
         dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
         dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        // The four vertex-texture samplers are half of DXVK's spec constant 3
+        // and nothing in this pass ever binds them, so whatever the recorded
+        // replay last left there would ride along on every engine draw. Null
+        // them wherever the default block is re-established, which is at the
+        // start of the walk and after every overlay frame.
+        for (uint32_t i = 0; i < pipelinekeys::kVSSamplers; i++)
+            dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + i, nullptr);
     }
 
     static void ApplyStateVec(const enginewarm::StateVec& v)
@@ -2873,17 +2941,181 @@ class ShaderPrecompiler
         dev->SetRenderState(D3DRS_ZWRITEENABLE, v.zWrite);
     }
 
+    // References taken on the engine's own shader objects for the duration of
+    // the walk, one per distinct object.
+    static inline std::vector<IUnknown*> engineShaderRefs;
+
+    static void ReleaseEngineShaderRefs()
+    {
+        for (auto* u : engineShaderRefs) if (u) u->Release();
+        engineShaderRefs.clear();
+    }
+
+    // Read every pass's shader objects, and only then agree to bind them.
+    //
+    // Two things come out of this, and both used to come from the .fxc database
+    // joined to the engine by ARRAY INDEX: the VS input signature the vertex
+    // declarations are projected onto, and the sampler slots the pixel shader
+    // declares. A D3D9 shader object hands its own token stream back through
+    // GetFunction, so the engine can answer both itself -- no join, no
+    // assumption about which directory the file came from, and it works for a
+    // mod's effect that has no .fxc entry here at all.
+    //
+    // It is also where the reference is taken. The walk holds these pointers
+    // for minutes while the streamer runs on another thread, and grcEffect has
+    // a destructor (0x00435640) that LoadOrCreateByName can reach; a freed
+    // effect releases its shader objects, and the next SetVertexShader would be
+    // a virtual call through a dangling COM pointer. The object has just
+    // answered GetFunction with a well-formed SM3 token stream, so it is alive
+    // at this instant: AddRef it once here and release at the end of the pass.
+    // A pass whose vertex shader does not answer is dropped outright rather
+    // than drawn with a pointer nothing validated.
+    static void ResolveEngineShaderIO(enginewarm::Plan& plan)
+    {
+        struct Info
+        {
+            std::vector<std::pair<uint8_t, uint8_t>> sig;
+            uint8_t dim[16]{};
+            bool ok = false;
+        };
+        std::unordered_map<void*, Info> byObj;
+        std::vector<uint8_t> buf(64 * 1024);
+        uint32_t objs = 0, read = 0, failed = 0;
+
+        auto resolve = [&](void* obj, bool isVS) -> const Info*
+        {
+            if (!obj) return nullptr;
+            if (auto it = byObj.find(obj); it != byObj.end())
+                return it->second.ok ? &it->second : nullptr;
+            objs++;
+            Info info;
+            const UINT size = ReadShaderFunction(obj, isVS, buf.data(), (UINT)buf.size());
+            if (size)
+            {
+                read++;
+                ShaderIO io{};
+                ParseShaderIO(buf.data(), size, isVS, io);
+                if (isVS)
+                {
+                    for (auto& in : io.inputs) info.sig.push_back({ in.usage, in.index });
+                    auto* sh = static_cast<IDirect3DVertexShader9*>(obj);
+                    sh->AddRef();
+                    engineShaderRefs.push_back(sh);
+                }
+                else
+                {
+                    for (int s = 0; s < 16; s++)
+                        info.dim[s] = io.usesSampler[s] ? (io.samplerDim[s] ? io.samplerDim[s] : 2) : 0;
+                    auto* sh = static_cast<IDirect3DPixelShader9*>(obj);
+                    sh->AddRef();
+                    engineShaderRefs.push_back(sh);
+                }
+                info.ok = true;
+            }
+            else failed++;
+            auto ins = byObj.emplace(obj, std::move(info));
+            return ins.first->second.ok ? &ins.first->second : nullptr;
+        };
+
+        for (auto& pass : plan.passes)
+        {
+            const Info* v = resolve(pass.vs, true);
+            if (!v) { pass.vs = nullptr; continue; }
+            pass.sig = v->sig;
+            const Info* p = resolve(pass.ps, false);
+            if (p) memcpy(pass.psDim, p->dim, sizeof(pass.psDim));
+            else   pass.ps = nullptr;        // no bytecode, no binding
+        }
+        const size_t before = plan.passes.size();
+        plan.passes.erase(std::remove_if(plan.passes.begin(), plan.passes.end(),
+                                         [](const enginewarm::PassInfo& p) { return p.vs == nullptr; }),
+                          plan.passes.end());
+        plan.census.shaderObjects = objs;
+        plan.census.shaderRead    = read;
+        plan.census.shaderFailed  = failed;
+        plan.census.passesDropped = (uint32_t)(before - plan.passes.size());
+        plan.census.passes        = (uint32_t)plan.passes.size();
+    }
+
+    // One job's draw, in a function of its own so GuardedCall can put an SEH
+    // frame round it: everything it touches is a pointer read out of the
+    // engine, and a fault here should cost the phase, not the session.
+    struct DrawArgs
+    {
+        const enginewarm::Plan* plan;
+        const enginewarm::Job*  job;
+        IDirect3DSurface9* rts[4];
+        IDirect3DSurface9* ds;
+        IDirect3DVertexDeclaration9* declObj;
+        bool failed;
+    };
+
+    static void DoDrawJob(void* a)
+    {
+        auto* d = static_cast<DrawArgs*>(a);
+        const enginewarm::Plan& plan = *d->plan;
+        const enginewarm::Job&  j    = *d->job;
+        const enginewarm::PassInfo& pass = plan.passes[j.pass];
+        const enginewarm::StateVec& SV   = enginewarm::kStateVecs[j.state];
+        const enginewarm::Decl& D = plan.decls[j.decl];
+
+        for (int i = 0; i < 4; i++) dev->SetRenderTarget(i, d->rts[i]);
+        dev->SetDepthStencilSurface(d->ds);
+        D3DVIEWPORT9 vp{ 0, 0, 1, 1, 0.0f, 1.0f };
+        dev->SetViewport(&vp);
+
+        dev->SetVertexDeclaration(d->declObj);
+        for (UINT s = 0; s < 4; s++)
+            if (D.stride[s]) dev->SetStreamSource(s, dummyVB, 0, D.stride[s]);
+        // Rebound every job rather than once before the walk: the overlay's
+        // ID3DXFont drives an ID3DXSprite between jobs whenever the progress
+        // text changes, and whether its state block covers SetIndices is
+        // D3DX's business, not ours. One cached call against ~10 ms of work.
+        dev->SetIndices(dummyIB);
+        if (D.instanced)
+        {
+            // DXVK only draws instances when stream 0 carries INDEXEDDATA,
+            // and only stream 1's INSTANCEDATA is in the pipeline key.
+            dev->SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | 1u);
+            dev->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | 1u);
+        }
+
+        dev->SetVertexShader(pass.vs);
+        dev->SetPixelShader(pass.ps);
+        BindSamplersDim(pass.psDim);
+
+        // Phase vector, then the pass's own delta: the order gameplay uses.
+        ApplyStateVec(SV);
+        for (uint16_t s = 0; s < pass.stateCount; s++)
+        {
+            const uint32_t key = plan.stateWords[pass.stateOff + s * 2];
+            const uint32_t val = plan.stateWords[pass.stateOff + s * 2 + 1];
+            if (key < enginewarm::kRageStates && enginewarm::RSReaches(plan.stateToRS[key]))
+                dev->SetRenderState((D3DRENDERSTATETYPE)plan.stateToRS[key], val);
+        }
+        if (j.flags & enginewarm::kJF_AlphaTest) dev->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+        if (j.flags & enginewarm::kJF_ClipPlane) dev->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
+
+        static const D3DPRIMITIVETYPE kTopo[3] =
+            { D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DPT_TRIANGLEFAN };
+        const uint32_t ti = (j.flags & enginewarm::kJF_TopoMask) >> enginewarm::kJF_TopoShift;
+        d->failed = FAILED(dev->DrawIndexedPrimitive(kTopo[ti < 3 ? ti : 0], 0, 0, 3, 0, 1));
+
+        // grcEffectPass::RestoreState: put the pass's own keys back to the
+        // engine's default block, so the next job starts where a phase does.
+        for (uint16_t s = 0; s < pass.stateCount; s++)
+        {
+            const uint32_t key = plan.stateWords[pass.stateOff + s * 2];
+            if (key < enginewarm::kRageStates && enginewarm::RSReaches(plan.stateToRS[key]))
+                dev->SetRenderState((D3DRENDERSTATETYPE)plan.stateToRS[key], plan.defaultRS[key]);
+        }
+        if (j.flags & enginewarm::kJF_ClipPlane) dev->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+        if (D.instanced) { dev->SetStreamSourceFreq(0, 1); dev->SetStreamSourceFreq(1, 1); }
+    }
+
     static void EngineWarmPass(fxc_db* db)
     {
         using namespace enginewarm;
-
-        // VS input signatures, parallel to the .fxc unique table. This is the
-        // one thing the engine cannot hand us: it frees the bytecode as soon as
-        // the shader object exists (01-effects §1.4).
-        std::vector<std::vector<std::pair<uint8_t, uint8_t>>> sigs(shaderIO.size());
-        for (size_t i = 0; i < shaderIO.size(); i++)
-            for (auto& in : shaderIO[i].inputs)
-                sigs[i].push_back({ in.usage, in.index });
 
         // Wait, briefly, for RAGE to build its render phases.
         //
@@ -2923,27 +3155,61 @@ class ShaderPrecompiler
         // The enumeration reads engine memory through Readable() checks, but a
         // build this does not know could still put a bad pointer where a table
         // belongs. Contain a fault here rather than losing the whole pass.
-        BuildArgs args{ db, &sigs, cfg.engineWarm, nullptr, bbFmt };
+        BuildArgs args{ db, cfg.engineWarm, nullptr, bbFmt };
         Plan plan;
         args.out = &plan;
-        if (!GuardedCall(&DoBuildPlan, &args))
+        if (!GuardedCall(&DoBuildTables, &args))
         {
+            curLabel.clear();
             Log("engine: enumeration faulted - falling back to the recorded replay alone");
             return;
         }
-
         if (!plan.ok)
         {
+            curLabel.clear();
             Log("engine: OFF - %s. This is the fail-safe: another build, EFLC, or a mod that "
                 "moves the effect set. The recorded d3d9cache replay is unaffected.",
                 plan.why.empty() ? "an engine table did not validate" : plan.why.c_str());
             return;
         }
 
+        // Between the two halves of the build: read every pass's shader objects
+        // and take a reference on them. See ResolveEngineShaderIO -- this is
+        // what makes the declaration projection and the sampler binding come
+        // from the live objects instead of a .fxc join by array index, and what
+        // makes the pointers the draw loop binds minutes later safe to bind.
+        ResolveEngineShaderIO(plan);
+        if (plan.passes.empty())
+        {
+            curLabel.clear();
+            ReleaseEngineShaderRefs();
+            Log("engine: OFF - no pass survived reading its shader objects. The recorded "
+                "d3d9cache replay is unaffected.");
+            return;
+        }
+        if (!GuardedCall(&DoBuildJobs, &args) || !plan.ok)
+        {
+            curLabel.clear();
+            ReleaseEngineShaderRefs();
+            Log("engine: OFF - %s. The recorded d3d9cache replay is unaffected.",
+                plan.why.empty() ? "the job walk produced nothing" : plan.why.c_str());
+            return;
+        }
+
+        // Only now, with a plan that will actually draw, is the backdrop
+        // softened: blurring it before the fail-safe has had its say left the
+        // loading screen soft for the rest of the load with nothing running
+        // behind it, which happened on the very first live run of this feature.
+        BlurBackdrop();
+
         const Census& c = plan.census;
-        Log("engine: enumerated %u effects (%u joined to .fxc), %u techniques (%u named), %u passes, "
-            "%u VS + %u PS objects",
-            c.effects, c.effectsJoined, c.techniques, c.techniquesJoined, c.passes, c.vs, c.ps);
+        Log("engine: enumerated %u effects (%u joined to .fxc), %u techniques (%u named: "
+            "%u by index, %u by hash, %u unmatched), %u passes, %u VS + %u PS programs",
+            c.effects, c.effectsJoined, c.techniques, c.techniquesJoined,
+            c.techByIndex, c.techByHash, c.techUnmatched, c.passes, c.vs, c.ps);
+        Log("engine: read %u of %u distinct shader objects with GetFunction "
+            "(%u refused, %u passes dropped for it)",
+            c.shaderRead, c.shaderObjects, c.shaderFailed, c.passesDropped);
         Log("engine: %u render phases declare %u targets, %u more named targets read directly -> "
             "%zu distinct render-target/depth/sample sets (%u from phases, %u derived single-colour, "
             "%u shipped fallback)",
@@ -2960,9 +3226,8 @@ class ShaderPrecompiler
             "%u state vectors, mean %.2f declaration projections per pass",
             c.declsTotal, c.declsShipped, c.declsLive, c.liveRegistryEntries,
             (uint32_t)kSV_Count, c.projectionsPerPass100 / 100.0);
-        char capped[64] = "";
-        if (c.jobsCapped)
-            _snprintf_s(capped, sizeof(capped), _TRUNCATE, ", %u over the job cap", c.jobsCapped);
+        const char* capped = c.jobsCapped ? ", STOPPED AT THE JOB CAP - raise it or lower the level"
+                                          : "";
         Log("engine: %u jobs after dedup (%u collapsed onto an identity already emitted%s), level %d",
             c.jobsEmitted, c.jobsDeduped, capped, cfg.engineWarm);
 
@@ -2995,14 +3260,13 @@ class ShaderPrecompiler
         };
 
         ApplyDefaultBlock(plan);
-        dev->SetIndices(dummyIB);
 
         IDirect3DQuery9* fence = nullptr;
         dev->CreateQuery(D3DQUERYTYPE_EVENT, &fence);
         const uint32_t kFenceChunk = (cfg.fenceChunk > 0) ? (uint32_t)cfg.fenceChunk : 1;
         uint32_t sinceFence = 0;
 
-        uint32_t drawn = 0, skippedRT = 0, skippedDecl = 0, failedDraw = 0;
+        uint32_t drawn = 0, skippedRT = 0, skippedDecl = 0, failedDraw = 0, faulted = 0;
         uint32_t perCtx[16] = {}, perState[kSV_Count] = {};
         bool stopped = false;
         const char* stopWhy = "";
@@ -3017,9 +3281,7 @@ class ShaderPrecompiler
         {
             if (overlayFrames != framesAtBase) { ApplyDefaultBlock(plan); framesAtBase = overlayFrames; }
 
-            const PassInfo& pass = plan.passes[j.pass];
-            const Context&  C    = plan.contexts[j.ctx];
-            const Decl&     D    = plan.decls[j.decl];
+            const Context& C = plan.contexts[j.ctx];
 
             // Our own targets in the engine's formats. A Vulkan pipeline is
             // keyed on attachment FORMAT, never size, so 64x64 reproduces the
@@ -3041,56 +3303,22 @@ class ShaderPrecompiler
                 (j.decl < engineDeclObjs.size()) ? engineDeclObjs[j.decl] : nullptr;
             if (!declObj) { skippedDecl++; workDone++; continue; }
 
-            for (int i = 0; i < 4; i++) dev->SetRenderTarget(i, rts[i]);
-            dev->SetDepthStencilSurface(ds);
-            D3DVIEWPORT9 vp{ 0, 0, 1, 1, 0.0f, 1.0f };
-            dev->SetViewport(&vp);
-
-            dev->SetVertexDeclaration(declObj);
-            for (UINT s = 0; s < 4; s++)
-                if (D.stride[s]) dev->SetStreamSource(s, dummyVB, 0, D.stride[s]);
-            if (D.instanced)
+            DrawArgs da{};
+            da.plan = &plan; da.job = &j; da.ds = ds; da.declObj = declObj;
+            for (int i = 0; i < 4; i++) da.rts[i] = rts[i];
+            if (!GuardedCall(&DoDrawJob, &da))
             {
-                // DXVK only draws instances when stream 0 carries INDEXEDDATA,
-                // and only stream 1's INSTANCEDATA is in the pipeline key.
-                dev->SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | 1u);
-                dev->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | 1u);
+                // One bad bind is one job, not the session. Stop anyway: the
+                // only way to get here is an engine pointer that stopped being
+                // what it was, and the rest of the plan holds more of them.
+                faulted++;
+                stopped = true; stopWhy = " [faulted on an engine pointer]";
+                break;
             }
-
-            dev->SetVertexShader(pass.vs);
-            dev->SetPixelShader(pass.ps);
-            BindSamplers(pass.psIO >= 0 ? (uint32_t)pass.psIO : 0xFFFFFFFFu);
-
-            // Phase vector, then the pass's own delta: the order gameplay uses.
-            ApplyStateVec(kStateVecs[j.state]);
-            if (pass.states)
-                for (uint16_t s = 0; s < pass.stateCount; s++)
-                {
-                    uint32_t key = 0, val = 0;
-                    memcpy(&key, pass.states + s * 8, 4);
-                    memcpy(&val, pass.states + s * 8 + 4, 4);
-                    if (key < kRageStates && RSReaches(plan.stateToRS[key]))
-                        dev->SetRenderState((D3DRENDERSTATETYPE)plan.stateToRS[key], val);
-                }
-            if (j.flags & 1) dev->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
-
-            const D3DPRIMITIVETYPE topo = (j.flags & 2) ? D3DPT_TRIANGLESTRIP : D3DPT_TRIANGLELIST;
-            if (FAILED(dev->DrawIndexedPrimitive(topo, 0, 0, 3, 0, 1))) failedDraw++;
+            if (da.failed) failedDraw++;
             drawn++;
             if (j.ctx < 16) perCtx[j.ctx]++;
             if (j.state < kSV_Count) perState[j.state]++;
-
-            // grcEffectPass::RestoreState: put the pass's own keys back to the
-            // engine's default block, so the next job starts where a phase does.
-            if (pass.states)
-                for (uint16_t s = 0; s < pass.stateCount; s++)
-                {
-                    uint32_t key = 0;
-                    memcpy(&key, pass.states + s * 8, 4);
-                    if (key < kRageStates && RSReaches(plan.stateToRS[key]))
-                        dev->SetRenderState((D3DRENDERSTATETYPE)plan.stateToRS[key], plan.defaultRS[key]);
-                }
-            if (D.instanced) { dev->SetStreamSourceFreq(0, 1); dev->SetStreamSourceFreq(1, 1); }
 
             if (++sinceFence >= kFenceChunk)
             {
@@ -3130,22 +3358,29 @@ class ShaderPrecompiler
         for (UINT s = 0; s < 4; s++) { dev->SetStreamSource(s, nullptr, 0, 0); dev->SetStreamSourceFreq(s, 1); }
         dev->SetIndices(nullptr);
         dev->SetVertexDeclaration(nullptr);
-        for (uint32_t i = 0; i < pipelinekeys::kPSSamplers; i++) dev->SetTexture(i, nullptr);
+        for (uint32_t i = 0; i < pipelinekeys::kNumSamplers; i++)
+            dev->SetTexture(i < pipelinekeys::kPSSamplers
+                                ? i
+                                : D3DVERTEXTEXTURESAMPLER0 + (i - pipelinekeys::kPSSamplers),
+                            nullptr);
         ApplyDefaultBlock(plan);
         for (auto& d : engineDeclObjs) SAFE_RELEASE(d);
         engineDeclObjs.clear();
         for (auto& r : engineRTs) SAFE_RELEASE(r.surf);
         engineRTs.clear();
+        ReleaseEngineShaderRefs();
 
         if (stopped) workDone = workTotal;
 
-        Log("engine: drew %u of %zu jobs in %llds%s (%u failed, %u no render target, %u no declaration)",
+        Log("engine: drew %u of %zu jobs in %llds%s (%u failed, %u faulted, %u no render target, "
+            "%u no declaration)",
             drawn, plan.jobs.size(), (long long)(elapsedMs() / 1000), stopWhy,
-            failedDraw, skippedRT, skippedDecl);
+            failedDraw, faulted, skippedRT, skippedDecl);
         {
             std::string per = "engine: per render-target set:";
             for (size_t i = 0; i < plan.contexts.size() && i < 16; i++)
-                per += " " + plan.contexts[i].name + "=" + std::to_string(perCtx[i]);
+                per += " " + std::to_string(i) + ":" + plan.contexts[i].name +
+                       "=" + std::to_string(perCtx[i]);
             LogStr(per);
             std::string ps = "engine: per phase state vector:";
             for (int i = 0; i < kSV_Count; i++)
@@ -3423,10 +3658,9 @@ class ShaderPrecompiler
         presentsAtStart = pipelinekeys::DevicePresentCount();
 
         CreateOverlay();
-        // With the engine walk on, the pass draws the game's own shaders with
-        // the game's own targets and state. Soften the backdrop for the whole
-        // pass so the screen says plainly that this is not gameplay yet.
-        if (cfg.engineWarm > 0) BlurBackdrop();
+        // The backdrop is blurred by EngineWarmPass itself, once its plan has
+        // validated: softening it here meant a fail-safe run spent the whole
+        // load behind a blur with nothing running behind it.
         PresentOverlay(true);
 
         // The order on the loading screen (VulkanReplayState in pipelinekeys.h):
