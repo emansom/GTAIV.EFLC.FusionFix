@@ -1888,15 +1888,18 @@ class ShaderPrecompiler
         // holds objects whose GetFunction returns a well-formed SM3 token stream,
         // which ReadShaderFunction checks for every one of them.
         const char* name = *reinterpret_cast<const char* const*>(base + 0x00);
-        if (name && !IsBadReadPtr(name, 1))
+        bool named = false;
+        for (uint32_t i = 0; name && i < 64; i++)
         {
-            uint32_t len = 0;
-            while (len < 64 && !IsBadReadPtr(name + len, 1) && name[len] &&
-                   (unsigned char)name[len] >= 0x20 && (unsigned char)name[len] <= 0x7E)
-                len++;
-            if (!len || len >= 64 || name[len]) name = nullptr;
+            // Probe before every byte, and never read the one that failed: a name
+            // running off the end of a page is exactly the shape a wrong address
+            // takes, and faulting here would abandon the whole walk.
+            if (IsBadReadPtr(name + i, 1)) break;
+            const unsigned char c = (unsigned char)name[i];
+            if (!c) { named = i > 0; break; }
+            if (c < 0x20 || c > 0x7E) break;
         }
-        else name = nullptr;
+        if (!named) name = nullptr;
 
         // m_VertexPrograms/+0x1C count, m_FragmentPrograms/+0x24 count; stride 0x0C,
         // the D3D object at +0x08 (grcProgram).
