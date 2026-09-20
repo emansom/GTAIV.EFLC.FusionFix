@@ -1037,8 +1037,15 @@ namespace enginewarm
                 if (tbl[i]) effects.push_back(tbl[i]);
         // One gta_im lives outside the array (03-live's correction) and
         // produced 646883 draws over a route, so it is not an oddity.
-        uintptr_t extra = 0;
-        if (Peek(Rebase(kVA_EffectExtra), extra) && extra &&
+        //
+        // kVA_EffectExtra is the grcEffect ITSELF, not a pointer to one. This
+        // was read as a pointer at first and the effect was silently lost: the
+        // census said 111 effects and 1850 shader objects where the other walk
+        // of the same registry, which takes the address as a base, says 112 and
+        // 1864 -- the difference being exactly its 15 programs less the one
+        // that holds no shader.
+        const uintptr_t extra = Rebase(kVA_EffectExtra);
+        if (Readable((const void*)extra, 0x30) &&
             std::find(effects.begin(), effects.end(), extra) == effects.end())
             effects.push_back(extra);
 
@@ -1179,48 +1186,43 @@ namespace enginewarm
         // shipped fallbacks, and within each the ones that carry depth (most of
         // the game's draws do). A kind with no context of its own falls back to
         // the scene set, which every install has.
+        std::vector<int> order(p.contexts.size());
+        for (size_t i = 0; i < order.size(); i++) order[i] = (int)i;
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+            const Context& A = p.contexts[(size_t)a];
+            const Context& B = p.contexts[(size_t)b];
+            if (A.fromPhase != B.fromPhase) return A.fromPhase;
+            const bool as = A.name == "shipped", bs = B.name == "shipped";
+            if (as != bs) return bs;
+            const bool ad = A.depth != D3DFMT_UNKNOWN, bd = B.depth != D3DFMT_UNKNOWN;
+            if (ad != bd) return ad;
+            return a < b;
+        });
+
         const size_t ctxPerKind = (level >= 2) ? 6 : 3;
         std::vector<int> byKind[kCtxOther + 1];
+        for (int i : order)
         {
-            std::vector<int> order(p.contexts.size());
-            for (size_t i = 0; i < order.size(); i++) order[i] = (int)i;
-            std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-                const Context& A = p.contexts[(size_t)a];
-                const Context& B = p.contexts[(size_t)b];
-                if (A.fromPhase != B.fromPhase) return A.fromPhase;
-                const bool as = A.name == "shipped", bs = B.name == "shipped";
-                if (as != bs) return bs;
-                const bool ad = A.depth != D3DFMT_UNKNOWN, bd = B.depth != D3DFMT_UNKNOWN;
-                if (ad != bd) return ad;
-                return a < b;
-            });
-            for (int i : order)
-            {
-                std::vector<int>& v = byKind[ContextKind(p.contexts[(size_t)i])];
-                if (v.size() < ctxPerKind) v.push_back(i);
-            }
-            if (byKind[kCtxScene].empty() && !order.empty()) byKind[kCtxScene].push_back(order[0]);
-            for (int k = 0; k <= kCtxOther; k++)
-                if (byKind[k].empty()) byKind[k] = byKind[kCtxScene];
+            std::vector<int>& v = byKind[ContextKind(p.contexts[(size_t)i])];
+            if (v.size() < ctxPerKind) v.push_back(i);
         }
+        if (byKind[kCtxScene].empty() && !order.empty()) byKind[kCtxScene].push_back(order[0]);
+        for (int k = 0; k <= kCtxOther; k++)
+            if (byKind[k].empty()) byKind[k] = byKind[kCtxScene];
 
         // The single-colour contexts a post-fx / lighting / blit pass is drawn
-        // at, taken from the per-kind lists so every kind is represented before
-        // any kind gets a second, and capped so neither level can multiply the
-        // whole walk by however many formats happen to exist. Eight covers the
-        // eight heaviest single-colour sets this rig's recording holds.
+        // at. Taken from ALL of them in that order, NOT from the per-kind lists:
+        // going through the lists put a two-target set at the head of kCtxOther
+        // and pushed L8 off the end, so a whole colour format got no job at all
+        // (measured live -- 'shipped=0' against set 10). Capped so neither level
+        // can multiply the whole walk by however many formats happen to exist;
+        // eight covers the eight heaviest single-colour sets this rig's
+        // recording holds.
         const size_t singleCap = (level >= 2) ? 12 : 8;
         std::vector<int> singles;
-        for (size_t round = 0; round < ctxPerKind; round++)
-            for (int k = 0; k <= kCtxOther; k++)
-                if (round < byKind[k].size())
-                {
-                    const int i = byKind[k][round];
-                    if (p.contexts[(size_t)i].mrt == 1 &&
-                        std::find(singles.begin(), singles.end(), i) == singles.end() &&
-                        singles.size() < singleCap)
-                        singles.push_back(i);
-                }
+        for (int i : order)
+            if (p.contexts[(size_t)i].mrt == 1 && singles.size() < singleCap)
+                singles.push_back(i);
         if (singles.empty() && !p.contexts.empty()) singles.push_back(byKind[kCtxScene][0]);
 
         // Declaration ordering: most-drawn first, so a budget cut sheds the
