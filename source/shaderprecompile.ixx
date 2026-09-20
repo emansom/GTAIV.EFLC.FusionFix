@@ -132,8 +132,10 @@ struct ShaderIO
     // VS: declared input (usage,usageIndex) pairs, in declaration order.
     struct In { uint8_t usage; uint8_t index; };
     std::vector<In> inputs;
-    // PS: per used sampler slot, its texture dimension (2=2D, 3=CUBE, 4=VOLUME, 0=unknown).
-    // samplerDim[slot] == 0 means "not declared / leave null".
+    // Per declared sampler slot, its texture dimension (2=2D, 3=CUBE, 4=VOLUME, 0=unknown).
+    // samplerDim[slot] == 0 means "not declared / leave null". A pixel shader declares
+    // s0..s15; a VERTEX shader declares s0..s3, which are D3DVERTEXTEXTURESAMPLER0..3 and
+    // land in KeyRecord::samplerType[16..19].
     uint8_t samplerDim[16] = {};
     bool    usesSampler[16] = {};
 };
@@ -165,16 +167,22 @@ static void ParseShaderIO(const uint8_t* bytecode, uint32_t size, bool isVS, Sha
                 in.usage = (uint8_t)(dcl & 0x1F);
                 in.index = (uint8_t)((dcl >> 16) & 0xF);
                 out.inputs.push_back(in);
-            } else if (!isVS && regtype == 10 /*SAMPLER*/ && regnum < 16) {
+            } else if (regtype == 10 /*SAMPLER*/ && regnum < 16) {
                 out.usesSampler[regnum] = true;
                 out.samplerDim[regnum]  = (uint8_t)((dcl >> 27) & 0xF); // D3DSTT_*
             }
             i += 3;                              // dcl is always 2 operand dwords in SM3
             continue;
         }
-        uint32_t len = (tok >> 24) & 0xF;
-        i += 1 + len;
-        if (len == 0) i++;                       // safety: never stall on a 0-length token
+        // The instruction-length field (bits 24..27) is authoritative from SM2 on,
+        // and it is legitimately 0 for the zero-operand instructions -- ELSE, ENDIF,
+        // BREAK, RET, END-of-loop. The old walk added an extra dword whenever it saw
+        // one, which desynchronised the rest of the shader from the first ELSE. Every
+        // shader on this install is SM3 and none of them changes mask (measured: 2387
+        // .fxc shaders in both directories plus the 75 the caches carry), so this is a
+        // latent bug rather than an observed one -- but the walk is the thing the
+        // sampler masks are built from, so it should be right.
+        i += 1 + ((tok >> 24) & 0xF);
     }
 }
 
@@ -1271,6 +1279,44 @@ class ShaderPrecompiler
     // driver that reported 663 real pipelines.
     static inline std::unordered_map<uint64_t, std::array<bool, 16>> psSamplerUse;
 
+    // The same thing for VERTEX shaders and their four vertex-texture slots
+    // (D3DVERTEXTEXTURESAMPLER0..3 == KeyRecord::samplerType[16..19]). DXVK builds
+    // one `nullOrUnusedMask = ~usedSamplerMask | ~usedTextureMask` from BOTH stages'
+    // declarations (d3d9_device.cpp:7384,7466) and feeds it to setVsSamplers, so a
+    // texture bound to a slot the vertex shader never declares changes nothing about
+    // the pipeline.
+    //
+    // It was left unmasked because nothing parsed VS declarations, and the cost of
+    // that is large: 14524 of this rig's 14805 recorded keys carry vertex sampler
+    // slot 19 -- leftover device state from an earlier draw -- while only five of the
+    // install's 853 vertex shaders declare it. Measured offline over the three cache
+    // files the replay loads, masking takes the set from 2428 unique pipelines to
+    // 1098, with the 602 base identities unchanged: ~1330 duplicate draws.
+    static inline std::unordered_map<uint64_t, std::array<bool, pipelinekeys::kVSSamplers>> vsSamplerUse;
+
+    // Record a shader's declared sampler slots under its bytecode hash, from whichever
+    // source resolved it first. One helper so the five call sites (the .fxc database,
+    // the engine's own programs, the runtime registry, the cache's bytecode and our own
+    // resources) cannot drift apart.
+    static void NoteSamplerUse(uint64_t hash, bool isVS, const ShaderIO& io)
+    {
+        if (!hash) return;
+        if (isVS)
+        {
+            if (vsSamplerUse.count(hash)) return;
+            std::array<bool, pipelinekeys::kVSSamplers> use{};
+            for (uint32_t s = 0; s < pipelinekeys::kVSSamplers; s++) use[s] = io.usesSampler[s];
+            vsSamplerUse.emplace(hash, use);
+        }
+        else
+        {
+            if (psSamplerUse.count(hash)) return;
+            std::array<bool, 16> use{};
+            for (int s = 0; s < 16; s++) use[s] = io.usesSampler[s];
+            psSamplerUse.emplace(hash, use);
+        }
+    }
+
     // Not constexpr: a static data member of this class cannot be constant-
     // initialised from a member function of the same class, because the function is
     // not available until the class is complete. Resolved once at DLL load instead.
@@ -1366,7 +1412,9 @@ class ShaderPrecompiler
     // pipelines -- the strict record is ~10x finer than the driver's identity. What
     // is dropped here (cull mode, depth/stencil ops, and the rest) is dynamic state
     // or fixed-function configuration these shader-based draws never run.
-    static uint64_t ReplayPipelineKey(const pipelinekeys::KeyRecord& k)
+    // maskVS = false reproduces the key as it was before vertex sampler slots were
+    // masked, which is only used to measure what the mask is worth on this install.
+    static uint64_t ReplayPipelineKey(const pipelinekeys::KeyRecord& k, bool maskVS = true)
     {
         struct Reduced
         {
@@ -1382,15 +1430,22 @@ class ShaderPrecompiler
         r.fogEnable   = RSOr0(k, kRS_FogEnable);
         r.clipPlanes  = RSOr0(k, kRS_ClipPlanes) & 0x3Fu;
 
-        // Mask pixel-shader sampler slots to the ones the shader declares. Vertex
-        // samplers stay unmasked: there are only four and we do not parse VS
-        // sampler declarations.
+        // Mask each stage's sampler slots to the ones that stage's shader declares:
+        // an undeclared slot is in DXVK's nullOrUnusedMask however the device state
+        // left it, so keeping it would split one pipeline into several keys. Where a
+        // shader cannot be resolved the slots stay as recorded, which over-counts
+        // rather than under-warms.
         const std::array<bool, 16>* use = nullptr;
         if (auto it = psSamplerUse.find(k.psHash); it != psSamplerUse.end()) use = &it->second;
         for (uint32_t i = 0; i < pipelinekeys::kPSSamplers; i++)
             r.samplerType[i] = (!use || (*use)[i]) ? k.samplerType[i] : 0;
-        for (uint32_t i = pipelinekeys::kPSSamplers; i < pipelinekeys::kNumSamplers; i++)
-            r.samplerType[i] = k.samplerType[i];
+
+        const std::array<bool, pipelinekeys::kVSSamplers>* vuse = nullptr;
+        if (maskVS)
+            if (auto it = vsSamplerUse.find(k.vsHash); it != vsSamplerUse.end()) vuse = &it->second;
+        for (uint32_t i = 0; i < pipelinekeys::kVSSamplers; i++)
+            r.samplerType[pipelinekeys::kPSSamplers + i] =
+                (!vuse || (*vuse)[i]) ? k.samplerType[pipelinekeys::kPSSamplers + i] : 0;
 
         return pipelinekeys::Fnv1a(&r, sizeof(r));
     }
@@ -1713,6 +1768,21 @@ class ShaderPrecompiler
             drawList.size(), declOrder.size(), c.shaders.size(), path.c_str());
     }
 
+    // Read a shader object's bytecode back out of it and parse its declarations.
+    // Every D3D9 shader object can hand its own token stream back, which is cheaper
+    // than finding the file it came from and works for shaders that have no file.
+    template <typename T>
+    static bool ParseShaderFunction(T* obj, bool isVS, ShaderIO& io)
+    {
+        if (!obj) return false;
+        UINT size = 0;
+        if (FAILED(obj->GetFunction(nullptr, &size)) || !size) return false;
+        std::vector<uint8_t> code(size);
+        if (FAILED(obj->GetFunction(code.data(), &size))) return false;
+        ParseShaderIO(code.data(), size, isVS, io);
+        return true;
+    }
+
     // Index the shaders we just created by the same bytecode hash the capture used,
     // so a recorded key can name the exact shader objects to bind.
     static void IndexShadersByHash(fxc_db* db)
@@ -1725,16 +1795,12 @@ class ShaderPrecompiler
             const fxc_shader* s = fxc_unique_shader(db, i);
             if (!s || !s->bytecode || !s->size) continue;
             uint64_t h = pipelinekeys::Fnv1a(s->bytecode, s->size);
-            if (s->stage == FXC_STAGE_VS) { if (vsHandles[i]) vsByHash.emplace(h, vsHandles[i]); }
-            else
-            {
-                if (psHandles[i]) psByHash.emplace(h, psHandles[i]);
-                // Remember which sampler slots this shader declares; the replay key
-                // masks the recorded sampler types down to these.
-                std::array<bool, 16> use{};
-                for (int s2 = 0; s2 < 16; s2++) use[s2] = shaderIO[i].usesSampler[s2];
-                psSamplerUse.emplace(h, use);
-            }
+            const bool isVS = s->stage == FXC_STAGE_VS;
+            if (isVS) { if (vsHandles[i]) vsByHash.emplace(h, vsHandles[i]); }
+            else      { if (psHandles[i]) psByHash.emplace(h, psHandles[i]); }
+            // Remember which sampler slots this shader declares; the replay key masks
+            // the recorded sampler types down to these, per stage.
+            NoteSamplerUse(h, isVS, shaderIO[i]);
         }
         size_t fromDb = vsByHash.size() + psByHash.size();
 
@@ -1742,32 +1808,276 @@ class ShaderPrecompiler
         // (SMAA, FXAA, sun shafts, gamma, LOD lights) which are not in RAGE's .fxc
         // database, and draws using them were previously skipped outright -- 178 of
         // 5110 pipelines on the first capture.
-        for (auto& [h, obj] : pipelinekeys::Registry().vs) vsByHash.emplace(h, obj);
+        // Registry shaders have no .fxc entry, so parse their declarations here too --
+        // otherwise their keys keep every sampler slot and over-expand.
+        for (auto& [h, obj] : pipelinekeys::Registry().vs)
+        {
+            vsByHash.emplace(h, obj);
+            ShaderIO io{};
+            if (!vsSamplerUse.count(h) && ParseShaderFunction(obj, true, io)) NoteSamplerUse(h, true, io);
+        }
         for (auto& [h, obj] : pipelinekeys::Registry().ps)
         {
             psByHash.emplace(h, obj);
-            // Registry shaders have no .fxc entry, so parse their declarations here
-            // too -- otherwise their keys keep all 16 sampler slots and over-expand.
-            if (psSamplerUse.find(h) == psSamplerUse.end())
-            {
-                UINT size = 0;
-                if (SUCCEEDED(obj->GetFunction(nullptr, &size)) && size)
-                {
-                    std::vector<uint8_t> code(size);
-                    if (SUCCEEDED(obj->GetFunction(code.data(), &size)))
-                    {
-                        ShaderIO io{};
-                        ParseShaderIO(code.data(), size, false, io);
-                        std::array<bool, 16> use{};
-                        for (int s2 = 0; s2 < 16; s2++) use[s2] = io.usesSampler[s2];
-                        psSamplerUse.emplace(h, use);
-                    }
-                }
-            }
+            ShaderIO io{};
+            if (!psSamplerUse.count(h) && ParseShaderFunction(obj, false, io)) NoteSamplerUse(h, false, io);
         }
 
         Log("replay: indexed %zu VS + %zu PS by bytecode hash (%zu from the .fxc db, %zu more from the registry)",
             vsByHash.size(), psByHash.size(), fromDb, vsByHash.size() + psByHash.size() - fromDb);
+    }
+
+    // ---- RAGE's own shader objects -------------------------------------------
+    //
+    // The engine creates an IDirect3DVertex/PixelShader9 for every shader in every
+    // .fxc it loads, eagerly, at load time (grcEffect::Load), and keeps it in the
+    // grcProgram it belongs to. By the time the loading screen runs, the process
+    // therefore already holds an object for every shader the game can draw -- and a
+    // D3D9 shader object hands its own token stream back through GetFunction, which
+    // DXVK implements (d3d9_shader.h:178). So the engine, not the file system, is the
+    // complete and authoritative list of what this install can draw with.
+    //
+    // Reading it matters for keys whose shader our .fxc parse cannot supply: a mod's
+    // effect, an episode's, or one of the five effects the engine loads from the base
+    // directory rather than update/. Those keys are skipped as "no-shader" today. On
+    // THIS install the parse happens to cover everything the recording names, so the
+    // measurable effect here is the log line; the value is that it stops depending on
+    // which directory the parse guessed.
+    //
+    // Cost: GetFunction on DXVK's 32-bit build maps the stored bytecode rather than
+    // copying it (DXVK_USE_UNMAPPABLE_MEMORY, util/util_unmap.h:12), so each call is a
+    // map pair into one reused 64 KB buffer.
+    //
+    // WHAT IS READ: only .data globals. Everything in 0x00401000-0x004FB000 is
+    // SecuROM-encrypted in the shipped exe and is plaintext only once the game has
+    // decrypted itself, so no code there may be read, hooked or fingerprinted -- this
+    // walk touches none of it. Addresses and layout:
+    // re/rage-shader-precompile/01-effects-static.md §2.1, §2.4, §3.
+    static constexpr uintptr_t kVA_Effects      = 0x017F5638;   // grcEffect* [128]
+    static constexpr uint32_t  kEffectSlots     = 128;
+    static constexpr uintptr_t kVA_ExtraEffect  = 0x018DD508;   // a second gta_im, not in the array
+    static constexpr uint32_t  kEffMaxPrograms  = 4096;         // sanity bound on a count field
+    static constexpr uint32_t  kMaxEnginePrograms = 8192;       // this install has ~1864
+
+    struct EngineProgram { void* obj; uint8_t isVS; uint16_t effect; };
+    struct EngineScan
+    {
+        EngineProgram* out;
+        const char**   names;        // the effect name per registry slot, [kEffectSlots + 1]
+        uint32_t cap, n;             // programs collected
+        uint32_t effects;            // effects that passed validation
+        uint32_t rejected;           // non-null registry slots that did not
+        uint32_t nullPrograms;       // program slots with no D3D object
+        uint32_t unnamed;            // accepted effects with no readable name
+        bool     extraValid;         // the effect outside the registry validated
+        bool     faulted;
+    };
+
+    // POD only, so it can carry a __try: a fault here must cost the engine path and
+    // nothing else. Never reads through a pointer it has not checked first, because
+    // the whole point of a hard-coded address is that it may be wrong on another build.
+    static bool ScanEngineEffect(uintptr_t base, uint32_t slot, EngineScan& s)
+    {
+        if (base < 0x10000 || IsBadReadPtr((void*)base, 0x28)) return false;
+
+        // The name is for the log, not for the decision. It was a validation rule at
+        // first, and it threw away the one effect that matters most for having the
+        // walk at all: the gta_im outside the registry, which the name/UI code never
+        // touches (01-effects §2.1: "only the registry array and the name/UI code use
+        // base"). What actually proves this is an effect is that its program array
+        // holds objects whose GetFunction returns a well-formed SM3 token stream,
+        // which ReadShaderFunction checks for every one of them.
+        const char* name = *reinterpret_cast<const char* const*>(base + 0x00);
+        bool named = false;
+        for (uint32_t i = 0; name && i < 64; i++)
+        {
+            // Probe before every byte, and never read the one that failed: a name
+            // running off the end of a page is exactly the shape a wrong address
+            // takes, and faulting here would abandon the whole walk.
+            if (IsBadReadPtr(name + i, 1)) break;
+            const unsigned char c = (unsigned char)name[i];
+            if (!c) { named = i > 0; break; }
+            if (c < 0x20 || c > 0x7E) break;
+        }
+        if (!named) name = nullptr;
+
+        // m_VertexPrograms/+0x1C count, m_FragmentPrograms/+0x24 count; stride 0x0C,
+        // the D3D object at +0x08 (grcProgram).
+        const uint32_t arrOff[2] = { 0x18, 0x20 };
+        const uint32_t cntOff[2] = { 0x1C, 0x24 };
+        bool anyArray = false;
+        const uint32_t before = s.n;
+        for (int stage = 0; stage < 2; stage++)
+        {
+            auto arr = *reinterpret_cast<uintptr_t const*>(base + arrOff[stage]);
+            uint32_t n = *reinterpret_cast<const uint16_t*>(base + cntOff[stage]);
+            if (!n || n > kEffMaxPrograms) continue;
+            if (arr < 0x10000 || IsBadReadPtr((void*)arr, n * 0x0C)) continue;
+            anyArray = true;
+            for (uint32_t i = 0; i < n && s.n < s.cap; i++)
+            {
+                void* obj = *reinterpret_cast<void* const*>(arr + i * 0x0C + 0x08);
+                if (!obj || IsBadReadPtr(obj, 4)) { s.nullPrograms++; continue; }
+                s.out[s.n].obj    = obj;
+                s.out[s.n].isVS   = stage == 0;
+                s.out[s.n].effect = (uint16_t)slot;
+                s.n++;
+            }
+        }
+        if (!anyArray) { s.n = before; return false; }
+
+        if (slot < kEffectSlots + 1) s.names[slot] = name;
+        if (!name) s.unnamed++;
+        s.effects++;
+        return true;
+    }
+
+    static void ScanEngineEffects(EngineScan& s)
+    {
+        __try
+        {
+            const uintptr_t tbl = RebaseVA(kVA_Effects);
+            if (IsBadReadPtr((void*)tbl, kEffectSlots * sizeof(uintptr_t))) { s.faulted = true; return; }
+            for (uint32_t i = 0; i < kEffectSlots; i++)
+            {
+                const uintptr_t base = reinterpret_cast<const uintptr_t*>(tbl)[i];
+                if (base < 0x10000) continue;
+                if (!ScanEngineEffect(base, i, s)) s.rejected++;
+            }
+            // 01-effects §3: one gta_im lives OUTSIDE the array, at its own static
+            // address, with its own 13 techniques and its own shader objects. Counted
+            // apart from the registry slots, because "one slot rejected" cannot say
+            // whether it was this known outlier or a registry entry we misread.
+            s.extraValid = ScanEngineEffect(RebaseVA(kVA_ExtraEffect), kEffectSlots, s);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            s.faulted = true;
+        }
+    }
+
+    // Also POD-only: a shader object that is not one would fault inside GetFunction.
+    static UINT ReadShaderFunction(void* obj, bool isVS, uint8_t* buf, UINT cap)
+    {
+        __try
+        {
+            UINT size = 0;
+            if (isVS)
+            {
+                auto* sh = static_cast<IDirect3DVertexShader9*>(obj);
+                if (FAILED(sh->GetFunction(nullptr, &size)) || !size || size > cap) return 0;
+                if (FAILED(sh->GetFunction(buf, &size))) return 0;
+            }
+            else
+            {
+                auto* sh = static_cast<IDirect3DPixelShader9*>(obj);
+                if (FAILED(sh->GetFunction(nullptr, &size)) || !size || size > cap) return 0;
+                if (FAILED(sh->GetFunction(buf, &size))) return 0;
+            }
+            // A D3D9 token stream opens with a version token whose high word is
+            // 0xFFFE (vertex) or 0xFFFF (pixel). Anything else is not a shader and the
+            // pointer was not what we thought it was.
+            if (size < 8 || (*reinterpret_cast<const uint32_t*>(buf) >> 16) != (isVS ? 0xFFFEu : 0xFFFFu))
+                return 0;
+            return size;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    static void IndexShadersFromEngine()
+    {
+        std::vector<EngineProgram> programs(kMaxEnginePrograms);
+        std::vector<const char*>   names(kEffectSlots + 1, nullptr);
+
+        EngineScan s{};
+        s.out = programs.data();
+        s.names = names.data();
+        s.cap = kMaxEnginePrograms;
+        ScanEngineEffects(s);
+
+        if (s.faulted && !s.n)
+        {
+            Log("replay: engine: the effect registry at %08X could not be read - "
+                "falling back to the .fxc files alone", (unsigned)RebaseVA(kVA_Effects));
+            return;
+        }
+
+        std::vector<uint8_t> buf(64 * 1024);
+        uint32_t read = 0, known = 0, addedVS = 0, addedPS = 0, failed = 0, newMask = 0;
+        // Effects whose shaders the .fxc parse does not have. Names them, because the
+        // answer to "does the engine load effects our directory choice misses?" is a
+        // list of effect names, not a count.
+        std::unordered_map<const char*, uint32_t> unknownByEffect;
+
+        const auto tStartEngine = std::chrono::steady_clock::now();
+        for (uint32_t i = 0; i < s.n; i++)
+        {
+            const EngineProgram& p = programs[i];
+            const UINT size = ReadShaderFunction(p.obj, p.isVS != 0, buf.data(), (UINT)buf.size());
+            if (!size) { failed++; continue; }
+            read++;
+
+            const uint64_t h = pipelinekeys::Fnv1a(buf.data(), size);
+            const bool have = p.isVS ? vsByHash.count(h) != 0 : psByHash.count(h) != 0;
+            if (have) known++;
+            else
+            {
+                // AddRef and never Release, like every other shader handle this pass
+                // keeps. "The effects live for the whole session" is asserted, not
+                // established -- grcEffect has a destructor and LoadOrCreateByName
+                // hunts for a free slot, so an effect CAN be freed, and a freed one
+                // releases its shader objects. 1850 refcount increments cost nothing
+                // and a dangling bind would cost everything. The object has just
+                // answered GetFunction with a well-formed token stream, so it is alive
+                // at this instant; the window between the census and here is a few
+                // milliseconds on the blocked render thread.
+                if (p.isVS)
+                {
+                    auto* sh = static_cast<IDirect3DVertexShader9*>(p.obj);
+                    sh->AddRef();
+                    vsByHash.emplace(h, sh);
+                    addedVS++;
+                }
+                else
+                {
+                    auto* sh = static_cast<IDirect3DPixelShader9*>(p.obj);
+                    sh->AddRef();
+                    psByHash.emplace(h, sh);
+                    addedPS++;
+                }
+                if (p.effect <= kEffectSlots && names[p.effect]) unknownByEffect[names[p.effect]]++;
+            }
+
+            if (!(p.isVS ? vsSamplerUse.count(h) : psSamplerUse.count(h)))
+            {
+                ShaderIO io{};
+                ParseShaderIO(buf.data(), size, p.isVS != 0, io);
+                NoteSamplerUse(h, p.isVS != 0, io);
+                newMask++;
+            }
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - tStartEngine).count();
+
+        std::string trouble;
+        if (failed)      trouble += "; " + std::to_string(failed) + " objects gave no bytecode";
+        if (s.rejected)  trouble += "; " + std::to_string(s.rejected) + " registry slots rejected";
+        if (s.unnamed)   trouble += "; " + std::to_string(s.unnamed) + " unnamed";
+        if (s.nullPrograms) trouble += "; " + std::to_string(s.nullPrograms) + " programs hold no shader";
+        if (!s.extraValid)  trouble += "; the effect outside the registry was not there";
+        if (s.faulted)   trouble += "; the walk faulted and stopped early";
+        Log("replay: engine: %u effects, %u shader objects, %u bytecodes read in %u ms, "
+            "%u already known, %u new (%u VS + %u PS), %u sampler masks parsed%s",
+            s.effects, s.n, read, (unsigned)ms, known, addedVS + addedPS, addedVS, addedPS,
+            newMask, trouble.c_str());
+
+        // The point of the line above is this list: an effect named here is one the
+        // .fxc parse did not cover, i.e. a key using it would have been skipped.
+        for (const auto& [name, n] : unknownByEffect)
+            Log("replay: engine: %s.fxc - %u shader(s) the .fxc parse does not have", name, n);
     }
 
     // Shader objects we created ourselves from captured bytecode. Held for the
@@ -1798,8 +2108,21 @@ class ShaderPrecompiler
         for (auto& [hash, blob] : replayBlobs)
         {
             if (!named.count(hash)) { unnamed++; continue; }
+            const bool isVS = blob.stage == pipelinekeys::kStageVS;
+
+            // Same reason as the registry path: without the declared-sampler mask the
+            // key keeps every slot and expands into pipelines that do not exist. Done
+            // before the "already resolved" check below, because a shader can be
+            // resolvable from elsewhere and still have no mask recorded.
+            if (!(isVS ? vsSamplerUse.count(hash) : psSamplerUse.count(hash)))
+            {
+                ShaderIO io{};
+                ParseShaderIO(blob.code.data(), (uint32_t)blob.code.size(), isVS, io);
+                NoteSamplerUse(hash, isVS, io);
+            }
+
             const DWORD* fn = reinterpret_cast<const DWORD*>(blob.code.data());
-            if (blob.stage == pipelinekeys::kStageVS)
+            if (isVS)
             {
                 if (vsByHash.count(hash)) continue;
                 IDirect3DVertexShader9* sh = nullptr;
@@ -1816,18 +2139,6 @@ class ShaderPrecompiler
                 sidecarPS.push_back(sh);
                 psByHash.emplace(hash, sh);
                 madePS++;
-
-                // Same reason as the registry path: without the declared-sampler mask
-                // the key keeps all 16 slots and expands into pipelines that do not
-                // exist.
-                if (psSamplerUse.find(hash) == psSamplerUse.end())
-                {
-                    ShaderIO io{};
-                    ParseShaderIO(blob.code.data(), (uint32_t)blob.code.size(), false, io);
-                    std::array<bool, 16> use{};
-                    for (int s = 0; s < 16; s++) use[s] = io.usesSampler[s];
-                    psSamplerUse.emplace(hash, use);
-                }
             }
         }
 
@@ -1884,6 +2195,16 @@ class ShaderPrecompiler
         const uint64_t h = pipelinekeys::Fnv1a(data, size);
         const DWORD* fn = reinterpret_cast<const DWORD*>(data);
 
+        // The mask first, whether or not the shader still has to be created: a
+        // resource can be resolvable from the .fxc database or the engine and still
+        // have no declared-sampler mask recorded.
+        if (!(isVS ? vsSamplerUse.count(h) : psSamplerUse.count(h)))
+        {
+            ShaderIO io{};
+            ParseShaderIO(reinterpret_cast<const uint8_t*>(data), (uint32_t)size, isVS, io);
+            NoteSamplerUse(h, isVS, io);
+        }
+
         if (isVS)
         {
             if (vsByHash.count(h)) { ownResKnown++; return TRUE; }
@@ -1901,15 +2222,6 @@ class ShaderPrecompiler
             ownResPSObjs.push_back(sh);
             psByHash.emplace(h, sh);
             ownResPS++;
-
-            if (psSamplerUse.find(h) == psSamplerUse.end())
-            {
-                ShaderIO io{};
-                ParseShaderIO(reinterpret_cast<const uint8_t*>(data), (uint32_t)size, false, io);
-                std::array<bool, 16> use{};
-                for (int s = 0; s < 16; s++) use[s] = io.usesSampler[s];
-                psSamplerUse.emplace(h, use);
-            }
         }
         return TRUE;
     }
@@ -2066,10 +2378,18 @@ class ShaderPrecompiler
         // a progress bar is for.
         std::unordered_set<uint64_t> seenPipeline;
         seenPipeline.reserve(replayRecs.size());
+        // The same set as it would be without the vertex-sampler mask. Kept because
+        // the mask's worth is an install-specific number -- it depends on how much
+        // leftover vertex-texture state the recording happened to carry -- and
+        // asserting it from one machine's measurement would be exactly the kind of
+        // claim this pass keeps having to re-check.
+        std::unordered_set<uint64_t> seenUnmaskedVS;
+        seenUnmaskedVS.reserve(replayRecs.size());
         std::vector<uint32_t> drawList;
         drawList.reserve(replayRecs.size() / 4);
         for (size_t r = 0; r < replayRecs.size(); r++)
         {
+            seenUnmaskedVS.insert(ReplayPipelineKey(replayRecs[r], false));
             if (seenPipeline.insert(ReplayPipelineKey(replayRecs[r])).second)
                 drawList.push_back((uint32_t)r);
             else
@@ -2078,6 +2398,9 @@ class ShaderPrecompiler
                 replaySources[replaySrc[r]].samePipeline++;
             }
         }
+        if (seenUnmaskedVS.size() > seenPipeline.size())
+            Log("replay: the vertex-sampler mask removed %zu duplicate draws (%zu keys without it, %zu with)",
+                seenUnmaskedVS.size() - seenPipeline.size(), seenUnmaskedVS.size(), seenPipeline.size());
         // Warm the pipelines the game uses MOST first. If a budget or an early exit
         // cuts the pass short, what got built is then the part that matters, not an
         // arbitrary prefix of the file.
@@ -2713,6 +3036,11 @@ class ShaderPrecompiler
             if (useReplay)
             {
                 IndexShadersByHash(db);
+                // After the .fxc database, which clears the handle maps: the engine
+                // then adds only what the files could not supply. Either object warms
+                // the same pipeline -- DXVK keys its shader modules on the bytecode
+                // hash -- so the order is about which one is bound, not what is built.
+                IndexShadersFromEngine();
                 IndexShadersFromBlobs();
                 IndexShadersFromOwnResources();
                 ReplayPass();
