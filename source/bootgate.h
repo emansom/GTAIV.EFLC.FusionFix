@@ -74,6 +74,11 @@ namespace bootgate
     constexpr uintptr_t kVA_CreatePhases     = 0x005D49D0;  // CViewportGame vtable slot 12
     constexpr uintptr_t kVA_ViewportVT       = 0x00FE0A44;  // that vtable
     constexpr uintptr_t kVA_PumpOsAndOverlay = 0x005C31F0;  // the OS/overlay pump the legals spin uses
+    // The three bytes rageBoot_PumpOsAndOverlay's own message pump (FUN_00420E90)
+    // tests before it decides to STOP RETURNING. Read, never written; see PumpOs.
+    constexpr uintptr_t kVA_PumpSpinA        = 0x017ED8D1;
+    constexpr uintptr_t kVA_PumpSpinB        = 0x0105B48F;
+    constexpr uintptr_t kVA_AppActive        = 0x017ACCF8;
     constexpr uintptr_t kVA_SpriteSetTexture = 0x008D4CB0;
     constexpr uintptr_t kVA_SpriteQuad       = 0x008D4990;  // untextured quad, PIXEL coords
     constexpr uintptr_t kVA_SpriteFlush      = 0x008D3C20;
@@ -294,12 +299,47 @@ namespace bootgate
         uint8_t saved = 0;
     };
 
+    // A bounded message pump of our own: it always returns.
+    inline void PumpOwn()
+    {
+        MSG m;
+        for (int i = 0; i < 128 && PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE); i++)
+        {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+
+    // Would rageBoot_PumpOsAndOverlay fail to come back?
+    //
+    // Its message pump FUN_00420E90 does NOT just drain the queue. Once the
+    // queue is empty it tests two flags, and while both are set it either calls
+    // SetFocus on the game window and pumps again, or -- if the window is
+    // iconic -- Sleep(100)s inside `do { } while(true)`. For the game's own
+    // legals spin that is correct: it is a second or two and the point is to
+    // get the focus back. For a hold measured in MINUTES it is not: it snatches
+    // the focus from a player who alt-tabbed, and a minimised window stops the
+    // gate's loop evaluating its own exit conditions at all.
+    //
+    // So read the same three bytes the engine reads and skip the call exactly
+    // when it would spin. Unreadable, or in doubt, means call it: that is the
+    // behaviour this replaces.
+    inline bool PumpOsWouldSpin()
+    {
+        uint8_t a = 0, b = 0, active = 1;
+        if (!Peek(Rebase(kVA_PumpSpinA), a) || !Peek(Rebase(kVA_PumpSpinB), b)) return false;
+        if (a == 0 || b == 0) return false;              // it returns as soon as the queue is empty
+        if (!Peek(Rebase(kVA_AppActive), active)) return false;
+        return active == 0;                              // inactive: SetFocus spin, or Sleep(100) forever
+    }
+
     // The OS / Steam-overlay pump the game's own legals spin calls. The main
     // thread is blocked at the gate for the whole pass, so nothing else runs
     // it; 60 s without it was fine under Proton, minutes is untested, and one
     // call per millisecond costs nothing.
     inline void PumpOs()
     {
+        if (PumpOsWouldSpin()) { PumpOwn(); return; }
         ((void(__cdecl*)())Rebase(kVA_PumpOsAndOverlay))();
     }
 
@@ -389,6 +429,35 @@ namespace bootgate
         bool        hasTexture = false;     // 0 of 36 at this gate; recorded, not relied on
     };
 
+    // Is this pointer plausibly a live COM object?
+    //
+    // Readable() proves four bytes are committed; it does not prove they are an
+    // IDirect3DTexture9, and at this gate a half-built registry entry is a real
+    // possibility (09-phase-contexts caught five phases with vtable 0x86150000
+    // and 0xCDCD filler in exactly this window). A virtual call through one of
+    // those is an access violation on the main thread, with the loading screen
+    // pinned -- which this header exists not to do. So before dispatching:
+    // the object is readable, its vtable is readable, and the first three slots
+    // (IUnknown's) each point into committed, EXECUTABLE memory.
+    inline bool LooksLikeCom(uintptr_t p)
+    {
+        uintptr_t vt = 0;
+        if (!Peek(p, vt) || !vt) return false;
+        if (!Readable((const void*)vt, 3 * sizeof(uintptr_t))) return false;
+        for (int i = 0; i < 3; i++)
+        {
+            uintptr_t fn = 0;
+            if (!Peek(vt + (uintptr_t)i * sizeof(uintptr_t), fn) || !fn) return false;
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery((const void*)fn, &mbi, sizeof(mbi))) return false;
+            if (mbi.State != MEM_COMMIT) return false;
+            const DWORD exec = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+            if (!(mbi.Protect & exec)) return false;
+        }
+        return true;
+    }
+
     inline bool ReadTarget(uintptr_t rt, Target& out)
     {
         if (!rt || !Readable((const void*)rt, 0x50)) return false;
@@ -404,6 +473,7 @@ namespace bootgate
         // A live texture is authoritative when there IS one: it is what DXVK
         // keys on, and it is the only thing that can disagree with the rage
         // byte (rage 5 claims A2R10G10B10 on rigs where no such target exists).
+        if (out.hasTexture && !LooksLikeCom(tex)) out.hasTexture = false;
         if (out.hasTexture)
         {
             auto* t = (IDirect3DTexture9*)tex;

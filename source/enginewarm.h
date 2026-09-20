@@ -742,6 +742,17 @@ namespace enginewarm
         // carries a non-zero clipPlaneCount in specialization constant 0 -- 75
         // route keys, all in the reflection group and in named techniques. It
         // is a property of the CONTEXT, not a free axis.
+        //
+        // NAME MATCHING IS THE WEAK PART and is worth saying plainly: the
+        // authoritative source is the phase itself -- 09-phase-contexts
+        // identifies the reflection and mirror phases by their BuildRenderList
+        // callbacks (0x00D514F0, 0x00D77130) and their phase ids, both readable
+        // off the same viewport array the gate already walks. A name test
+        // cannot see a clipped phase whose first colour target is named
+        // anything else, and it would wrongly clip an unclipped phase that
+        // happened to render INTO a reflection map. Until the callback read
+        // exists, an over-broad match is the cheaper error: a spurious clipped
+        // context costs jobs, a missing one costs pipelines.
         auto clipped = [](const std::string& n) {
             return n.find("REFLECTION") != std::string::npos ||
                    n.find("MIRROR") != std::string::npos;
@@ -1329,6 +1340,18 @@ namespace enginewarm
         // depth before one that does not -- most of the game's draws do. Two
         // per kind: one engine set and one stand-in is as far as a kind can
         // usefully go, and a third is always a duplicate format tuple.
+        //
+        // A CLIPPED SET AND AN UNCLIPPED ONE ARE NEVER ALTERNATIVES, though,
+        // and that is why the fill is two passes rather than one.
+        // ClassifyContext only consults `clip` in the fp16+depth arm (where it
+        // yields kCtx_Reflect), so a clipped MIRROR_RT -- A8R8G8B8 with depth,
+        // read from the engine, and every job at it carries kJF_ClipPlane --
+        // classifies as plain kCtx_Ldr and competed with the unclipped LDR sets
+        // for the same two slots. Whichever lost, its pipelines were never
+        // built, and which one lost depended on registry order.
+        // clipPlaneCount is in specialization constant 0, so they are different
+        // pipelines for the same shader: take the first of each before taking a
+        // second of either.
         std::vector<int> byKind[kCtx_KindCount];
         {
             std::vector<int> order(p.contexts.size());
@@ -1341,10 +1364,22 @@ namespace enginewarm
                 if (ad != bd) return ad;
                 return a < b;
             });
+            for (int wantClip = 0; wantClip < 2; wantClip++)
+                for (int i : order)
+                {
+                    const Context& C = p.contexts[(size_t)i];
+                    if (C.clip != (wantClip != 0)) continue;
+                    std::vector<int>& v = byKind[C.kind];
+                    // First pass takes at most one of each clip-ness, so the
+                    // other is guaranteed a slot; second pass fills what is left.
+                    const size_t cap = (wantClip == 0) ? 1u : 2u;
+                    if (v.size() < cap) v.push_back(i);
+                }
             for (int i : order)
             {
                 std::vector<int>& v = byKind[p.contexts[(size_t)i].kind];
-                if (v.size() < 2) v.push_back(i);
+                if (v.size() < 2 &&
+                    std::find(v.begin(), v.end(), i) == v.end()) v.push_back(i);
             }
         }
 
