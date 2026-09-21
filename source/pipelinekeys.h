@@ -474,6 +474,84 @@ namespace pipelinekeys
         return (int64_t)(c.QuadPart / freq * 1000000 + c.QuadPart % freq * 1000000 / freq);
     }
 
+    // ---- the 32-bit address space -------------------------------------------
+    //
+    // GTA IV is a 32-bit process, and this Proton is an old-wow64 one (its wine
+    // ships lib/wine/i386-unix), so the Vulkan loader, DXVK and the Mesa driver
+    // all live in the SAME 4 GB the game does. Anything a warm pass leaves
+    // behind is spent out of the game's own budget for the rest of the session,
+    // and DXVK does not give a graphics pipeline back before its device goes
+    // (dxvk_pipemanager.cpp: m_graphicsPipelines is only ever inserted into).
+    // So every phase of the pass says here what it cost.
+    //
+    // ullAvailVirtual is the SUM of the free runs. `largest` is the biggest
+    // single one, which is what an allocation actually has to fit in: the two
+    // diverge under fragmentation, and a sum on its own cannot see that.
+    struct VaStats
+    {
+        uint64_t avail = 0;     // bytes free in total
+        uint64_t largest = 0;   // bytes in the largest single free run
+        uint64_t commit = 0;    // bytes committed, private
+        uint64_t image = 0;     // bytes committed, images (the PE modules)
+        uint64_t mapped = 0;    // bytes committed, file mappings
+        uint32_t freeRuns = 0;
+        uint32_t regions = 0;
+    };
+
+    inline VaStats ReadVa()
+    {
+        VaStats v;
+        MEMORYSTATUSEX ms{ sizeof(ms) };
+        if (GlobalMemoryStatusEx(&ms)) v.avail = ms.ullAvailVirtual;
+
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        uintptr_t at = reinterpret_cast<uintptr_t>(si.lpMinimumApplicationAddress);
+        const uintptr_t end = reinterpret_cast<uintptr_t>(si.lpMaximumApplicationAddress);
+        MEMORY_BASIC_INFORMATION mbi{};
+        while (at < end && VirtualQuery(reinterpret_cast<void*>(at), &mbi, sizeof(mbi)) == sizeof(mbi))
+        {
+            const uint64_t size = (uint64_t)mbi.RegionSize;
+            if (!size) break;
+            v.regions++;
+            if (mbi.State == MEM_FREE)
+            {
+                v.freeRuns++;
+                if (size > v.largest) v.largest = size;
+            }
+            else if (mbi.State == MEM_COMMIT)
+            {
+                if (mbi.Type == MEM_IMAGE)       v.image  += size;
+                else if (mbi.Type == MEM_MAPPED) v.mapped += size;
+                else                             v.commit += size;
+            }
+            at += (uintptr_t)size;
+        }
+        return v;
+    }
+
+    // The cheap half of the above: no region walk, for a loop that has to ask
+    // often. Megabytes free in total.
+    inline uint64_t AvailVaMB()
+    {
+        MEMORYSTATUSEX ms{ sizeof(ms) };
+        return GlobalMemoryStatusEx(&ms) ? (ms.ullAvailVirtual >> 20) : 0;
+    }
+
+    inline std::string VaLine()
+    {
+        const VaStats v = ReadVa();
+        char b[224];
+        _snprintf_s(b, sizeof(b), _TRUNCATE,
+                    "free %llu MB (largest run %llu MB, %u runs), committed %llu MB private + "
+                    "%llu MB image + %llu MB mapped, %u regions",
+                    (unsigned long long)(v.avail >> 20), (unsigned long long)(v.largest >> 20),
+                    v.freeRuns, (unsigned long long)(v.commit >> 20),
+                    (unsigned long long)(v.image >> 20), (unsigned long long)(v.mapped >> 20),
+                    v.regions);
+        return std::string(b);
+    }
+
     struct VulkanReplayState
     {
         std::atomic<bool> passPlanned{ false }, passDone{ false }, holding{ false }, running{ false };
@@ -494,6 +572,11 @@ namespace pipelinekeys
         uint64_t (*compilerCpuUs)(uint32_t* threads, uint64_t* csUs) = nullptr;
         std::atomic<bool> recordPaused{ false };
         std::atomic<uint32_t> notRecorded{ 0 };   // pipelines DXVK created meanwhile
+        // Set while the MOD is creating a D3D9 device of its own (the engine
+        // warm pass's throwaway device, ShaderPrecompiler::CreateWarmDevice), so
+        // vkcapture can tell that VkDevice from the game's: it is wrapped for
+        // the counters, but it must not record, replay or report.
+        std::atomic<bool> modOwnedDevice{ false };
 
         const int64_t epochUs = ClockUs();
         const SYSTEMTIME epochLocal = [] { SYSTEMTIME st{}; GetLocalTime(&st); return st; }();

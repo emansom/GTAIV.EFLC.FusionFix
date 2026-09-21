@@ -65,6 +65,7 @@ module;
 #include <d3dx9core.h>
 #include <cstdarg>
 #include <cstdio>
+#include <intrin.h>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -146,6 +147,14 @@ struct PrecompileConfig
     // from RAGE's own live tables, so it needs no recording at all -- see the
     // ini text for what the recorded cache still covers that it cannot.
     int     engineWarm    = 0;      // PrecompileEngineWarm
+    // Where the engine walk's pipelines are built. DXVK never frees a graphics
+    // pipeline while its device lives (see CreateWarmDevice), and the walk
+    // builds ~61,000 of them, which is ~760 MB of a 32-bit process's address
+    // space kept for the whole session. 1 = build them on a D3D9 device of our
+    // own and destroy it when the walk is done, so only the DRIVER's on-disk
+    // cache survives; 2 = only probe whether such a device can be created here
+    // and say what it cost (diagnostic); 0 = the game's device, as before.
+    int     warmDevice    = 1;      // PrecompileWarmDevice
 };
 
 // ===========================================================================
@@ -468,6 +477,86 @@ class ShaderPrecompiler
         vsnprintf(buf, sizeof(buf), fmt, ap);
         va_end(ap);
         pipelinekeys::LogLine("[ShaderPrecompile] ", buf);
+    }
+
+    // What this phase cost the 32-bit address space, and how many pipelines DXVK
+    // has built by now. Both numbers on one line, at every boundary of the pass,
+    // so a log alone answers "where did the address space go" without a rerun.
+    // The VirtualQuery walk behind it is ~1 ms with tens of thousands of
+    // regions, which is why it is at phase boundaries and not per job.
+    static void LogVa(const char* where)
+    {
+        Log("memory %s: %s; DXVK has created %u pipelines", where,
+            pipelinekeys::VaLine().c_str(), pipelinekeys::VulkanReplay().creations.load());
+    }
+
+    // -------------------------------------------------------------------
+    //  What ends the process, when something does
+    //
+    //  Two engine-warm runs ended with the game gone a minute or two into
+    //  gameplay and nothing in the log to say why. Both still wrote vkcapture's
+    //  "gameplay frames final" line, which comes from DLL_PROCESS_DETACH
+    //  (dllmain.cpp) -- so the process was unwound rather than killed, i.e.
+    //  somebody called ExitProcess. These two say who, and what the address
+    //  space looked like at that instant.
+    //
+    //  The vectored handler sees an exception before any filter the game
+    //  installed, and only for the codes that end a process; Wine and the game
+    //  raise plenty of others all the time. It is rate limited in TIME rather
+    //  than by a plain count, so a burst during startup cannot use up the
+    //  budget for a fault two minutes into gameplay.
+    // -------------------------------------------------------------------
+    static inline SafetyHookInline shExitProcess{};
+    static inline std::atomic<int64_t> lastVehUs{ 0 };
+    static inline std::atomic<uint32_t> vehSeen{ 0 }, vehLogged{ 0 };
+
+    static LONG CALLBACK ExceptionLogger(EXCEPTION_POINTERS* ep)
+    {
+        const DWORD code = ep->ExceptionRecord->ExceptionCode;
+        const bool fatal = code == EXCEPTION_ACCESS_VIOLATION
+                        || code == EXCEPTION_IN_PAGE_ERROR
+                        || code == EXCEPTION_STACK_OVERFLOW
+                        || code == EXCEPTION_ILLEGAL_INSTRUCTION
+                        || code == EXCEPTION_PRIV_INSTRUCTION
+                        || code == EXCEPTION_INT_DIVIDE_BY_ZERO
+                        || code == (DWORD)0xC0000017 /* STATUS_NO_MEMORY */
+                        || code == (DWORD)0xC00000FD /* STATUS_STACK_OVERFLOW */;
+        if (!fatal) return EXCEPTION_CONTINUE_SEARCH;
+        vehSeen++;
+        const int64_t now = pipelinekeys::ClockUs();
+        const int64_t last = lastVehUs.load();
+        if (vehLogged.load() >= 64 || (last && now - last < 2000000)) return EXCEPTION_CONTINUE_SEARCH;
+        lastVehUs = now;
+        vehLogged++;
+        const ULONG_PTR* info = ep->ExceptionRecord->ExceptionInformation;
+        Log("EXCEPTION 0x%08lX at %p (thread %lu, %u seen): %s %p [%u params]",
+            (unsigned long)code, ep->ExceptionRecord->ExceptionAddress, GetCurrentThreadId(),
+            vehSeen.load(),
+            ep->ExceptionRecord->NumberParameters >= 2
+                ? (info[0] == 0 ? "reading" : info[0] == 1 ? "writing" : "executing") : "at",
+            ep->ExceptionRecord->NumberParameters >= 2 ? (void*)info[1] : nullptr,
+            ep->ExceptionRecord->NumberParameters);
+        Log("memory at that exception: %s", pipelinekeys::VaLine().c_str());
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    static void WINAPI ExitProcessDetour(UINT code)
+    {
+        void* from = _ReturnAddress();
+        Log("ExitProcess(%u) from %p (rebased 0x%08X) - somebody is ending the process",
+            code, from, (unsigned)((uintptr_t)from - (uintptr_t)GetModuleHandleW(nullptr) + 0x400000));
+        Log("memory at ExitProcess: %s", pipelinekeys::VaLine().c_str());
+        Log("exceptions seen by then: %u fatal-class (%u logged)", vehSeen.load(), vehLogged.load());
+        shExitProcess.stdcall<void>(code);
+    }
+
+    static void ArmCrashLogging()
+    {
+        AddVectoredExceptionHandler(0 /* last */, &ExceptionLogger);
+        if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll"))
+            if (void* fn = (void*)GetProcAddress(k32, "ExitProcess"))
+                shExitProcess = safetyhook::create_inline(fn, reinterpret_cast<void*>(&ExitProcessDetour));
+        Log("crash logging armed (vectored handler%s)", shExitProcess ? " + ExitProcess" : ", ExitProcess NOT hooked");
     }
 
     // Drain the message queue so Windows keeps the window "responsive" while the
@@ -2933,6 +3022,347 @@ class ShaderPrecompiler
     // ===================================================================
     static inline std::vector<IDirect3DVertexDeclaration9*> engineDeclObjs;
 
+    // ===================================================================
+    //  A D3D9 DEVICE OF OUR OWN, FOR THE PIPELINES WE DO NOT WANT TO KEEP
+    //
+    //  DXVK never frees a graphics pipeline while its device lives. The proof
+    //  is in DXVK 3.1.1's own source, and it is three facts deep:
+    //
+    //   * DxvkPipelineManager::m_graphicsPipelines is an unordered_map that is
+    //     only ever inserted into (createGraphicsPipeline, dxvk_pipemanager.cpp
+    //     :222); nothing erases from it and the destructor is the only teardown.
+    //   * DxvkGraphicsPipeline::releasePipeline (dxvk_graphics.cpp:1172) returns
+    //     on its first line unless DxvkDevice::mustTrackPipelineLifetime().
+    //   * mustTrackPipelineLifetime (dxvk_device.cpp:133) needs
+    //     canUseGraphicsPipelineLibrary() on EVERY branch -- so with
+    //     `dxvk.enableGraphicsPipelineLibrary = False` it is false whatever the
+    //     trackPipelineLifetime option says -- and on Auto it is false for
+    //     VK_DRIVER_ID_MESA_RADV_KHR anyway. Even when it does run it drops only
+    //     the fast-linked BASE pipelines and keeps the optimized ones, which are
+    //     the only kind this pass builds.
+    //
+    //  So there is nothing a D3D9 caller can release, reset or configure that
+    //  gives an optimized pipeline back. Only ~DxvkDevice does, and a DxvkDevice
+    //  belongs to exactly one D3D9 device.
+    //
+    //  Hence: the engine walk gets a D3D9 device of its own and we destroy it
+    //  when the walk is done. What survives is the DRIVER's on-disk cache, which
+    //  is keyed on the SPIR-V and the pipeline state and not on the device --
+    //  which is the same thing vkcapture's Fossilize replay relies on when it
+    //  creates a pipeline and destroys it in the next statement.
+    //
+    //  The device is created from the game's OWN IDirect3D9 with the game's own
+    //  adapter ordinal and behaviour flags, so DXVK gives it the same options,
+    //  the same feature set and therefore the same SPIR-V for the same bytecode.
+    // ===================================================================
+    static inline IDirect3D9* warmD3D = nullptr;
+    static inline IDirect3DDevice9* edev = nullptr;
+    static inline HWND warmWnd = nullptr;
+    static inline bool warmClassOk = false;
+
+    static bool CreateWarmDevice()
+    {
+        if (edev) return true;
+        if (!dev) return false;
+
+        if (!warmClassOk)
+        {
+            WNDCLASSEXA wc{ sizeof(wc) };
+            wc.lpfnWndProc = DefWindowProcA;
+            wc.hInstance = (HINSTANCE)hSelf;
+            wc.lpszClassName = "FusionFixWarmDevice";
+            warmClassOk = RegisterClassExA(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+            if (!warmClassOk)
+            {
+                Log("warm device: RegisterClassEx failed (%lu)", GetLastError());
+                return false;
+            }
+        }
+        // Never shown and never activated. DXVK builds a Vulkan surface for the
+        // device window at creation time (Presenter's constructor, unless
+        // deferSurfaceCreation), so it has to be a real HWND -- but nothing is
+        // ever presented to it.
+        warmWnd = CreateWindowExA(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, "FusionFixWarmDevice",
+                                  "FusionFix warm", WS_POPUP, 0, 0, 8, 8,
+                                  nullptr, nullptr, (HINSTANCE)hSelf, nullptr);
+        if (!warmWnd)
+        {
+            Log("warm device: CreateWindowEx failed (%lu)", GetLastError());
+            return false;
+        }
+
+        if (FAILED(dev->GetDirect3D(&warmD3D)) || !warmD3D)
+        {
+            Log("warm device: GetDirect3D failed");
+            DestroyWarmDevice();
+            return false;
+        }
+        D3DDEVICE_CREATION_PARAMETERS cp{};
+        if (FAILED(dev->GetCreationParameters(&cp)))
+        {
+            Log("warm device: GetCreationParameters failed");
+            DestroyWarmDevice();
+            return false;
+        }
+        // The game's own flags, so DXVK's shader translation and device options
+        // match -- minus PUREDEVICE (which would refuse the Get* calls the pass
+        // makes) and plus the two that say "this window is not yours to touch".
+        DWORD flags = (cp.BehaviorFlags & ~(DWORD)D3DCREATE_PUREDEVICE)
+                    | D3DCREATE_NOWINDOWCHANGES | D3DCREATE_MULTITHREADED;
+        D3DPRESENT_PARAMETERS pp{};
+        pp.BackBufferWidth  = 64;
+        pp.BackBufferHeight = 64;
+        pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+        pp.BackBufferCount  = 1;
+        pp.SwapEffect       = D3DSWAPEFFECT_DISCARD;
+        pp.hDeviceWindow    = warmWnd;
+        pp.Windowed         = TRUE;
+        pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+
+        const int64_t t0 = pipelinekeys::ClockUs();
+        // vkcapture tells this VkDevice from the game's by this flag: it wraps
+        // it for the counters but must not record, replay or report on it.
+        pipelinekeys::VulkanReplay().modOwnedDevice = true;
+        HRESULT hr = warmD3D->CreateDevice(cp.AdapterOrdinal, cp.DeviceType, warmWnd, flags, &pp, &edev);
+        pipelinekeys::VulkanReplay().modOwnedDevice = false;
+        if (FAILED(hr) || !edev)
+        {
+            edev = nullptr;
+            Log("warm device: CreateDevice(adapter %u, type %u, flags 0x%08lX) failed (hr=0x%08lX)",
+                cp.AdapterOrdinal, (unsigned)cp.DeviceType, (unsigned long)flags, (unsigned long)hr);
+            DestroyWarmDevice();
+            return false;
+        }
+        Log("warm device: created in %.2f s on adapter %u, flags 0x%08lX (the game's own, less "
+            "PUREDEVICE) - every pipeline the engine walk builds goes here and dies with it",
+            (pipelinekeys::ClockUs() - t0) / 1e6, cp.AdapterOrdinal, (unsigned long)flags);
+        return true;
+    }
+
+    // Destroying this device is the whole point of having it, so it says what
+    // happened rather than assuming: how many references were left (anything but
+    // 0 means one of our own objects outlived the release and DXVK's
+    // D3D9DeviceChild kept the device alive with it), how long DXVK took to tear
+    // ~61,000 pipelines down, and what the address space looked like on the
+    // other side.
+    static void DestroyWarmDevice()
+    {
+        const bool real = edev != nullptr;
+        const int64_t t0 = pipelinekeys::ClockUs();
+        if (edev)
+        {
+            const ULONG left = edev->Release();
+            edev = nullptr;
+            if (real)
+                Log("warm device: released, %lu references left (0 is what destroys it), "
+                    "torn down in %.2f s", (unsigned long)left,
+                    (pipelinekeys::ClockUs() - t0) / 1e6);
+        }
+        if (warmD3D) { warmD3D->Release(); warmD3D = nullptr; }
+        if (warmWnd) { DestroyWindow(warmWnd); warmWnd = nullptr; }
+        if (real) LogVa("engine: the instant the warm device was released");
+    }
+
+    // Everything the engine walk binds, on the device the walk is running on.
+    // A D3D9 object belongs to the device that created it, so when the walk is
+    // on a device of ours NONE of the pass's shared resources may be used -- it
+    // gets its own copies of all of them, including a mirror of every engine
+    // shader object, built from the same bytecode (which is what DXVK keys its
+    // shader modules on, so the pipeline identity is unchanged).
+    struct EngineRes
+    {
+        IDirect3DVertexBuffer9*  vb = nullptr;
+        IDirect3DIndexBuffer9*   ib = nullptr;
+        IDirect3DTexture9*       t2 = nullptr;
+        IDirect3DCubeTexture9*   tc = nullptr;
+        IDirect3DVolumeTexture9* tv = nullptr;
+    };
+    static inline EngineRes eres;
+    static inline std::unordered_map<void*, IDirect3DVertexShader9*> eVsByObj;
+    static inline std::unordered_map<void*, IDirect3DPixelShader9*>  ePsByObj;
+    // The engine's shader BYTECODE, kept for the life of the walk so a mirror
+    // can be rebuilt on each new warm device (ResolveEngineShaderIO reads it
+    // once; the walk goes through several devices). ~2000 shaders, a few KB
+    // each. The mirrors themselves are made lazily, so a device only ever
+    // carries the shaders its own slice of the job list actually binds.
+    static inline std::unordered_map<void*, std::vector<uint8_t>> eShaderBytes;
+    static inline uint32_t eMirrorFailed = 0;
+
+    // The device the engine walk draws on: ours when there is one, the game's
+    // otherwise (PrecompileWarmDevice = 0, or a device we could not create).
+    static IDirect3DDevice9* EDev() { return edev ? edev : dev; }
+
+    static IDirect3DVertexBuffer9* EVB() { return edev ? eres.vb : dummyVB; }
+    static IDirect3DIndexBuffer9*  EIB() { return edev ? eres.ib : dummyIB; }
+    static IDirect3DBaseTexture9*  ETex(uint8_t dim)
+    {
+        if (edev)
+            return dim == 3 ? (IDirect3DBaseTexture9*)eres.tc
+                 : dim == 4 ? (IDirect3DBaseTexture9*)eres.tv
+                            : (IDirect3DBaseTexture9*)eres.t2;
+        return dim == 3 ? (IDirect3DBaseTexture9*)texCube
+             : dim == 4 ? (IDirect3DBaseTexture9*)texVol
+                        : (IDirect3DBaseTexture9*)tex2D;
+    }
+    static IDirect3DVertexShader9* EVS(IDirect3DVertexShader9* obj)
+    {
+        if (!edev) return obj;
+        if (!obj) return nullptr;
+        auto it = eVsByObj.find((void*)obj);
+        if (it != eVsByObj.end()) return it->second;
+        IDirect3DVertexShader9* mine = nullptr;
+        auto b = eShaderBytes.find((void*)obj);
+        if (b == eShaderBytes.end() ||
+            FAILED(edev->CreateVertexShader((const DWORD*)b->second.data(), &mine)))
+            mine = nullptr;
+        if (!mine) eMirrorFailed++;
+        eVsByObj[(void*)obj] = mine;
+        return mine;
+    }
+    static IDirect3DPixelShader9* EPS(IDirect3DPixelShader9* obj)
+    {
+        if (!edev) return obj;
+        if (!obj) return nullptr;
+        auto it = ePsByObj.find((void*)obj);
+        if (it != ePsByObj.end()) return it->second;
+        IDirect3DPixelShader9* mine = nullptr;
+        auto b = eShaderBytes.find((void*)obj);
+        if (b == eShaderBytes.end() ||
+            FAILED(edev->CreatePixelShader((const DWORD*)b->second.data(), &mine)))
+            mine = nullptr;
+        if (!mine) eMirrorFailed++;
+        ePsByObj[(void*)obj] = mine;
+        return mine;
+    }
+
+    static bool CreateEngineResources()
+    {
+        if (!edev) return true;
+        bool ok = true;
+        if (SUCCEEDED(edev->CreateVertexBuffer(64 * 1024, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &eres.vb, nullptr)))
+        {
+            void* p = nullptr;
+            if (SUCCEEDED(eres.vb->Lock(0, 0, &p, 0))) { memset(p, 0, 64 * 1024); eres.vb->Unlock(); }
+        }
+        else ok = false;
+        if (SUCCEEDED(edev->CreateIndexBuffer(1024 * sizeof(uint16_t), D3DUSAGE_WRITEONLY, D3DFMT_INDEX16,
+                                              D3DPOOL_DEFAULT, &eres.ib, nullptr)))
+        {
+            void* p = nullptr;
+            if (SUCCEEDED(eres.ib->Lock(0, 0, &p, 0))) { memset(p, 0, 1024 * sizeof(uint16_t)); eres.ib->Unlock(); }
+        }
+        else ok = false;
+        ok &= SUCCEEDED(edev->CreateTexture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &eres.t2, nullptr));
+        ok &= SUCCEEDED(edev->CreateCubeTexture(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &eres.tc, nullptr));
+        ok &= SUCCEEDED(edev->CreateVolumeTexture(4, 4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &eres.tv, nullptr));
+        if (!ok) Log("warm device: could not create every scratch resource on it");
+        return ok;
+    }
+
+    // What the walk is allowed to build on the GAME's device when a device of
+    // our own could not be created. 13.7 KB of address space per pipeline was
+    // measured on this rig (2026-09-21: 60,821 pipelines cost 836 MB of the
+    // 3093 MB the process had, and took the largest free RUN from 578 MB to
+    // 27 MB), so 8192 jobs is ~112 MB of pipelines against the walk's 836.
+    static constexpr uint32_t kCappedJobs = 8192;
+
+    // How many jobs one warm device gets before it is destroyed and replaced.
+    //
+    // This is the number that makes the feature safe, and why it is needed at
+    // all is not obvious, so: destroying the device DOES free everything the
+    // pipelines held -- measured, `0 references left`, 61,564 pipelines torn
+    // down in 0.08 s -- but the free virtual ADDRESS SPACE does not come back.
+    // The per-pipeline cost is ordinary C++ allocation on the PE-side heap, and
+    // a Windows heap does not decommit an interleaved free list. What it does
+    // do is REUSE it, and that is measurable: with one device per 8192 jobs the
+    // walk's whole cost is its FIRST chunk and every chunk after it is free.
+    //   8192 jobs in (device 2): free 2916 MB, largest run 442 MB
+    //  16384 jobs in (device 3): free 2916 MB, largest run 442 MB
+    //  ...
+    //  49152 jobs in (device 7): free 2914 MB, largest run 442 MB
+    // 179 MB for the whole 61,191-job walk instead of 836, and the largest free
+    // run holds at 442 MB instead of collapsing to 27. A smaller chunk would
+    // shrink the 179 MB further, at one more device swap (~0.03 s) per chunk.
+    static constexpr uint32_t kWarmChunkJobs = 8192;
+
+    static void ReleaseEngineResources()
+    {
+        for (auto& kv : eVsByObj) SAFE_RELEASE(kv.second);
+        for (auto& kv : ePsByObj) SAFE_RELEASE(kv.second);
+        eVsByObj.clear();
+        ePsByObj.clear();
+        SAFE_RELEASE(eres.vb);
+        SAFE_RELEASE(eres.ib);
+        SAFE_RELEASE(eres.t2);
+        SAFE_RELEASE(eres.tc);
+        SAFE_RELEASE(eres.tv);
+    }
+
+    // Everything the walk owns, in the order COM needs it: the objects first,
+    // the device they belong to last. When that device is ours, this is the
+    // moment DXVK destroys the pipelines -- ~DxvkDevice is the only code in it
+    // that ever does (see the block above), so this call IS the fix.
+    // Everything the CURRENT warm device owns, without touching what the walk
+    // needs to carry on somewhere else (the engine's shader references and the
+    // bytecode the mirrors are built from).
+    static void ReleaseWarmDeviceObjects()
+    {
+        for (auto& d : engineDeclObjs) SAFE_RELEASE(d);
+        for (auto& r : engineRTs) SAFE_RELEASE(r.surf);
+        engineRTs.clear();
+        for (auto& s : engineDepths) { SAFE_RELEASE(s.surf); SAFE_RELEASE(s.tex); }
+        engineDepths.clear();
+        ReleaseEngineResources();
+    }
+
+    static void ReleaseEngineWalk()
+    {
+        ReleaseWarmDeviceObjects();
+        engineDeclObjs.clear();
+        eShaderBytes.clear();
+        ReleaseEngineShaderRefs();
+        DestroyWarmDevice();
+    }
+
+    // Swap the walk onto a fresh warm device: everything the old one holds goes
+    // with it, and the new one starts empty. False if a new device could not be
+    // made, in which case the caller stops the walk rather than carry on
+    // building pipelines the game will have to live with.
+    static bool RotateWarmDevice(const enginewarm::Plan& plan)
+    {
+        ReleaseWarmDeviceObjects();
+        DestroyWarmDevice();
+        if (!CreateWarmDevice() || !CreateEngineResources())
+        {
+            DestroyWarmDevice();
+            return false;
+        }
+        for (size_t i = 0; i < plan.decls.size() && i < engineDeclObjs.size(); i++)
+        {
+            std::vector<D3DVERTEXELEMENT9> e = plan.decls[i].elems;
+            e.push_back(D3DDECL_END());
+            engineDeclObjs[i] = nullptr;
+            if (FAILED(EDev()->CreateVertexDeclaration(e.data(), &engineDeclObjs[i])))
+                engineDeclObjs[i] = nullptr;
+        }
+        ApplyDefaultBlock(plan);
+        return true;
+    }
+
+    // Diagnostic arm of PrecompileWarmDevice: can a second D3D9 device be made
+    // here at all, and what does one cost while it exists? Answered before the
+    // long pass, so a run that dies later still says it in the log.
+    static void ProbeWarmDevice()
+    {
+        LogVa("before the warm-device probe");
+        const bool ok = CreateWarmDevice();
+        if (ok) LogVa("with a second D3D9 device alive");
+        DestroyWarmDevice();
+        LogVa("after the second D3D9 device was destroyed");
+        Log("warm device: probe %s", ok ? "OK - a device of our own can be created at this gate"
+                                        : "FAILED - the engine walk cannot be moved off the game's device");
+    }
+
     // A distinct surface per (format, MRT slot). The recorded replay reuses one
     // surface per format, which means the G-buffer's three A8R8G8B8 targets are
     // the same image in three attachments -- a Vulkan feedback loop that is
@@ -2944,14 +3374,44 @@ class ShaderPrecompiler
 
     static IDirect3DSurface9* EngineScratch(D3DFORMAT fmt, int slot, uint32_t ms, uint32_t msq)
     {
-        if (slot == 0) return ScratchForMS(fmt, ms, msq);   // share slot 0 with the replay
+        // Slot 0 shares the replay's surface -- but only when the walk is on the
+        // game's device. On a device of our own nothing of the pass's is usable.
+        if (!edev && slot == 0) return ScratchForMS(fmt, ms, msq);
         for (auto& r : engineRTs)
             if (r.fmt == fmt && r.slot == slot && r.ms == ms && r.msq == msq) return r.surf;
         IDirect3DSurface9* s = nullptr;
-        if (FAILED(dev->CreateRenderTarget(kRTdim, kRTdim, fmt, (D3DMULTISAMPLE_TYPE)ms, msq, FALSE, &s, nullptr)))
+        if (FAILED(EDev()->CreateRenderTarget(kRTdim, kRTdim, fmt, (D3DMULTISAMPLE_TYPE)ms, msq, FALSE, &s, nullptr)))
             s = nullptr;
         engineRTs.push_back({ fmt, slot, ms, msq, s });
         return s;
+    }
+
+    // The same for depth. ReplayDepthForMS's cache lives on the game's device,
+    // so the walk keeps its own when it is somewhere else.
+    static inline std::vector<ScratchDS> engineDepths;
+
+    static IDirect3DSurface9* EngineDepth(uint32_t fmt, uint32_t type, uint32_t quality)
+    {
+        if (!edev) return ReplayDepthForMS(fmt, type, quality);
+        if (fmt == 0) return nullptr;
+        if (type && d3d9cache::IsFourCCDepth(fmt)) fmt = (uint32_t)D3DFMT_D24S8;
+        for (auto& s : engineDepths)
+            if (s.fmt == fmt && s.type == type && s.quality == quality) return s.surf;
+
+        ScratchDS s{ fmt, type, quality, nullptr, nullptr };
+        if (d3d9cache::IsFourCCDepth(fmt))
+        {
+            if (SUCCEEDED(edev->CreateTexture(kRTdim, kRTdim, 1, D3DUSAGE_DEPTHSTENCIL, (D3DFORMAT)fmt,
+                                              D3DPOOL_DEFAULT, &s.tex, nullptr)) && s.tex)
+                s.tex->GetSurfaceLevel(0, &s.surf);
+        }
+        else if (FAILED(edev->CreateDepthStencilSurface(kRTdim, kRTdim, (D3DFORMAT)fmt, (D3DMULTISAMPLE_TYPE)type,
+                                                        quality, FALSE, &s.surf, nullptr)))
+        {
+            s.surf = nullptr;
+        }
+        engineDepths.push_back(s);
+        return s.surf;
     }
 
     // MSVC refuses __try in a function that needs C++ unwinding, so the SEH
@@ -2986,29 +3446,30 @@ class ShaderPrecompiler
     // the way a render phase does before it emits a bucket draw.
     static void ApplyDefaultBlock(const enginewarm::Plan& p)
     {
+        IDirect3DDevice9* d = EDev();
         for (uint32_t i = 0; i < enginewarm::kRageStates; i++)
             if (enginewarm::RSReaches(p.stateToRS[i]))
-                dev->SetRenderState((D3DRENDERSTATETYPE)p.stateToRS[i], p.defaultRS[i]);
+                d->SetRenderState((D3DRENDERSTATETYPE)p.stateToRS[i], p.defaultRS[i]);
         // Not in the 43-entry table, and every one of them is a DXVK spec
         // constant -- so whatever the last thing to touch the device left here
         // rides along in the key of every job that follows. On the boot gate
         // that "last thing" is the game's own loading screen, once every slice.
         // 10-key-spec measured pointSprite at 0 across all 757 route keys and
         // fog off; those are the values a real draw is built with.
-        dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
-        dev->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
-        dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
-        dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
-        dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-        dev->SetRenderState(D3DRS_POINTSPRITEENABLE, FALSE);
-        dev->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
+        d->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        d->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+        d->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+        d->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+        d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        d->SetRenderState(D3DRS_POINTSPRITEENABLE, FALSE);
+        d->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
         // The four vertex-texture samplers are half of DXVK's spec constant 3
         // and nothing in this pass ever binds them, so whatever the recorded
         // replay last left there would ride along on every engine draw. Null
         // them wherever the default block is re-established, which is at the
         // start of the walk and after every overlay frame.
         for (uint32_t i = 0; i < pipelinekeys::kVSSamplers; i++)
-            dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + i, nullptr);
+            d->SetTexture(D3DVERTEXTEXTURESAMPLER0 + i, nullptr);
     }
 
     // A phase callback pushes exactly this much that DXVK can bake: the four
@@ -3018,12 +3479,13 @@ class ShaderPrecompiler
     // the pass's own delta does (enginewarm::ResolveRS).
     static void ApplyStateVec(const enginewarm::StateVec& v)
     {
-        dev->SetRenderState(D3DRS_COLORWRITEENABLE,  v.cwe[0]);
-        dev->SetRenderState(D3DRS_COLORWRITEENABLE1, v.cwe[1]);
-        dev->SetRenderState(D3DRS_COLORWRITEENABLE2, v.cwe[2]);
-        dev->SetRenderState(D3DRS_COLORWRITEENABLE3, v.cwe[3]);
-        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, v.blendEnable);
-        dev->SetRenderState(D3DRS_ALPHATESTENABLE, v.alphaTest);
+        IDirect3DDevice9* d = EDev();
+        d->SetRenderState(D3DRS_COLORWRITEENABLE,  v.cwe[0]);
+        d->SetRenderState(D3DRS_COLORWRITEENABLE1, v.cwe[1]);
+        d->SetRenderState(D3DRS_COLORWRITEENABLE2, v.cwe[2]);
+        d->SetRenderState(D3DRS_COLORWRITEENABLE3, v.cwe[3]);
+        d->SetRenderState(D3DRS_ALPHABLENDENABLE, v.blendEnable);
+        d->SetRenderState(D3DRS_ALPHATESTENABLE, v.alphaTest);
     }
 
     // References taken on the engine's own shader objects for the duration of
@@ -3105,6 +3567,17 @@ class ShaderPrecompiler
                     sh->AddRef();
                     engineShaderRefs.push_back(sh);
                 }
+                // The walk's own device cannot bind the engine's object, so it
+                // binds one built from the same bytes -- DXVK keys its shader
+                // modules on a hash of the bytecode, so the two are the same
+                // DxvkShader as far as a pipeline identity goes, which is the
+                // same thing that makes the .fxc replay warm pipelines the
+                // game's own objects then reuse. The mirror is made on demand
+                // (EVS / EPS) because the walk goes through several devices and
+                // each one should only carry the shaders its own slice binds;
+                // what is kept here is the bytecode to build them from.
+                if (cfg.warmDevice == 1)
+                    eShaderBytes[obj].assign(buf.data(), buf.data() + size);
                 info.ok = true;
             }
             else failed++;
@@ -3155,30 +3628,31 @@ class ShaderPrecompiler
         const enginewarm::PassInfo& pass = plan.passes[j.pass];
         const enginewarm::StateVec& SV   = enginewarm::kStateVecs[j.state];
         const enginewarm::Decl& D = plan.decls[j.decl];
+        IDirect3DDevice9* dv = EDev();
 
-        for (int i = 0; i < 4; i++) dev->SetRenderTarget(i, d->rts[i]);
-        dev->SetDepthStencilSurface(d->ds);
+        for (int i = 0; i < 4; i++) dv->SetRenderTarget(i, d->rts[i]);
+        dv->SetDepthStencilSurface(d->ds);
         D3DVIEWPORT9 vp{ 0, 0, 1, 1, 0.0f, 1.0f };
-        dev->SetViewport(&vp);
+        dv->SetViewport(&vp);
 
-        dev->SetVertexDeclaration(d->declObj);
+        dv->SetVertexDeclaration(d->declObj);
         for (UINT s = 0; s < 4; s++)
-            if (D.stride[s]) dev->SetStreamSource(s, dummyVB, 0, D.stride[s]);
+            if (D.stride[s]) dv->SetStreamSource(s, EVB(), 0, D.stride[s]);
         // Rebound every job rather than once before the walk: the overlay's
         // ID3DXFont drives an ID3DXSprite between jobs whenever the progress
         // text changes, and whether its state block covers SetIndices is
         // D3DX's business, not ours. One cached call against ~10 ms of work.
-        dev->SetIndices(dummyIB);
+        dv->SetIndices(EIB());
         if (D.instanced)
         {
             // DXVK only draws instances when stream 0 carries INDEXEDDATA,
             // and only stream 1's INSTANCEDATA is in the pipeline key.
-            dev->SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | 1u);
-            dev->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | 1u);
+            dv->SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | 1u);
+            dv->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | 1u);
         }
 
-        dev->SetVertexShader(pass.vs);
-        dev->SetPixelShader(pass.ps);
+        dv->SetVertexShader(EVS(pass.vs));
+        dv->SetPixelShader(EPS(pass.ps));
         // The material's binding pattern: every declared slot, or one of them
         // left null, or none of them. It is the axis the engine cannot answer
         // -- which of the slots a shader declares actually receives a texture
@@ -3189,16 +3663,15 @@ class ShaderPrecompiler
             memcpy(dim, pass.psDim, sizeof(dim));
             if (j.psVariant == enginewarm::kPSV_NoneBound) memset(dim, 0, sizeof(dim));
             else if (j.psVariant != enginewarm::kPSV_AllBound) dim[j.psVariant - 1] = 0;
-            BindSamplersDim(dim);
+            for (int s = 0; s < 16; s++)
+                dv->SetTexture(s, dim[s] ? ETex(dim[s]) : nullptr);
         }
         for (int s = 0; s < 4; s++)
         {
             IDirect3DBaseTexture9* t = nullptr;
             if ((j.flags & enginewarm::kJF_VSSampler) && pass.vsDim[s])
-                t = (pass.vsDim[s] == 3) ? (IDirect3DBaseTexture9*)texCube
-                  : (pass.vsDim[s] == 4) ? (IDirect3DBaseTexture9*)texVol
-                                         : (IDirect3DBaseTexture9*)tex2D;
-            dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + s, t);
+                t = ETex(pass.vsDim[s]);
+            dv->SetTexture(D3DVERTEXTEXTURESAMPLER0 + s, t);
         }
 
         // Phase vector, then the pass's own delta: the order gameplay uses.
@@ -3208,7 +3681,7 @@ class ShaderPrecompiler
             const uint32_t key = plan.stateWords[pass.stateOff + s * 2];
             const uint32_t val = plan.stateWords[pass.stateOff + s * 2 + 1];
             if (key < enginewarm::kRageStates && enginewarm::RSReaches(plan.stateToRS[key]))
-                dev->SetRenderState((D3DRENDERSTATETYPE)plan.stateToRS[key], val);
+                dv->SetRenderState((D3DRENDERSTATETYPE)plan.stateToRS[key], val);
         }
         // DXVK counts the clip planes that are ENABLED **and non-zero**
         // (UpdateClipPlanes, d3d9_device.cpp:6107), so setting the enable
@@ -3217,14 +3690,14 @@ class ShaderPrecompiler
         if (j.flags & enginewarm::kJF_ClipPlane)
         {
             static const float kPlane[4] = { 0.0f, 1.0f, 0.0f, 0.0f };
-            dev->SetClipPlane(0, kPlane);
-            dev->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
+            dv->SetClipPlane(0, kPlane);
+            dv->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
         }
 
         static const D3DPRIMITIVETYPE kTopo[3] =
             { D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DPT_TRIANGLEFAN };
         const uint32_t ti = j.flags & enginewarm::kJF_TopoMask;
-        d->failed = FAILED(dev->DrawIndexedPrimitive(kTopo[ti < 3 ? ti : 0], 0, 0, 3, 0, 1));
+        d->failed = FAILED(dv->DrawIndexedPrimitive(kTopo[ti < 3 ? ti : 0], 0, 0, 3, 0, 1));
 
         // grcEffectPass::RestoreState: put the pass's own keys back to the
         // engine's default block, so the next job starts where a phase does.
@@ -3232,15 +3705,15 @@ class ShaderPrecompiler
         {
             const uint32_t key = plan.stateWords[pass.stateOff + s * 2];
             if (key < enginewarm::kRageStates && enginewarm::RSReaches(plan.stateToRS[key]))
-                dev->SetRenderState((D3DRENDERSTATETYPE)plan.stateToRS[key], plan.defaultRS[key]);
+                dv->SetRenderState((D3DRENDERSTATETYPE)plan.stateToRS[key], plan.defaultRS[key]);
         }
         if (j.flags & enginewarm::kJF_ClipPlane)
         {
             static const float kZero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-            dev->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
-            dev->SetClipPlane(0, kZero);
+            dv->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+            dv->SetClipPlane(0, kZero);
         }
-        if (D.instanced) { dev->SetStreamSourceFreq(0, 1); dev->SetStreamSourceFreq(1, 1); }
+        if (D.instanced) { dv->SetStreamSourceFreq(0, 1); dv->SetStreamSourceFreq(1, 1); }
     }
 
     // -------------------------------------------------------------------
@@ -3382,6 +3855,24 @@ class ShaderPrecompiler
             return;
         }
 
+        // THE DEVICE THE WALK DRAWS ON. Before the shader objects are read,
+        // because each one is mirrored onto it as it is read. If it cannot be
+        // created the walk still runs, on the game's device and with the job
+        // cap below, because a warm pass that keeps 61,000 live pipelines in a
+        // 32-bit process is the thing this is here to stop.
+        if (cfg.warmDevice == 1)
+        {
+            LogVa("engine: before the warm device");
+            if (CreateWarmDevice() && CreateEngineResources())
+                LogVa("engine: with the warm device up");
+            else
+            {
+                DestroyWarmDevice();
+                Log("engine: no warm device - the walk runs on the game's device and is capped "
+                    "at %u jobs so it cannot spend the address space the game needs", kCappedJobs);
+            }
+        }
+
         // Between the two halves of the build: read every pass's shader objects
         // and take a reference on them. See ResolveEngineShaderIO -- this is
         // what makes the declaration projection and the sampler binding come
@@ -3391,7 +3882,7 @@ class ShaderPrecompiler
         if (plan.passes.empty())
         {
             curLabel.clear();
-            ReleaseEngineShaderRefs();
+            ReleaseEngineWalk();
             Log("engine: OFF - no pass survived reading its shader objects. The recorded "
                 "d3d9cache replay is unaffected.");
             return;
@@ -3399,7 +3890,7 @@ class ShaderPrecompiler
         if (!GuardedCall(&DoBuildJobs, &args) || !plan.ok)
         {
             curLabel.clear();
-            ReleaseEngineShaderRefs();
+            ReleaseEngineWalk();
             Log("engine: OFF - %s. The recorded d3d9cache replay is unaffected.",
                 plan.why.empty() ? "the job walk produced nothing" : plan.why.c_str());
             return;
@@ -3491,7 +3982,7 @@ class ShaderPrecompiler
         {
             std::vector<D3DVERTEXELEMENT9> e = plan.decls[i].elems;
             e.push_back(D3DDECL_END());
-            if (SUCCEEDED(dev->CreateVertexDeclaration(e.data(), &engineDeclObjs[i]))) declMade++;
+            if (SUCCEEDED(EDev()->CreateVertexDeclaration(e.data(), &engineDeclObjs[i]))) declMade++;
             else declFailed++;
         }
         Log("engine: created %u vertex declarations (%u refused by the device)", declMade, declFailed);
@@ -3513,7 +4004,7 @@ class ShaderPrecompiler
         ApplyDefaultBlock(plan);
 
         IDirect3DQuery9* fence = nullptr;
-        dev->CreateQuery(D3DQUERYTYPE_EVENT, &fence);
+        EDev()->CreateQuery(D3DQUERYTYPE_EVENT, &fence);
         const uint32_t kFenceChunk = (cfg.fenceChunk > 0) ? (uint32_t)cfg.fenceChunk : 1;
         uint32_t sinceFence = 0;
 
@@ -3568,9 +4059,68 @@ class ShaderPrecompiler
         uint32_t framesAtBase = overlayFrames;
         uint32_t epochAtBase = sliceEpoch;
 
-        for (size_t ji = 0; ji < plan.jobs.size(); ji++)
+        // The address space, every 8192 jobs. This walk is the one thing in the
+        // mod that can spend hundreds of megabytes of a 32-bit process, and a
+        // curve through the walk is what says whether it spends them evenly
+        // (pipelines) or in steps (something else).
+        LogVa("engine: before the walk");
+        size_t vaAt = 0;
+        constexpr size_t kVaEvery = 8192;
+
+        // Without a device of our own the pipelines are the game's for the rest
+        // of the session, so the walk is bounded rather than complete. With one,
+        // nothing survives the walk and there is nothing to bound.
+        const size_t jobCap = (!edev && cfg.warmDevice == 1)
+                            ? (std::min)((size_t)kCappedJobs, plan.jobs.size()) : plan.jobs.size();
+
+        // And a floor under both arms. Even with a device of its own the walk
+        // holds every pipeline it has built until that device goes, so the
+        // TROUGH is the same either way -- it is only the state gameplay starts
+        // in that differs. The game's world is already loaded at this gate and
+        // its streamer is idle behind the loading screen, but nothing about a
+        // 32-bit address space is worth betting a session on: if free space
+        // reaches the floor the walk stops where it is and releases what it has.
+        const uint64_t vaFloorMB = 1024;
+        const uint64_t vaAtStart = pipelinekeys::AvailVaMB();
+        const uint64_t vaBudgetMB = 192;   // only on the game's device
+        uint32_t sinceVaCheck = 0;
+
+        uint32_t warmDevices = 1, rotateFailed = 0;
+        size_t rotateAt = 0;
+
+        for (size_t ji = 0; ji < jobCap; ji++)
         {
             const Job& j = plan.jobs[ji];
+            // A fresh device every kWarmChunkJobs jobs: the old one's pipelines
+            // go with it and the next chunk builds in the space they gave back.
+            // The fence first, so nothing of this chunk's is still in flight
+            // when its device is destroyed.
+            if (edev && ji && ji - rotateAt >= kWarmChunkJobs)
+            {
+                rotateAt = ji;
+                if (sinceFence) { FenceChunk(fence); workDone += sinceFence; sinceFence = 0; }
+                else FenceChunk(fence);
+                SAFE_RELEASE(fence);
+                if (!RotateWarmDevice(plan))
+                {
+                    rotateFailed++;
+                    stopped = true;
+                    stopWhy = " [could not make another warm device]";
+                    break;
+                }
+                warmDevices++;
+                EDev()->CreateQuery(D3DQUERYTYPE_EVENT, &fence);
+                framesAtBase = overlayFrames;
+                epochAtBase = sliceEpoch;
+            }
+            if (ji - vaAt >= kVaEvery)
+            {
+                vaAt = ji;
+                char what[64];
+                _snprintf_s(what, sizeof(what), _TRUNCATE, "engine: %zu jobs in (device %u)",
+                            ji, warmDevices);
+                LogVa(what);
+            }
             if (overlayFrames != framesAtBase || sliceEpoch != epochAtBase)
             {
                 ApplyDefaultBlock(plan);
@@ -3592,7 +4142,7 @@ class ShaderPrecompiler
                     unsupported |= !rts[i];
                 }
             IDirect3DSurface9* ds = (C.depth != D3DFMT_UNKNOWN)
-                                  ? ReplayDepthForMS((uint32_t)C.depth, C.msType, C.msQuality) : nullptr;
+                                  ? EngineDepth((uint32_t)C.depth, C.msType, C.msQuality) : nullptr;
             unsupported |= (C.depth != D3DFMT_UNKNOWN) && !ds;
             if (!rts[0] || unsupported) { skippedRT++; workDone++; continue; }
 
@@ -3631,7 +4181,7 @@ class ShaderPrecompiler
                 }
                 // A lost device here would turn every remaining draw into a
                 // silent failure; stop and let the game have its frame back.
-                if (dev->TestCooperativeLevel() != D3D_OK)
+                if (EDev()->TestCooperativeLevel() != D3D_OK)
                 {
                     stopped = true; stopWhy = " [device lost]";
                     break;
@@ -3643,6 +4193,28 @@ class ShaderPrecompiler
                 stopWhy = gateAbort.load() ? " [the gate asked the pass to stop]"
                                            : " [PrecompileBudgetSeconds reached]";
                 break;
+            }
+            if (++sinceVaCheck >= 256)
+            {
+                sinceVaCheck = 0;
+                const uint64_t freeMB = pipelinekeys::AvailVaMB();
+                if (freeMB && freeMB < vaFloorMB)
+                {
+                    stopped = true; stopWhy = " [address space floor reached]";
+                    Log("engine: STOPPING at job %zu - only %llu MB of address space is free, "
+                        "and this walk will not take a 32-bit process below %llu",
+                        ji, (unsigned long long)freeMB, (unsigned long long)vaFloorMB);
+                    break;
+                }
+                if (!edev && cfg.warmDevice == 1 && vaAtStart && freeMB && freeMB < vaAtStart &&
+                    vaAtStart - freeMB > vaBudgetMB)
+                {
+                    stopped = true; stopWhy = " [address-space budget spent, no device of our own]";
+                    Log("engine: STOPPING at job %zu - the walk has spent %llu MB of address "
+                        "space on the GAME's device, which is the whole session's to lose",
+                        ji, (unsigned long long)(vaAtStart - freeMB));
+                    break;
+                }
             }
             // The cheap path. A fence first, so every pipeline the sample
             // needed has been created -- with graphics pipeline libraries off
@@ -3670,28 +4242,51 @@ class ShaderPrecompiler
             }
             PresentOverlay(false);
         }
+        if (!stopped && jobCap < plan.jobs.size())
+        {
+            stopped = true;
+            stopWhy = " [capped: no device of our own, so the walk is bounded]";
+        }
 
         if (sinceFence) { FenceChunk(fence); workDone += sinceFence; }
         SAFE_RELEASE(fence);
+        LogVa("engine: at the end of the walk");
 
         // Unbind everything this phase touched, then put RAGE's default block
         // back, so the pass-level restore below only has the overlay's own
-        // state left to undo.
-        for (uint32_t i = 1; i < 4; i++) dev->SetRenderTarget(i, nullptr);
-        for (UINT s = 0; s < 4; s++) { dev->SetStreamSource(s, nullptr, 0, 0); dev->SetStreamSourceFreq(s, 1); }
-        dev->SetIndices(nullptr);
-        dev->SetVertexDeclaration(nullptr);
-        for (uint32_t i = 0; i < pipelinekeys::kNumSamplers; i++)
-            dev->SetTexture(i < pipelinekeys::kPSSamplers
-                                ? i
-                                : D3DVERTEXTEXTURESAMPLER0 + (i - pipelinekeys::kPSSamplers),
-                            nullptr);
-        ApplyDefaultBlock(plan);
-        for (auto& d : engineDeclObjs) SAFE_RELEASE(d);
-        engineDeclObjs.clear();
-        for (auto& r : engineRTs) SAFE_RELEASE(r.surf);
-        engineRTs.clear();
-        ReleaseEngineShaderRefs();
+        // state left to undo. On a device of our own that is cosmetic -- it is
+        // about to be destroyed -- but on the game's device it is not.
+        {
+            IDirect3DDevice9* d = EDev();
+            for (uint32_t i = 1; i < 4; i++) d->SetRenderTarget(i, nullptr);
+            for (UINT s = 0; s < 4; s++) { d->SetStreamSource(s, nullptr, 0, 0); d->SetStreamSourceFreq(s, 1); }
+            d->SetIndices(nullptr);
+            d->SetVertexDeclaration(nullptr);
+            for (uint32_t i = 0; i < pipelinekeys::kNumSamplers; i++)
+                d->SetTexture(i < pipelinekeys::kPSSamplers
+                                  ? i
+                                  : D3DVERTEXTEXTURESAMPLER0 + (i - pipelinekeys::kPSSamplers),
+                              nullptr);
+            ApplyDefaultBlock(plan);
+        }
+        // NOTHING may still be compiling when the device goes: DXVK creates a
+        // graphics pipeline on the CS thread as the draw that needs it executes
+        // (with pipeline libraries off there is no worker to hand it to), and a
+        // half-built one at ~DxvkDevice is a use-after-free waiting to happen.
+        // This is also the point the user's "wait for the pipelines to compile"
+        // names -- the wait after the whole D3D9 pass is too late to matter for
+        // a device that no longer exists.
+        if (edev) WaitUntilIdle("the engine walk, before its device goes", edev);
+        const bool hadWarmDevice = edev != nullptr;
+        ReleaseEngineWalk();
+        LogVa("engine: after the walk's device and resources went");
+        if (hadWarmDevice)
+        {
+            // A second reading a moment later, in case anything about the
+            // teardown is deferred to another thread.
+            PassSleep(1000);
+            LogVa("engine: a second after the walk's device went");
+        }
 
         if (stopped) workDone = workTotal;
 
@@ -3699,6 +4294,11 @@ class ShaderPrecompiler
             "%u no declaration)",
             drawn, plan.jobs.size(), (long long)(elapsedMs() / 1000), stopWhy,
             failedDraw, faulted, skippedRT, skippedDecl);
+        if (cfg.warmDevice == 1)
+            Log("engine: the walk went through %u warm device(s) of %u jobs each%s, and %u shader "
+                "mirror(s) could not be built on one", warmDevices, kWarmChunkJobs,
+                rotateFailed ? " (one could not be replaced, which is why it stopped)" : "",
+                eMirrorFailed);
         Log("engine: PATH = %s", skippedWarm
                 ? "CHEAP - the stamp matched and the driver cache is warm"
                 : (stampMatches ? "FULL - the stamp matched but the driver cache had gone cold"
@@ -3767,12 +4367,13 @@ class ShaderPrecompiler
     //     started <n> creations (at most <n> at once), its <n> compiler threads used
     //     <s>s CPU (<s>s since they started; its CS thread <s>s), last activity
     //     t=<s>; settle <s>s
-    static void WaitUntilIdle(const char* after)
+    static void WaitUntilIdle(const char* after, IDirect3DDevice9* on = nullptr)
     {
         auto& vr = pipelinekeys::VulkanReplay();
         const int64_t w0 = pipelinekeys::ClockUs();
         IDirect3DQuery9* q = nullptr;
-        if (SUCCEEDED(dev->CreateQuery(D3DQUERYTYPE_EVENT, &q)) && q)
+        if (!on) on = dev;
+        if (SUCCEEDED(on->CreateQuery(D3DQUERYTYPE_EVENT, &q)) && q)
         {
             q->Issue(D3DISSUE_END);
             for (int spin = 0; spin < 200000; spin++)
@@ -4460,6 +5061,8 @@ class ShaderPrecompiler
         }
         DetectBackend();
         Log("backend = %s, device = %p", backend == Backend::DXVK ? "DXVK" : "native", (void*)dev);
+        LogVa("at the gate, before the pass");
+        if (cfg.warmDevice == 2) ProbeWarmDevice();
         ResolveOverlayInterval();
 
         // We are armed on the loading-screen render, so the game is very likely already
@@ -4561,6 +5164,7 @@ class ShaderPrecompiler
             {
                 DummyDrawPass(db);
             }
+            LogVa("after the recorded D3D9 replay");
             // Then the engine's own space, which needs no recording at all.
             // It runs AFTER the recorded replay on purpose: the recorded keys
             // are the ones this PC has proven it draws, so a
@@ -4571,8 +5175,10 @@ class ShaderPrecompiler
                 Log("order: 1b. engine warm phase (level %d), t=%.3f",
                     cfg.engineWarm, pipelinekeys::VulkanReplay().Seconds());
                 EngineWarmPass(db);
+                LogVa("after the engine warm phase");
             }
             WaitUntilIdle("the D3D9 pass");
+            LogVa("after waiting for DXVK to go quiet");
             // Everything the other PCs' keys started is built: record again.
             if (pipelinekeys::VulkanReplay().recordPaused.exchange(false))
                 Log("replay: Vulkan recording resumed, t=%.3f - %u pipelines DXVK created meanwhile were not recorded",
@@ -4581,6 +5187,7 @@ class ShaderPrecompiler
         }
         if (HoldForVulkanReplay())
             WaitUntilIdle("the Vulkan replay");
+        LogVa("after the Vulkan replay");
         // NB: ReleaseResources() deliberately happens AFTER the state restore below.
         // Releasing our scratch targets and textures while they are still bound, and
         // only then putting the game's state back, is the wrong order -- COM keeps
@@ -4651,6 +5258,7 @@ class ShaderPrecompiler
         else
             Log("presents accounted for: %u device presents vs %u overlay frames - nothing else "
                 "is presenting during the pass", devPresents, overlayFrames);
+        LogVa("at the gate, with the pass over");
         Log("order: 3. loading screen released, t=%.3f", pipelinekeys::VulkanReplay().Seconds());
         dev->Release();
         dev = nullptr;
@@ -4910,6 +5518,7 @@ class ShaderPrecompiler
         cfg.specVariants  = ini.ReadInteger("SHADERS", "PrecompileSpecVariants", 1) != 0;
         cfg.exportBaseline = ini.ReadInteger("SHADERS", "PrecompileExportBaseline", 0) != 0;
         cfg.engineWarm    = ini.ReadInteger("SHADERS", "PrecompileEngineWarm", 0);
+        cfg.warmDevice    = ini.ReadInteger("SHADERS", "PrecompileWarmDevice", 1);
         cfg.emitLog       = ini.ReadInteger("SHADERS", "PrecompileEmitLog", 0) != 0;
         cfg.sliceMs       = ini.ReadInteger("SHADERS", "PrecompileSliceMs", 8);
         cfg.gateMaxSeconds = ini.ReadInteger("SHADERS", "PrecompileGateMaxSeconds", 0);
@@ -4932,6 +5541,7 @@ public:
 
             GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                (LPCWSTR)&RebaseVA, &hSelf);
+            ArmCrashLogging();
 
             // Install the code hook on the render-thread loadscreen render
             // (FUN_005cc760 @ 0x005cc760, 1.2.0.59). It does NOT run on first call:

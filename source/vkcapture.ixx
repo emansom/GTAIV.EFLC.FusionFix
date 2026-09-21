@@ -796,6 +796,11 @@ class VkCapture
             gameplayTimes.Describe().c_str());
         Log(final ? "created by DXVK on later loading screens: %s" : "created by DXVK on later loading screens so far: %s",
             laterLoadingTimes.Describe().c_str());
+        // The 32-bit address space, at the same cadence. A warm pass leaves live
+        // DXVK pipelines behind it and the game keeps streaming into what is
+        // left, so the number that matters is not what the pass cost at the gate
+        // but what gameplay still has -- and whether it is still falling.
+        Log("memory in gameplay: %s", pipelinekeys::VaLine().c_str());
     }
 
     // Runs as long as the device: the 15 s gameplay reports. The final one comes from
@@ -1033,7 +1038,13 @@ class VkCapture
             if (it != devices.end()) { d = std::move(it->second); devices.erase(it); }
         }
         if (!d) return;
-        pipelinekeys::VulkanReplay().watching = false;
+        // Only when the LAST one goes. The mod's own warm device is destroyed in
+        // the middle of the loading screen, and clearing this there would leave
+        // every later "wait until DXVK is quiet" with nothing to watch.
+        {
+            std::shared_lock lock(devLock);
+            if (devices.empty()) pipelinekeys::VulkanReplay().watching = false;
+        }
         // The replay creates objects on this device: it must be finished first.
         d->stop = true;
         if (d->replay.joinable()) d->replay.join();
@@ -1989,9 +2000,15 @@ class VkCapture
             appInfo.pApplicationName = appName.c_str();
             appInfo.pEngineName = engineName.c_str();
             haveAppInfo = true;
-            Log("instance created by \"%s\" / engine \"%s\" %u.%u.%u", appName.c_str(), engineName.c_str(),
+            // With the session clock and the address space, because a Vulkan
+            // instance appearing in the MIDDLE of gameplay is a subsystem
+            // re-initialising, and the 2026-09-20 full+engine run that died had
+            // two of those and no other run had any.
+            Log("instance created by \"%s\" / engine \"%s\" %u.%u.%u, t=%.3f, memory: %s",
+                appName.c_str(), engineName.c_str(),
                 VK_API_VERSION_MAJOR(appInfo.engineVersion), VK_API_VERSION_MINOR(appInfo.engineVersion),
-                VK_API_VERSION_PATCH(appInfo.engineVersion));
+                VK_API_VERSION_PATCH(appInfo.engineVersion), pipelinekeys::VulkanReplay().Seconds(),
+                pipelinekeys::VaLine().c_str());
         }
         return res;
     }
@@ -2077,17 +2094,24 @@ class VkCapture
 
         // One recorder, one file. GTA IV has one D3D9 device, but DXVK is not the
         // only Vulkan user in the process: under Proton a second DXVK (the one
-        // behind Proton's dxgi/d3d11, 2.7.1 here) creates instances of its own. A
-        // second device must not append to the same archive concurrently.
+        // behind Proton's dxgi/d3d11, 2.7.1 here) creates instances of its own,
+        // and from the warm-device work the MOD creates a D3D9 device of its own
+        // for the engine walk. A second device must not append to the same
+        // archive concurrently, must not start a replay on a device that is
+        // about to be destroyed, and must not report gameplay twice.
+        //
+        // It must still be REGISTERED, though. GetDeviceProcAddr hands out the
+        // real entry points for a device this does not know, so an unregistered
+        // one is completely unwrapped -- and then its pipeline creations are
+        // missing from the counters the warm pass measures itself with, and from
+        // the signals its "wait until DXVK is quiet" watches. That was harmless
+        // while the only unregistered device was Proton's idle d3d11 one.
+        bool primary;
         {
             std::shared_lock lock(devLock);
-            if (!devices.empty())
-            {
-                Log("device %p (engine \"%s\") not recorded: already recording one device",
-                    (void*)*out, engineName.c_str());
-                return res;
-            }
+            primary = devices.empty();
         }
+        const bool mine = pipelinekeys::VulkanReplay().modOwnedDevice.load();
         // DXVK's device only: the wrappers are always on, for the metrics.
         if (haveAppInfo && engineName != "DXVK")
         {
@@ -2114,7 +2138,7 @@ class VkCapture
         d->DestroyDescriptorSetLayout = reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(load("vkDestroyDescriptorSetLayout"));
         d->DestroyPipelineLayout     = reinterpret_cast<PFN_vkDestroyPipelineLayout>(load("vkDestroyPipelineLayout"));
         d->DestroyRenderPass         = reinterpret_cast<PFN_vkDestroyRenderPass>(load("vkDestroyRenderPass"));
-        realQueuePresent             = reinterpret_cast<PFN_vkQueuePresentKHR>(load("vkQueuePresentKHR"));
+        if (primary) realQueuePresent = reinterpret_cast<PFN_vkQueuePresentKHR>(load("vkQueuePresentKHR"));
 
         auto* ident = static_cast<const VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT*>(
             FindPNext(info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT));
@@ -2124,6 +2148,16 @@ class VkCapture
             d->GetShaderModuleCreateInfoIdentifierEXT =
                 reinterpret_cast<PFN_vkGetShaderModuleCreateInfoIdentifierEXT>(load("vkGetShaderModuleCreateInfoIdentifierEXT"));
             d->usesIdentifiers = d->GetShaderModuleIdentifierEXT && d->GetShaderModuleCreateInfoIdentifierEXT;
+        }
+
+        if (!primary)
+        {
+            Log("device %p (engine \"%s\")%s: wrapped for the counters only - not recording, "
+                "not replaying, not reporting, because another device is already the primary one",
+                (void*)dev, engineName.c_str(), mine ? ", the mod's own warm device" : "");
+            std::unique_lock lock(devLock);
+            devices[dev] = std::move(d);
+            return res;
         }
 
         // The enabled features, as a VkPhysicalDeviceFeatures2 chain -- what a replay
