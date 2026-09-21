@@ -577,6 +577,12 @@ namespace pipelinekeys
         // vkcapture can tell that VkDevice from the game's: it is wrapped for
         // the counters, but it must not record, replay or report.
         std::atomic<bool> modOwnedDevice{ false };
+        // Whether the game's DXVK device enabled VK_EXT_graphics_pipeline_library
+        // (vkcapture reads it off the VkDeviceCreateInfo). It decides whether
+        // DXVK builds optimized pipelines inline on its CS thread or queues
+        // them to worker threads a fence cannot see, which is why the engine
+        // walk waits for DXVK to go QUIET and not merely for the GPU.
+        std::atomic<bool> gplEnabled{ false };
 
         const int64_t epochUs = ClockUs();
         const SYSTEMTIME epochLocal = [] { SYSTEMTIME st{}; GetLocalTime(&st); return st; }();

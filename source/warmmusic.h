@@ -112,7 +112,7 @@ namespace warmmusic
     //  stays off: a wrong call into the audio engine is a crash on the main
     //  thread with the loading screen pinned.
     // ---------------------------------------------------------------------
-    struct Check { uintptr_t va; const char* what; uint8_t bytes[6]; uint8_t n; };
+    struct Check { uintptr_t va; const char* what; uint8_t bytes[24]; uint8_t n; };
 
     static const Check kChecks[] = {
         // PUSH EBX / MOV EBX,ECX / CMP byte[ebx+0x43C],0
@@ -127,8 +127,19 @@ namespace warmmusic
         { kVA_CreateAndPlay, "0x00E393D0 create and play",      { 0x83, 0xEC, 0x48, 0x56, 0x8B, 0xF1 }, 6 },
         // PUSH EBX / PUSH ESI / MOV ESI,ECX / MOVZX EAX,byte[esi+4]
         { kVA_StopSound,     "0x00891850 stop sound",           { 0x53, 0x56, 0x8B, 0xF1, 0x0F, 0xB6 }, 6 },
-        // PUSH EBP / MOV EBP,ESP / AND ESP,-8 / SUB ESP,0x44
-        { kVA_Commit,        "0x008AA790 commit sounds",        { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8 }, 6 },
+        // THE COMMIT, and the one that has to be more than a prologue: this is
+        // a __thiscall into the sound manager with `this` read out of a global,
+        // made twice per track change on the main thread with the loading
+        // screen pinned, so calling the wrong function here is the crash this
+        // whole table exists to prevent -- and `PUSH EBP / MOV EBP,ESP /
+        // AND ESP,-8` is the opening of thousands of functions in this build.
+        // So it runs past the prologue to the frame size and the first field
+        // test, whose displacement (+0x3230) is this build's:
+        //   PUSH EBP / MOV EBP,ESP / AND ESP,-8 / SUB ESP,0x44 / PUSH EBX /
+        //   PUSH ESI / PUSH EDI / MOV EDI,ECX / CMP byte[edi+0x3230],0
+        { kVA_Commit,        "0x008AA790 commit sounds",
+          { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x83, 0xEC, 0x44, 0x53, 0x56, 0x57,
+            0x8B, 0xF9, 0x80, 0xBF, 0x30, 0x32, 0x00, 0x00 }, 20 },
     };
 
     // ---------------------------------------------------------------------
@@ -480,7 +491,7 @@ namespace warmmusic
     }
 
     // Begin: the gate is open and the loading screen is pinned.
-    inline void Begin(int64_t nowUs, bool enabled, const std::string& spec)
+    inline void BeginImpl(int64_t nowUs, bool enabled, const std::string& spec)
     {
         State& s = S();
         s.running = false;
@@ -509,7 +520,7 @@ namespace warmmusic
 
     // Tick: from the gate's hold loop, on the main thread. Cheap and bounded --
     // it does nothing at all for 50 ms at a time.
-    inline void Tick(int64_t nowUs)
+    inline void TickImpl(int64_t nowUs)
     {
         State& s = S();
         if (!s.running) return;
@@ -535,7 +546,7 @@ namespace warmmusic
 
     // End: the pass is done and the loading screen is about to come down.
     // NOTHING of ours may still be audible after this.
-    inline void End()
+    inline void EndImpl()
     {
         State& s = S();
         if (!s.running)
@@ -552,5 +563,55 @@ namespace warmmusic
         if (s.hadStems && !StemsPlaying()) StartStems(0);
         Say("warm music: off - %u tracks played, %u refused; ours stopped, the game's %s",
             s.played, s.failed, s.hadStems ? "loading music handed back" : "audio untouched");
+    }
+
+    // ---------------------------------------------------------------------
+    //  CONTAINMENT. Everything above calls into the game's audio engine, on
+    //  the MAIN thread, at a gate where the loading screen is pinned by a
+    //  patched rageBoot_LoadscreenEnd -- so a fault here does not just lose the
+    //  music, it ends the process on a loading screen that would never have
+    //  come down anyway. Every other new engine call at this gate is behind an
+    //  SEH frame (the phase build behind GuardedCall, the overlay's text inside
+    //  DrawProgress, the pass on its own fiber); these three were the only ones
+    //  that were not, and the fingerprints above cannot see a build where a
+    //  STRUCTURE changed under a function that still starts with the right
+    //  bytes.
+    //
+    //  MSVC refuses __try in a function that needs C++ unwinding, so the SEH
+    //  frame lives in these trivial wrappers and the work stays in the *Impl
+    //  above. A fault turns the feature off for the rest of the load and sweeps
+    //  whatever it had playing, under an SEH frame of its own -- because the
+    //  one thing worse than losing the music is a track of ours playing into
+    //  gameplay.
+    // ---------------------------------------------------------------------
+    inline void SweepQuiet()
+    {
+        __try { StopOurSound(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { S().sound = 0; }
+    }
+
+    inline void Faulted(const char* doing)
+    {
+        S().running = false;
+        S().armed = false;
+        Say("warm music: FAULTED while %s - off for the rest of the load", doing);
+    }
+
+    inline void Begin(int64_t nowUs, bool enabled, const std::string& spec)
+    {
+        __try { BeginImpl(nowUs, enabled, spec); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Faulted("starting the rotation"); SweepQuiet(); }
+    }
+
+    inline void Tick(int64_t nowUs)
+    {
+        __try { TickImpl(nowUs); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Faulted("changing track"); SweepQuiet(); }
+    }
+
+    inline void End()
+    {
+        __try { EndImpl(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Faulted("stopping"); SweepQuiet(); }
     }
 }

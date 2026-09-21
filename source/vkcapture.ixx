@@ -200,6 +200,12 @@ class VkCapture
         PFN_vkGetShaderModuleIdentifierEXT           GetShaderModuleIdentifierEXT = nullptr;
         PFN_vkGetShaderModuleCreateInfoIdentifierEXT GetShaderModuleCreateInfoIdentifierEXT = nullptr;
         bool usesIdentifiers = false;
+        // The FIRST DXVK device seen, which is the game's. Second devices --
+        // Proton's own d3d11 DXVK, and the mod's warm device -- are wrapped for
+        // the pipeline counters and nothing else. In particular they must not
+        // get the present wrapper: it counts frames into the gameplay report
+        // and calls a function pointer loaded from this device.
+        bool primary = false;
 
         // Used only by the replay, to get rid of what it creates.
         PFN_vkDestroyPipeline             DestroyPipeline = nullptr;
@@ -1966,7 +1972,10 @@ class VkCapture
     static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddr(VkDevice device, const char* name)
     {
         PFN_vkVoidFunction real = realGDPA(device, name);
-        if (!real || !name || !Get(device)) return real;
+        if (!real || !name) return real;
+        Device* d = Get(device);
+        if (!d) return real;
+        const bool primary = d->primary;
         struct { const char* name; PFN_vkVoidFunction fn; } wrap[] = {
             { "vkCreateGraphicsPipelines",   reinterpret_cast<PFN_vkVoidFunction>(&CreateGraphicsPipelines) },
             { "vkCreateComputePipelines",    reinterpret_cast<PFN_vkVoidFunction>(&CreateComputePipelines) },
@@ -1978,7 +1987,12 @@ class VkCapture
             { "vkCreateRenderPass2",         reinterpret_cast<PFN_vkVoidFunction>(&CreateRenderPass2) },
             { "vkCreateRenderPass2KHR",      reinterpret_cast<PFN_vkVoidFunction>(&CreateRenderPass2KHR) },
             { "vkDestroyDevice",             reinterpret_cast<PFN_vkVoidFunction>(&DestroyDevice) },
-            { "vkQueuePresentKHR",           realQueuePresent ? reinterpret_cast<PFN_vkVoidFunction>(&QueuePresentKHR) : real },
+            // The game's frames only. Proton's d3d11 DXVK presents its own, and
+            // counting those into the frame-time report this whole feature is
+            // measured by would be measuring somebody else's swapchain with a
+            // function pointer taken from a different device.
+            { "vkQueuePresentKHR",           (primary && realQueuePresent)
+                                                 ? reinterpret_cast<PFN_vkVoidFunction>(&QueuePresentKHR) : real },
         };
         for (auto& w : wrap)
             if (strcmp(w.name, name) == 0) return w.fn;
@@ -2120,8 +2134,33 @@ class VkCapture
         }
 
         auto d = std::make_unique<Device>();
+        d->primary = primary;
         VkDevice dev = *out;
         auto load = [&](const char* n) { return realGDPA(dev, n); };
+
+        // WHICH COMPILATION REGIME THIS DEVICE IS IN, because the engine warm
+        // pass's chunked walk depends on it. With VK_EXT_graphics_pipeline_library
+        // enabled, DXVK's draw takes a fast-linked base pipeline and QUEUES the
+        // optimized one to its worker threads (dxvk_graphics.cpp:1111); a GPU
+        // fence does not wait for those, and ~DxvkPipelineManager drops whatever
+        // is still queued. Without it -- this rig, where the option is off and
+        // RADV is refused it anyway -- every optimized pipeline is built inline
+        // on the CS thread and a drained fence IS the compile. The walk waits
+        // until DXVK is quiet either way, which covers both; this is here so the
+        // log SAYS which regime the measurement was taken in.
+        if (primary && info->ppEnabledExtensionNames)
+        {
+            bool gpl = false;
+            for (uint32_t i = 0; i < info->enabledExtensionCount; i++)
+                if (info->ppEnabledExtensionNames[i] &&
+                    strcmp(info->ppEnabledExtensionNames[i], "VK_EXT_graphics_pipeline_library") == 0)
+                    gpl = true;
+            pipelinekeys::VulkanReplay().gplEnabled = gpl;
+            Log("device %p: graphics pipeline libraries are %s - DXVK compiles optimized "
+                "pipelines %s", (void*)dev, gpl ? "ENABLED" : "off",
+                gpl ? "on its worker threads, so only a quiet wait can see them finish"
+                    : "inline on its CS thread, where a drained fence is the compile");
+        }
         d->CreateGraphicsPipelines   = reinterpret_cast<PFN_vkCreateGraphicsPipelines>(load("vkCreateGraphicsPipelines"));
         d->CreateComputePipelines    = reinterpret_cast<PFN_vkCreateComputePipelines>(load("vkCreateComputePipelines"));
         d->CreateShaderModule        = reinterpret_cast<PFN_vkCreateShaderModule>(load("vkCreateShaderModule"));

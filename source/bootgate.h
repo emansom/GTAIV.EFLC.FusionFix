@@ -708,7 +708,9 @@ namespace bootgate
     constexpr uint32_t kBandARGB     = 0xFF000000u;
     constexpr uint32_t kSepARGB      = 0xFFB4B4B4u;
     constexpr uint32_t kBarTrackARGB = 0x40FFFFFFu;
-    constexpr uint32_t kBarFillARGB  = 0xFFE1E1E1u;
+    // The bar's fill has no constant of its own: it draws in the same colour as
+    // the headline (the pause menu's colour[0x41] when that table was readable,
+    // kTextARGB when it was not), so the band is one palette and not two.
     constexpr uint32_t kTextARGB     = 0xFFE1E1E1u;   // the legend's own colour
     constexpr uint32_t kDetailARGB   = 0xFF9A9A9Au;
     constexpr int      kFontStyle    = 0;            // font1, the face the menus and HUD use
@@ -772,19 +774,32 @@ namespace bootgate
     // The CFont entry points, fingerprinted. A mismatch costs the native font
     // and nothing else -- the glyph set draws instead -- so this is separate
     // from ValidateCode, which decides whether the gate runs at all.
+    // Most of these carry a relative CALL displacement in their first six
+    // bytes, which is this build's and nobody else's. Two did not and had to be
+    // lengthened: a bare `PUSH EBX / PUSH ESI / CALL` and the universal
+    // `PUSH EBP / MOV EBP,ESP / AND ESP,-8` prologue match thousands of
+    // functions each, so they validated nothing. Both now run far enough to
+    // reach an absolute or relative operand -- the E8 displacement in
+    // FontSetStyle, and in FontPrint the security cookie's own address
+    // (MOV EAX,[0x01057FB4]), which cannot be anything but this image.
     inline bool ValidateFont()
     {
-        struct { uintptr_t va; const uint8_t b[6]; uint8_t n; } k[] = {
-            { kVA_FontSetStyle,  { 0x53, 0x56, 0xE8 },                         3 },  // PUSH EBX/ESI/CALL
-            { kVA_FontSetProp,   { 0xE8, 0x6B, 0x7C, 0xFF, 0xFF, 0x8D },       6 },
-            { kVA_FontSetSlant,  { 0xE8, 0x3B, 0x7E, 0xFF, 0xFF, 0xF3 },       6 },
-            { kVA_FontSetAlign,  { 0xE8, 0xAB, 0x7C, 0xFF, 0xFF, 0x8D },       6 },
-            { kVA_FontSetColour, { 0xE8, 0x5B, 0x7F, 0xFF, 0xFF, 0xF3 },       6 },
-            { kVA_FontSetBox,    { 0xE8, 0x3B, 0x7B, 0xFF, 0xFF, 0xF3 },       6 },
-            { kVA_FontSetScale,  { 0x83, 0xEC, 0x08, 0x56, 0xE8, 0x47 },       6 },
-            { kVA_FontPrint,     { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8 },       6 },
-            { kVA_FontFlush,     { 0x56, 0x57, 0xE8, 0xF9, 0x87, 0xFF },       6 },
-            { kVA_WidescreenFix, { 0x53, 0x8B, 0x5C, 0x24, 0x08, 0x85 },       6 },
+        struct { uintptr_t va; const uint8_t b[20]; uint8_t n; } k[] = {
+            // PUSH EBX / PUSH ESI / CALL 0x0091C150 / MOV EBX,[ESP+0xC] / PUSH EBX
+            { kVA_FontSetStyle,  { 0x53, 0x56, 0xE8, 0xB9, 0x7D, 0xFF, 0xFF, 0x8B,
+                                   0x5C, 0x24, 0x0C, 0x53, 0x8D, 0x34, 0xC0, 0xE8 }, 16 },
+            { kVA_FontSetProp,   { 0xE8, 0x6B, 0x7C, 0xFF, 0xFF, 0x8D },             6 },
+            { kVA_FontSetSlant,  { 0xE8, 0x3B, 0x7E, 0xFF, 0xFF, 0xF3 },             6 },
+            { kVA_FontSetAlign,  { 0xE8, 0xAB, 0x7C, 0xFF, 0xFF, 0x8D },             6 },
+            { kVA_FontSetColour, { 0xE8, 0x5B, 0x7F, 0xFF, 0xFF, 0xF3 },             6 },
+            { kVA_FontSetBox,    { 0xE8, 0x3B, 0x7B, 0xFF, 0xFF, 0xF3 },             6 },
+            { kVA_FontSetScale,  { 0x83, 0xEC, 0x08, 0x56, 0xE8, 0x47 },             6 },
+            // PUSH EBP / MOV EBP,ESP / AND ESP,-8 / SUB ESP,0x58 /
+            // MOV EAX,[0x01057FB4] / XOR EAX,ESP / MOV [ESP+0x54],EAX
+            { kVA_FontPrint,     { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x83, 0xEC, 0x58, 0xA1,
+                                   0xB4, 0x7F, 0x05, 0x01, 0x33, 0xC4, 0x89, 0x44, 0x24, 0x54 }, 20 },
+            { kVA_FontFlush,     { 0x56, 0x57, 0xE8, 0xF9, 0x87, 0xFF },             6 },
+            { kVA_WidescreenFix, { 0x53, 0x8B, 0x5C, 0x24, 0x08, 0x85 },             6 },
         };
         for (const auto& e : k)
             if (!BytesAre(e.va, e.b, e.n)) return false;
@@ -815,12 +830,17 @@ namespace bootgate
         volatile int    faultStep = 0;
         volatile int    fontStyle = kFontStyle;
         // The band's geometry, resolved once from the frontend's own tables.
+        // TWO reads, and they fail independently -- the layout float2[] and the
+        // colour u32[] are different tables -- so the log says which of them
+        // answered rather than one flag for both. ruleFrac is in neither: the
+        // frontend hard-codes 0.002 * H, so it is ours and always the literal.
         volatile float    bandFrac = kBandFrac;
         volatile float    ruleFrac = kMenuRuleFrac;
         volatile uint32_t ruleARGB = kSepARGB;
         volatile uint32_t textARGB = kTextARGB;
         volatile uint32_t detailARGB = kDetailARGB;
-        volatile bool     styleFromGame = false;
+        volatile bool     layoutFromGame = false;
+        volatile bool     colourFromGame = false;
     };
     inline Progress& Prog()
     {
@@ -864,11 +884,12 @@ namespace bootgate
             top > 0.70f && top < 0.96f)
         {
             p.bandFrac = 1.0f - top;
-            p.styleFromGame = true;
+            p.layoutFromGame = true;
         }
         uint32_t c = 0;
         if (Peek(Rebase(kVA_MenuColours) + (uintptr_t)kMenuRuleColour * 4, c) && (c >> 24) >= 0x40)
         {
+            p.colourFromGame = true;
             p.ruleARGB = c;
             p.textARGB = c;
             // The second row is ours: the same colour at about two thirds, so
@@ -946,6 +967,13 @@ namespace bootgate
         wchar_t wbuf[96];
         const float left  = kMarginFrac;
         const float right = 1.0f - kMarginFrac;
+        // A COLUMN EACH. Both prints on a row used to share one box spanning
+        // the whole band, so a long left-hand string could wrap at the far
+        // margin -- and a wrapped line is drawn BELOW its row, which on the top
+        // row lands on the bar. The longest headline this can carry is a settle
+        // ("WAITING FOR THE DRIVER") plus its clock in the other column, so the
+        // split is where the two columns can never reach each other.
+        const float split = left + (right - left) * 0.62f;
         const float y1 = (bandY + bandH * kRow1Frac) / h;
         const float y2 = (bandY + bandH * kRow2Frac) / h;
 
@@ -953,13 +981,13 @@ namespace bootgate
         step = 2;  FontSetProp(1);
         step = 3;  FontSetSlant(0.0f);
         step = 4;  FontSetColour(p.textARGB);
-        step = 5;  FontSetBox(left, right);
 
         float sx = kHeadScaleX, sy = kHeadScaleY;
         step = 6;  WidescreenFix(sx, sy);
         step = 7;  FontSetScale(sx, sy);
         if (head[0])
         {
+            step = 5;  FontSetBox(left, split);
             step = 8;  FontSetAlign(1);
             ToWide(head, wbuf, 96);
             step = 9;  FontPrint(left, y1, wbuf);
@@ -974,26 +1002,32 @@ namespace bootgate
             // ignores the x and measures from the box's right edge anyway,
             // which is what 0x008B6C80 relies on when it prints the pause
             // menu's help line at x = 0.
+            step = 5;  FontSetBox(split, right);
             step = 10; FontSetAlign(2);
             ToWide(pct, wbuf, 96);
-            step = 11; FontPrint(left, y1, wbuf);
+            step = 11; FontPrint(split, y1, wbuf);
         }
 
         sx = kDetailScaleX; sy = kDetailScaleY;
         step = 12; WidescreenFix(sx, sy);
         step = 13; FontSetScale(sx, sy);
         step = 14; FontSetColour(p.detailARGB);
+        // The bottom row's own split. The detail is the longest string in the
+        // band ("STAGE 2 OF 3   ENGINE PIPELINE 27739 / 61191   0:52") and the
+        // estimate beside it is short, so it sits further right than the top
+        // row's.
+        const float split2 = left + (right - left) * 0.72f;
         if (detail[0])
         {
-            step = 15; FontSetAlign(1);
+            step = 15; FontSetBox(left, split2); FontSetAlign(1);
             ToWide(detail, wbuf, 96);
             step = 16; FontPrint(left, y2, wbuf);
         }
         if (eta[0])
         {
-            step = 17; FontSetAlign(2);
+            step = 17; FontSetBox(split2, right); FontSetAlign(2);
             ToWide(eta, wbuf, 96);
-            step = 18; FontPrint(left, y2, wbuf);
+            step = 18; FontPrint(split2, y2, wbuf);
         }
         step = 19; FontFlush();
         step = 0;

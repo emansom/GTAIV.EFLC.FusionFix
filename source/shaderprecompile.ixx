@@ -534,6 +534,117 @@ class ShaderPrecompiler
             pipelinekeys::VaLine().c_str(), pipelinekeys::VulkanReplay().creations.load());
     }
 
+    // ===================================================================
+    //  THE AMBIENT HALF OF A DXVK PIPELINE KEY
+    //
+    //  Under DXVK a D3D9 pipeline is keyed on more than the recorded key
+    //  carries. Everything in `D3D9SpecData` (dxvk 3.1.1 src/d3d9/d3d9_state.h)
+    //  that the bound shaders declare enters `DxvkGraphicsPipelineStateInfo::sc`
+    //  through DxvkContext::updateSpecConstants, so two draws with the same
+    //  shaders, declaration, render targets and blend state are still two
+    //  pipelines if any of it differs. Most of it the pass pins -- fog, clip
+    //  planes, point sprite, the samplers it binds, the alpha compare op out of
+    //  RAGE's default block. THREE things it does not, and all three are
+    //  whatever the last thing to touch the device left behind:
+    //
+    //    * the bool constants b0..b15 per stage, masked by each shader's own
+    //      boolMask (d3d9_device.cpp:7443 and 7459) -- spec IDs 3 and 6;
+    //    * the sampler projection mask, which is D3DTSS_TEXTURETRANSFORMFLAGS
+    //      per stage (spec ID 2, and that ID also carries psIsShaderModel3);
+    //    * the fixed-function texture stage ops and args, spec IDs 8..19.
+    //
+    //  WHY IT IS LOGGED. Moving the pass from the loading-screen gate to the
+    //  boot gate cost the DEFAULT path 51 pipelines -- 786 built before
+    //  gameplay on 4c85a78 against 735 on e3f42ce, the same integer in every
+    //  run of three, from provably identical work (14,543 keys, 1093 drawn
+    //  pipelines, 13,450 duplicate-state skips, byte-identical state restore)
+    //  -- and those 51 were worth ~46 pipeline creations and ~12 compiles per
+    //  route. The 2026-09-21 control run's verdict was that the two gates hand
+    //  the pass different ambient state and the same draws therefore specialise
+    //  differently. This is the measurement that confirms or clears that, and
+    //  it costs a dozen Get* calls at three points in a load.
+    // ===================================================================
+    struct AmbientSpec
+    {
+        uint32_t vsBools = 0, psBools = 0;          // b0..b15, one bit each
+        uint8_t  ttff[8] = {};                      // D3DTSS_TEXTURETRANSFORMFLAGS
+        uint8_t  colorOp[8] = {}, alphaOp[8] = {};  // spec IDs 8..19
+        uint32_t fogEnable = 0, fogVertex = 0, fogTable = 0, fogRange = 0;
+        uint32_t pointSprite = 0, pointScale = 0, specular = 0;
+        uint32_t alphaTest = 0, alphaFunc = 0, clipPlanes = 0, srgbWrite = 0, shadeMode = 0;
+        bool     readable = false;                  // false: a pure device refused Get*
+    };
+
+    static AmbientSpec ReadAmbientSpec(IDirect3DDevice9* d)
+    {
+        AmbientSpec a;
+        if (!d) return a;
+        BOOL b[16] = {};
+        if (SUCCEEDED(d->GetVertexShaderConstantB(0, b, 16)))
+        {
+            a.readable = true;
+            for (int i = 0; i < 16; i++) if (b[i]) a.vsBools |= 1u << i;
+        }
+        memset(b, 0, sizeof(b));
+        if (SUCCEEDED(d->GetPixelShaderConstantB(0, b, 16)))
+        {
+            a.readable = true;
+            for (int i = 0; i < 16; i++) if (b[i]) a.psBools |= 1u << i;
+        }
+        for (DWORD s = 0; s < 8; s++)
+        {
+            DWORD v = 0;
+            if (SUCCEEDED(d->GetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, &v))) a.ttff[s] = (uint8_t)v;
+            if (SUCCEEDED(d->GetTextureStageState(s, D3DTSS_COLOROP, &v))) a.colorOp[s] = (uint8_t)v;
+            if (SUCCEEDED(d->GetTextureStageState(s, D3DTSS_ALPHAOP, &v))) a.alphaOp[s] = (uint8_t)v;
+        }
+        auto rs = [&](D3DRENDERSTATETYPE k) { DWORD v = 0; d->GetRenderState(k, &v); return (uint32_t)v; };
+        a.fogEnable   = rs(D3DRS_FOGENABLE);
+        a.fogVertex   = rs(D3DRS_FOGVERTEXMODE);
+        a.fogTable    = rs(D3DRS_FOGTABLEMODE);
+        a.fogRange    = rs(D3DRS_RANGEFOGENABLE);
+        a.pointSprite = rs(D3DRS_POINTSPRITEENABLE);
+        a.pointScale  = rs(D3DRS_POINTSCALEENABLE);
+        a.specular    = rs(D3DRS_SPECULARENABLE);
+        a.alphaTest   = rs(D3DRS_ALPHATESTENABLE);
+        a.alphaFunc   = rs(D3DRS_ALPHAFUNC);
+        a.clipPlanes  = rs(D3DRS_CLIPPLANEENABLE);
+        a.srgbWrite   = rs(D3DRS_SRGBWRITEENABLE);
+        a.shadeMode   = rs(D3DRS_SHADEMODE);
+        return a;
+    }
+
+    static void LogAmbientSpec(const char* where, IDirect3DDevice9* d)
+    {
+        const AmbientSpec a = ReadAmbientSpec(d);
+        if (!a.readable)
+        {
+            Log("ambient spec %s: the device refused Get*ShaderConstantB (a pure device?) - "
+                "the bool-constant half of the key cannot be read here", where);
+        }
+        char t[80], c[96];
+        _snprintf_s(t, sizeof(t), _TRUNCATE, "%u%u%u%u%u%u%u%u",
+                    a.ttff[0], a.ttff[1], a.ttff[2], a.ttff[3], a.ttff[4], a.ttff[5], a.ttff[6], a.ttff[7]);
+        _snprintf_s(c, sizeof(c), _TRUNCATE, "%u/%u %u/%u %u/%u %u/%u",
+                    a.colorOp[0], a.alphaOp[0], a.colorOp[1], a.alphaOp[1],
+                    a.colorOp[2], a.alphaOp[2], a.colorOp[3], a.alphaOp[3]);
+        Log("ambient spec %s: vsBools 0x%04X psBools 0x%04X, texture transform flags %s, "
+            "stage ops (colour/alpha, 0-3) %s, fog %u (v%u t%u r%u), point sprite %u scale %u, "
+            "specular %u, alpha test %u func %u, clip planes 0x%X, sRGB write %u, shade %u",
+            where, a.vsBools, a.psBools, t, c, a.fogEnable, a.fogVertex, a.fogTable, a.fogRange,
+            a.pointSprite, a.pointScale, a.specular, a.alphaTest, a.alphaFunc,
+            a.clipPlanes, a.srgbWrite, a.shadeMode);
+    }
+
+    // The b# the GAME's device is carrying when the gate opens. The walk pins
+    // these on whatever device it runs on, so that the arm with a device of our
+    // own (brand new, every bool FALSE by the D3D9 default) and the arm on the
+    // game's device build the SAME pipelines rather than two different sets
+    // that only a pipeline count could tell apart.
+    static inline BOOL ambientVsB[16] = {};
+    static inline BOOL ambientPsB[16] = {};
+    static inline bool ambientBoolsRead = false;
+
     // -------------------------------------------------------------------
     //  What ends the process, when something does
     //
@@ -3210,6 +3321,16 @@ class ShaderPrecompiler
         const int64_t t0 = pipelinekeys::ClockUs();
         if (edev)
         {
+            // THE OBJECTS FIRST, ALWAYS. DXVK's D3D9DeviceChild holds a
+            // reference on its device for as long as it lives
+            // (d3d9_device_child.h), so releasing the device while one of our
+            // render targets, buffers or shader mirrors is still alive does not
+            // destroy it -- it leaves a live DxvkDevice with nobody holding the
+            // pointer, its pipelines still resident, and, a few lines further
+            // down, its Vulkan surface pointing at a window we just destroyed.
+            // The failure paths out of CreateEngineResources used to do exactly
+            // that, so the invariant lives here rather than in every caller.
+            ReleaseWarmDeviceObjects();
             const ULONG left = edev->Release();
             edev = nullptr;
             if (real)
@@ -3529,6 +3650,17 @@ class ShaderPrecompiler
         // start of the walk and after every overlay frame.
         for (uint32_t i = 0; i < pipelinekeys::kVSSamplers; i++)
             d->SetTexture(D3DVERTEXTEXTURESAMPLER0 + i, nullptr);
+        // The OTHER half of spec constant 3, and all of spec constant 6: the
+        // bool registers, masked by each shader's own boolMask. Nothing in the
+        // walk sets them, so on the game's device they are the gate's and on a
+        // brand-new device of ours they are all FALSE -- which would make the
+        // two arms build two different pipeline sets from the same jobs and
+        // call it an A/B. Pin the game's, on whichever device is being used.
+        if (ambientBoolsRead)
+        {
+            d->SetVertexShaderConstantB(0, ambientVsB, 16);
+            d->SetPixelShaderConstantB(0, ambientPsB, 16);
+        }
     }
 
     // A phase callback pushes exactly this much that DXVK can bake: the four
@@ -3677,6 +3809,7 @@ class ShaderPrecompiler
         IDirect3DSurface9* ds;
         IDirect3DVertexDeclaration9* declObj;
         bool failed;
+        bool noMirror;      // the shaders would not build on this warm device
     };
 
     static void DoDrawJob(void* a)
@@ -3688,6 +3821,21 @@ class ShaderPrecompiler
         const enginewarm::StateVec& SV   = enginewarm::kStateVecs[j.state];
         const enginewarm::Decl& D = plan.decls[j.decl];
         IDirect3DDevice9* dv = EDev();
+
+        // NO MIRROR, NO DRAW. On a device of our own the engine's shader
+        // objects cannot be bound and a copy built from the same bytecode is,
+        // but a copy that would not build caches as null -- and binding null is
+        // not "no pipeline", it is the FIXED-FUNCTION pipeline, which DXVK
+        // builds happily, which succeeds, and which would then be counted as a
+        // job warmed. It warms the wrong thing and lies about it, so it is
+        // skipped and counted where it can be seen.
+        IDirect3DVertexShader9* vsObj = EVS(pass.vs);
+        IDirect3DPixelShader9*  psObj = EPS(pass.ps);
+        if ((pass.vs && !vsObj) || (pass.ps && !psObj))
+        {
+            d->noMirror = true;
+            return;
+        }
 
         for (int i = 0; i < 4; i++) dv->SetRenderTarget(i, d->rts[i]);
         dv->SetDepthStencilSurface(d->ds);
@@ -3710,8 +3858,8 @@ class ShaderPrecompiler
             dv->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | 1u);
         }
 
-        dv->SetVertexShader(EVS(pass.vs));
-        dv->SetPixelShader(EPS(pass.ps));
+        dv->SetVertexShader(vsObj);
+        dv->SetPixelShader(psObj);
         // The material's binding pattern: every declared slot, or one of them
         // left null, or none of them. It is the axis the engine cannot answer
         // -- which of the slots a shader declares actually receives a texture
@@ -3923,7 +4071,14 @@ class ShaderPrecompiler
         {
             LogVa("engine: before the warm device");
             if (CreateWarmDevice() && CreateEngineResources())
+            {
                 LogVa("engine: with the warm device up");
+                // A brand-new device starts at the D3D9 defaults, which is not
+                // the state the game's device is in; ApplyDefaultBlock pins the
+                // difference that DXVK bakes into a pipeline, and this is the
+                // before picture.
+                LogAmbientSpec("on the fresh warm device", edev);
+            }
             else
             {
                 DestroyWarmDevice();
@@ -4068,6 +4223,7 @@ class ShaderPrecompiler
         uint32_t sinceFence = 0;
 
         uint32_t drawn = 0, skippedRT = 0, skippedDecl = 0, failedDraw = 0, faulted = 0;
+        uint32_t skippedMirror = 0, mirrorRun = 0;
         uint32_t perCtx[16] = {}, perState[kSV_Count] = {};
         bool stopped = false;
         const char* stopWhy = "";
@@ -4077,7 +4233,22 @@ class ShaderPrecompiler
         // ones, so a cold driver cache is caught on the work that matters most.
         WarmStamp stamp{};
         const bool stampRead = cfg.reuseStamp && ReadStamp(stamp);
-        const uint64_t fpEnum = EnumerationFingerprint(plan, cfg.engineWarm);
+        // The enumeration's own fingerprint, PLUS the two things about this
+        // build that change which pipelines the same enumeration produces: the
+        // arm the walk runs on (a device of our own starts at the D3D9 defaults
+        // and the game's device does not), and the bool constants the walk pins
+        // on it. A stamp written by one arm must not let the other take the
+        // cheap path over a 512-job probe of a different pipeline set.
+        uint64_t fpEnum = EnumerationFingerprint(plan, cfg.engineWarm);
+        {
+            const uint32_t arm = (uint32_t)(cfg.warmDevice == 0 ? 0 : 1);
+            uint32_t bools = 0;
+            if (ambientBoolsRead)
+                for (int i = 0; i < 16; i++)
+                    bools |= (ambientVsB[i] ? 1u : 0u) << i | (ambientPsB[i] ? 1u : 0u) << (i + 16);
+            fpEnum = pipelinekeys::Fnv1a(&arm, sizeof(arm), fpEnum);
+            fpEnum = pipelinekeys::Fnv1a(&bools, sizeof(bools), fpEnum);
+        }
         const uint64_t fpRig = RigFingerprint(), fpShaders = ShaderSetFingerprint();
         const bool stampMatches = stampRead && stamp.enumeration == fpEnum &&
                                   stamp.rig == fpRig && stamp.shaders == fpShaders;
@@ -4129,8 +4300,23 @@ class ShaderPrecompiler
         // Without a device of our own the pipelines are the game's for the rest
         // of the session, so the walk is bounded rather than complete. With one,
         // nothing survives the walk and there is nothing to bound.
-        const size_t jobCap = (!edev && cfg.warmDevice == 1)
+        //
+        // KEYED ON THE DEVICE, NOT ON THE INI VALUE. The cap used to fire only
+        // for PrecompileWarmDevice = 1, which meant the diagnostic arm (2) and
+        // any value the ini did not expect ran the full 61,191-job walk on the
+        // game's device -- the exact configuration that killed the game a
+        // minute into gameplay on 2026-09-20, arrived at by a typo. The one
+        // value that may still do it is an explicit 0, which is the documented
+        // A/B arm and says so in the ini and in the log.
+        const bool unprotected = !edev;
+        const bool deliberate = unprotected && cfg.warmDevice == 0;
+        const size_t jobCap = (unprotected && !deliberate)
                             ? (std::min)((size_t)kCappedJobs, plan.jobs.size()) : plan.jobs.size();
+        if (deliberate && plan.jobs.size() > kCappedJobs)
+            Log("engine: WARNING - PrecompileWarmDevice = 0, so all %zu jobs build on the GAME's "
+                "device and their pipelines are the session's to carry. This is the A/B arm; it "
+                "measured ~13.5 KB of address space per pipeline and a dead game.",
+                plan.jobs.size());
 
         // And a floor under both arms. Even with a device of its own the walk
         // holds every pipeline it has built until that device goes, so the
@@ -4160,6 +4346,19 @@ class ShaderPrecompiler
                 if (sinceFence) { FenceChunk(fence); workDone += sinceFence; sinceFence = 0; }
                 else FenceChunk(fence);
                 SAFE_RELEASE(fence);
+                // THE FULL WAIT, not just the fence. An event query drains the
+                // GPU and DXVK's CS thread, which is everything ON THIS RIG,
+                // where graphics pipeline libraries are off and DXVK therefore
+                // builds every optimized pipeline inline on the CS thread. It
+                // is NOT everything in general: with GPL enabled
+                // (canCreateBasePipeline) the draw gets a fast-linked base
+                // pipeline and the optimized one is queued to m_workers, and
+                // ~DxvkPipelineManager's stopWorkers() drops whatever is still
+                // in that queue -- so a fenced rotation would silently throw
+                // away the compilation this whole pass exists to do. Waiting
+                // until DXVK is QUIET covers both, and costs one settle second
+                // per rotation out of a walk measured in hundreds.
+                WaitUntilIdle("a warm device chunk, before it is replaced", edev);
                 if (!RotateWarmDevice(plan))
                 {
                     rotateFailed++;
@@ -4221,6 +4420,22 @@ class ShaderPrecompiler
                 stopped = true; stopWhy = " [faulted on an engine pointer]";
                 break;
             }
+            if (da.noMirror)
+            {
+                // One shader that will not build on this device will not build
+                // on the next one either, and a walk that skips every job is
+                // burning the load for nothing. Ten in a row is not a stray
+                // resource failure.
+                skippedMirror++;
+                if (++mirrorRun >= 10)
+                {
+                    stopped = true; stopWhy = " [the shader mirrors stopped building]";
+                    break;
+                }
+                workDone++;
+                continue;
+            }
+            mirrorRun = 0;
             if (da.failed) failedDraw++;
             drawn++;
             if (j.ctx < 16) perCtx[j.ctx]++;
@@ -4240,9 +4455,21 @@ class ShaderPrecompiler
                 }
                 // A lost device here would turn every remaining draw into a
                 // silent failure; stop and let the game have its frame back.
-                if (EDev()->TestCooperativeLevel() != D3D_OK)
+                // BOTH devices, and they mean different things: the game's
+                // being lost has to end the whole pass (the state block the
+                // restore applies would go to a device that cannot take it),
+                // while ours being lost only ends the walk. The warm device
+                // owns an 8x8 popup nobody touches, so it is the game's that
+                // actually moves -- and polling only ours, which the merge
+                // arrived at, would have missed every one of them.
+                if (dev->TestCooperativeLevel() != D3D_OK)
                 {
-                    stopped = true; stopWhy = " [device lost]";
+                    stopped = true; stopWhy = " [the game's device was lost]";
+                    break;
+                }
+                if (edev && edev->TestCooperativeLevel() != D3D_OK)
+                {
+                    stopped = true; stopWhy = " [the warm device was lost]";
                     break;
                 }
             }
@@ -4265,7 +4492,7 @@ class ShaderPrecompiler
                         ji, (unsigned long long)freeMB, (unsigned long long)vaFloorMB);
                     break;
                 }
-                if (!edev && cfg.warmDevice == 1 && vaAtStart && freeMB && freeMB < vaAtStart &&
+                if (unprotected && !deliberate && vaAtStart && freeMB && freeMB < vaAtStart &&
                     vaAtStart - freeMB > vaBudgetMB)
                 {
                     stopped = true; stopWhy = " [address-space budget spent, no device of our own]";
@@ -4365,9 +4592,9 @@ class ShaderPrecompiler
         if (stopped) workDone = workTotal;
 
         Log("engine: drew %u of %zu jobs in %llds%s (%u failed, %u faulted, %u no render target, "
-            "%u no declaration)",
+            "%u no declaration, %u no shader mirror)",
             drawn, plan.jobs.size(), (long long)(elapsedMs() / 1000), stopWhy,
-            failedDraw, faulted, skippedRT, skippedDecl);
+            failedDraw, faulted, skippedRT, skippedDecl, skippedMirror);
         if (cfg.warmDevice == 1)
             Log("engine: the walk went through %u warm device(s) of %u jobs each%s, and %u shader "
                 "mirror(s) could not be built on one", warmDevices, kWarmChunkJobs,
@@ -4675,6 +4902,10 @@ class ShaderPrecompiler
     // The slice mechanism.
     static inline void* pumpFiber = nullptr;
     static inline void* passFiber = nullptr;
+    // True while the loading-screen thread is inside the pass fiber. Only the
+    // gate's own thread reads it, and only to know whether it may release what
+    // the pass owns (AbandonPass).
+    static inline std::atomic<bool> inPassFiber{ false };
     static inline int64_t sliceDeadlineUs = 0;
     static inline int64_t passResumeUs = 0;
     static inline uint32_t sliceCount = 0;
@@ -4805,12 +5036,18 @@ class ShaderPrecompiler
         // from. The headline is then the settle's own sentence.
         const bool settling = !curTitle.empty();
 
-        const bool cheap = cheapStage.load() == stageNo;
+        // The cheap-path banner belongs to the WORK that took the cheap path,
+        // not to the rest of the stage. EngineWarmPass clears cheapStage when
+        // it returns, and a settle wins over it in any case: a settle can run
+        // for minutes if the driver's cache turned out colder than the probe
+        // suggested, and "this launch is seconds, not minutes" over a wait
+        // nobody can time is the one thing on this band that could be a lie.
+        const bool cheap = !settling && cheapStage.load() == stageNo;
 
         char head[64], pct[24], detail[96], eta[48], clock[24];
         _snprintf_s(head, sizeof(head), _TRUNCATE, "%s",
-                    cheap ? "Reusing the warm cache"
-                          : (settling ? curTitle.c_str() : curWhat));
+                    settling ? curTitle.c_str()
+                             : (cheap ? "Reusing the warm cache" : curWhat));
         _snprintf_s(pct, sizeof(pct), _TRUNCATE, "%d%%", (int)(frac * 100.0f));
 
         FormatClock(clock, sizeof(clock), overall);
@@ -4875,8 +5112,37 @@ class ShaderPrecompiler
         SwitchToFiber(pumpFiber);
     }
 
+    // THE WALK'S TEARDOWN, FROM OUTSIDE THE WALK.
+    //
+    // ReleaseEngineWalk() runs on every path THROUGH EngineWarmPass, and until
+    // this existed those were the only paths it ran on. Two of them do not go
+    // through it: a fault anywhere in the pass outside GuardedCall unwinds
+    // straight to PassFiberProc's handler, and a gate that times out abandons
+    // the pass fiber where it stands. Either one leaves a live warm D3D9 device
+    // holding up to a chunk's worth of pipelines -- and a Vulkan surface on a
+    // window -- for the whole session, which is precisely the leak the warm
+    // device exists to prevent.
+    //
+    // It is idempotent (SAFE_RELEASE and null checks throughout), so calling it
+    // again on the normal path costs nothing. Its own SEH frame, because the
+    // reason we are here at all may be that something under it faulted.
+    static void EmergencyReleaseWarmWalk()
+    {
+        if (!edev && !warmD3D && !warmWnd && engineRTs.empty() && engineDepths.empty()) return;
+        __try
+        {
+            Log("engine: releasing the warm walk from outside it - the pass did not get to");
+            ReleaseEngineWalk();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            Log("engine: the warm walk's teardown faulted; its device may outlive the load");
+        }
+    }
+
     static void FinishPass()
     {
+        EmergencyReleaseWarmWalk();
         pipelinekeys::PassThread() = 0;
         auto& vr = pipelinekeys::VulkanReplay();
         vr.passDone = true;
@@ -4904,6 +5170,20 @@ class ShaderPrecompiler
         started = true;
         gateOpen = false;
         gateDone = true;
+        // The pass fiber is suspended mid-walk and will never be resumed, so
+        // whatever the engine walk was holding -- a warm D3D9 device and a
+        // chunk's worth of pipelines -- has to be released from here or it is
+        // the session's. This runs on the GATE's thread, not the pass's, so it
+        // first waits for the loading-screen thread to be out of the fiber:
+        // gateDone above stops the next slice, and a slice already in flight is
+        // ~8 ms. If it does not come out, leaking the device is the lesser of
+        // the two outcomes and the log says which one happened.
+        for (int i = 0; i < 400 && inPassFiber.load(); i++) Sleep(5);
+        if (inPassFiber.load())
+            Log("gate: the pass fiber is still running, so its warm device is left alone - "
+                "it will cost this session address space rather than a crash");
+        else
+            EmergencyReleaseWarmWalk();
         pipelinekeys::PassThread() = 0;
         auto& vr = pipelinekeys::VulkanReplay();
         vr.passDone = true;
@@ -4975,6 +5255,19 @@ class ShaderPrecompiler
             if (dev) dev->AddRef();
         }
 
+        // THE OLD GATE'S SITE, for the comparison the control run asked for.
+        // This is the loading-screen render thread with the loading screen's own
+        // state live -- exactly what the pass inherited when it ran from here
+        // on 4c85a78, and what it does NOT inherit at the boot gate, where the
+        // first ambient reading is taken on the main thread before any of this
+        // has run. If the two lines are the same, the 51 pipelines the boot gate
+        // costs the default path are not in the spec constants and the search
+        // moves on; if they differ, the difference is the answer.
+        if (sliceCount == 0 || sliceCount == 64)
+            LogAmbientSpec(sliceCount ? "at slice 64, on the loading-screen thread (the old gate's site)"
+                                      : "at the first slice, on the loading-screen thread (the old gate's site)",
+                           dev);
+
         SaveEngineState();
         sliceDeadlineUs = now + (int64_t)(cfg.sliceMs > 0 ? cfg.sliceMs : 8) * 1000;
         sliceCount++;
@@ -4988,7 +5281,12 @@ class ShaderPrecompiler
         // building pipelines with somebody else's half of the key from the
         // second slice onward. Every such loop watches this counter.
         sliceEpoch++;
+        // While this is true the pass fiber is RUNNING on this thread, and the
+        // gate's own thread must not pull anything out from under it -- see
+        // AbandonPass, which is the one place that would.
+        inPassFiber = true;
         SwitchToFiber(passFiber);
+        inPassFiber = false;
         RestoreEngineState();
         if (gateDone.load()) ReleaseEngineState();
     }
@@ -5165,12 +5463,20 @@ class ShaderPrecompiler
             else
                 _snprintf_s(how, sizeof(how), _TRUNCATE,
                             "the 5x7 glyph set - no font texture is resident here");
-            Log("gate: progress drew with %s; band %.1f%% of the screen, rule %.3f, colour "
-                "0x%08X, text 0x%08X / 0x%08X (%s)", how, (double)pr.bandFrac * 100.0,
+            // Two reads, two verdicts. The layout float2[] and the colour u32[]
+            // are different tables and fail independently, so one flag for both
+            // would have the line contradict itself on a boot where only one of
+            // them answered. The rule's own fraction is in neither table: the
+            // frontend hard-codes 0.002 * H and so do we.
+            Log("gate: progress drew with %s; band %.1f%% of the screen (%s), rule %.3f "
+                "(the frontend's own literal), colour 0x%08X, text 0x%08X / 0x%08X (%s)",
+                how, (double)pr.bandFrac * 100.0,
+                pr.layoutFromGame ? "the pause menu's own layout table"
+                                  : "the shipped fallback - the layout table was not readable",
                 (double)pr.ruleFrac, (unsigned)pr.ruleARGB,
                 (unsigned)pr.textARGB, (unsigned)pr.detailARGB,
-                pr.styleFromGame ? "the pause menu's own tables"
-                                 : "the shipped fallback - the menu layout table was not readable");
+                pr.colourFromGame ? "the pause menu's own colour table"
+                                  : "the shipped fallback - the colour table was not readable");
         }
         Log("gate: released after %.1f s, %u slices", (pipelinekeys::ClockUs() - t0) / 1e6,
             sliceCount);
@@ -5252,6 +5558,25 @@ class ShaderPrecompiler
         DetectBackend();
         Log("backend = %s, device = %p", backend == Backend::DXVK ? "DXVK" : "native", (void*)dev);
         LogVa("at the gate, before the pass");
+        // The ambient half of the key, at the moment the pass takes the device,
+        // and the b# snapshot the engine walk pins on whichever device it runs
+        // on. This is ALSO the measurement the 2026-09-21 control run asked for:
+        // compare it with the same line from the first slice -- which is the
+        // state the OLD loading-screen gate's pass inherited -- and the 51
+        // pipelines that gate was worth are either in this line or they are not.
+        {
+            const AmbientSpec a = ReadAmbientSpec(dev);
+            ambientBoolsRead = a.readable;
+            if (a.readable)
+            {
+                for (int i = 0; i < 16; i++)
+                {
+                    ambientVsB[i] = (a.vsBools >> i) & 1 ? TRUE : FALSE;
+                    ambientPsB[i] = (a.psBools >> i) & 1 ? TRUE : FALSE;
+                }
+            }
+            LogAmbientSpec("at the gate, before the pass", dev);
+        }
         if (cfg.warmDevice == 2) ProbeWarmDevice();
         ResolveOverlayInterval();
 
@@ -5366,6 +5691,10 @@ class ShaderPrecompiler
                     cfg.engineWarm, pipelinekeys::VulkanReplay().Seconds());
                 EngineWarmPass(db);
                 LogVa("after the engine warm phase");
+                // The banner was about the walk, and the walk is over. What
+                // follows in this stage is the wait for DXVK, which is timed by
+                // nothing and must not wear "this launch is seconds".
+                cheapStage = 0;
             }
             WaitUntilIdle("the D3D9 pass");
             LogVa("after waiting for DXVK to go quiet");
@@ -5708,7 +6037,16 @@ class ShaderPrecompiler
         cfg.specVariants  = ini.ReadInteger("SHADERS", "PrecompileSpecVariants", 1) != 0;
         cfg.exportBaseline = ini.ReadInteger("SHADERS", "PrecompileExportBaseline", 0) != 0;
         cfg.engineWarm    = ini.ReadInteger("SHADERS", "PrecompileEngineWarm", 0);
+        // Clamped, and it says so when it clamps: 0 is the documented A/B arm
+        // that builds 61,000 pipelines on the game's device and has killed a
+        // session, so it may only be reached by asking for it exactly.
         cfg.warmDevice    = ini.ReadInteger("SHADERS", "PrecompileWarmDevice", 1);
+        if (cfg.warmDevice < 0 || cfg.warmDevice > 2)
+        {
+            Log("PrecompileWarmDevice = %d is not 0, 1 or 2 - using 1 (a warm device of our own)",
+                cfg.warmDevice);
+            cfg.warmDevice = 1;
+        }
         cfg.crashLog      = ini.ReadInteger("SHADERS", "PrecompileCrashLog", 0) != 0;
         cfg.emitLog       = ini.ReadInteger("SHADERS", "PrecompileEmitLog", 0) != 0;
         cfg.sliceMs       = ini.ReadInteger("SHADERS", "PrecompileSliceMs", 8);
