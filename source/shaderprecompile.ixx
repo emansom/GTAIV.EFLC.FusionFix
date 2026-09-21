@@ -163,8 +163,15 @@ struct PrecompileConfig
     // and the loading screen's own six stems loop every forty seconds, so the
     // rotation brings in the rest of what the game has resident here. 0 turns
     // it off entirely and leaves the engine's loading music exactly as shipped.
+    // Each episode gets its own rotation, chosen at the gate from the engine's
+    // episode index -- Vladivostok FM for IV, Liberty Rock Radio for TLAD,
+    // Electro-Choc and K109 for TBoGT -- so the override list is per episode
+    // too, with the all-episodes one as the fallback.
     bool        warmMusic = true;        // PrecompileWarmMusic
     std::string warmMusicTracks;         // PrecompileWarmMusicTracks, empty = the shipped rotation
+    std::string warmMusicTracksIV;       // PrecompileWarmMusicTracksIV
+    std::string warmMusicTracksTLAD;     // PrecompileWarmMusicTracksTLAD
+    std::string warmMusicTracksTBoGT;    // PrecompileWarmMusicTracksTBoGT
     // vkcapture owns this one; it is read here only so the band can say "stage
     // 2 of 3" instead of guessing how many stages the load has.
     bool    replayVulkan  = true;   // ReplayVulkanPipelines
@@ -5398,8 +5405,22 @@ class ShaderPrecompiler
         // The music, before the hold: the loading screen's own six stems loop
         // every forty seconds and this hold is measured in tens of minutes.
         // Engine calls only, on this thread, and End() below runs on every path.
+        //
+        // _dwCurrentEpisode is comvars', found by pattern and read by every
+        // other episodic fix in the mod; warmmusic validates the pointer and
+        // the value itself and falls back to the tracks every episode has.
+        // This gate is past the episode/DLC menu, so the index is settled.
         warmmusic::Log() = &Log;
-        warmmusic::Begin(t0, cfg.warmMusic, cfg.warmMusicTracks);
+        {
+            warmmusic::Options mo;
+            mo.enabled      = cfg.warmMusic;
+            mo.tracks       = cfg.warmMusicTracks;
+            mo.tracksIV     = cfg.warmMusicTracksIV;
+            mo.tracksTLAD   = cfg.warmMusicTracksTLAD;
+            mo.tracksTBoGT  = cfg.warmMusicTracksTBoGT;
+            mo.episode      = _dwCurrentEpisode;
+            warmmusic::Begin(t0, mo);
+        }
         // Belt and braces: a fault anywhere below this point must not leave a
         // track of ours playing into gameplay. End() is idempotent, so the
         // explicit call at the end of the hold stays where it reads best.
@@ -6076,6 +6097,9 @@ class ShaderPrecompiler
         cfg.reuseStamp    = ini.ReadInteger("SHADERS", "PrecompileReuseWarmCache", 1) != 0;
         cfg.warmMusic     = ini.ReadInteger("SHADERS", "PrecompileWarmMusic", 1) != 0;
         cfg.warmMusicTracks = ini.ReadString("SHADERS", "PrecompileWarmMusicTracks", "");
+        cfg.warmMusicTracksIV    = ini.ReadString("SHADERS", "PrecompileWarmMusicTracksIV", "");
+        cfg.warmMusicTracksTLAD  = ini.ReadString("SHADERS", "PrecompileWarmMusicTracksTLAD", "");
+        cfg.warmMusicTracksTBoGT = ini.ReadString("SHADERS", "PrecompileWarmMusicTracksTBoGT", "");
         cfg.replayVulkan  = ini.ReadInteger("SHADERS", "ReplayVulkanPipelines", 1) != 0;
         // Not ours, but it is the only thing that can put a sample count on a
         // render target, and the sample count is in the pipeline key. The
