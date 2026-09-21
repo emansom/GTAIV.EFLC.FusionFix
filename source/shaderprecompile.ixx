@@ -2472,6 +2472,28 @@ class ShaderPrecompiler
 
         Log("replay: indexed %zu VS + %zu PS by bytecode hash (%zu from the .fxc db, %zu more from the registry)",
             vsByHash.size(), psByHash.size(), fromDb, vsByHash.size() + psByHash.size() - fromDb);
+
+        // The b# masks, so the key's bool axis can be checked against the install
+        // rather than trusted. Measured offline over this rig's 1734 .fxc shaders:
+        // 159 read a bool register, every one of them exactly one, and only four
+        // registers appear anywhere (b0, b8, b9, b11 -> union 0x0B01). A walk that
+        // had desynchronised would show scattered high bits and a much larger
+        // union, so these two numbers are the parser's own check.
+        {
+            uint32_t withBools = 0, unionMask = 0, most = 0;
+            for (auto& [h, m] : shaderBoolMask)
+            {
+                if (!m) continue;
+                withBools++;
+                unionMask |= m;
+                uint32_t bits = 0;
+                for (uint32_t v = m; v; v &= v - 1) bits++;
+                if (bits > most) most = bits;
+            }
+            Log("replay: b# masks parsed for %zu shaders - %u read a bool register, union 0x%04X, "
+                "most read by any one shader %u",
+                shaderBoolMask.size(), withBools, unionMask, most);
+        }
     }
 
     // ---- RAGE's own shader objects -------------------------------------------
