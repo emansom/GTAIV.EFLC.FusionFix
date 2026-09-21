@@ -166,13 +166,39 @@ namespace warmmusic
     // only then brings in the rest.
     inline std::vector<Track> DefaultTracks()
     {
+        // EVERY ENTRY HAS A DURATION, and that is a correction from a measured
+        // run. "0 seconds" means "until the sound ends by itself", which is
+        // detected by the engine nulling our slot -- and a track that LOOPS
+        // never does. On the first long hold of the merged build the rotation
+        // reached MENU_MUSIC_STREAMED at 2 minutes and was still on it ten
+        // minutes later, which is the repetition this feature exists to fix,
+        // in a new place. So the shipped rotation is timed end to end, and
+        // Tick has a hard cap over the top of it for anything the ini asks for
+        // at 0.
+        //
+        // THE FOUR CONTINUOUS MIXES. GTA IV's radio is stations with DJs,
+        // adverts and a schedule, which need the world and a listener -- except
+        // for four stations that are one long DJ mix and nothing else, and
+        // those are a single sound each, the same shape as the one that was
+        // proven to play here. All four are in this build's own audio data
+        // (pc/audio/config/sounds.dat15, flat names): Electro-Choc's Francois
+        // K mix, Bobby Konders' Massive B Soundsystem, DJ Premier's The
+        // Classics and RamJam FM. A name the engine will not make costs a log
+        // line and the next entry, so a station whose wave will not stream at
+        // this gate is not a risk -- it is a line in FusionFix.shaders.log.
+        //
+        // Roughly 45 minutes before it repeats, which is the hour the cold
+        // first launch is allowed to take with one track heard twice.
         return {
-            { Kind::Stems, 0, "",                    150 },  // the loading music, as shipped
-            { Kind::Named, 0, "MENU_MUSIC_STREAMED",   0 },  // the pause / frontend menu music
-            { Kind::Stems, 0, "",                    120 },  // back to the loading music
-            { Kind::Named, 0, "RADIO_DANCE_MIX_FK",  600 },  // Electro-Choc's club mix
-            { Kind::Named, 0, "INTRO_MUSIC_TRACK",     0 },  // the intro cutscene track
-            { Kind::Named, 0, "END_CREDITS_MUSIC",     0 },  // the end-credits theme
+            { Kind::Stems, 0, "",                                 150 },  // the loading music, as shipped
+            { Kind::Named, 0, "MENU_MUSIC_STREAMED",              240 },  // the pause / frontend menu music
+            { Kind::Named, 0, "RADIO_DANCE_MIX_FK",               420 },  // Electro-Choc
+            { Kind::Stems, 0, "",                                  90 },  // back to the loading music
+            { Kind::Named, 0, "RADIO_BOBBY_KONDERS_MASSIVEB_MIX", 420 },  // Massive B Soundsystem
+            { Kind::Named, 0, "RADIO_NY_CLASSICS_CLASSICS_MIX",   420 },  // The Classics
+            { Kind::Named, 0, "RADIO_RAMJAMFM_RAMJAM_MIX",        420 },  // RamJam FM
+            { Kind::Named, 0, "INTRO_MUSIC_TRACK",                180 },  // the intro cutscene track
+            { Kind::Named, 0, "END_CREDITS_MUSIC",                300 },  // the end-credits theme
         };
         // NOT HERE, AND MEASURED: the INSTALL_MUSIC_ set. 0x008E55F0's flag
         // picks it and the sounds exist in sounds.dat15, but the PC build's
@@ -529,8 +555,17 @@ namespace warmmusic
 
         const Track& t = s.tracks[s.index];
         const int64_t elapsed = nowUs - s.trackStartUs;
-        bool advance = false;
-        if (t.kind == Kind::Named)
+        // Nothing holds the rotation for more than a quarter of an hour, ini or
+        // not: "until it ends by itself" cannot end a track that loops, and a
+        // twenty-minute hold on one loop is the thing this feature is for.
+        constexpr int64_t kHardCapUs = 900ll * 1000000ll;
+        bool advance = elapsed > kHardCapUs;
+        if (advance)
+        {
+            Say("warm music: %s has had its quarter of an hour - moving on",
+                t.kind == Kind::Named ? t.name.c_str() : "the loading stems");
+        }
+        else if (t.kind == Kind::Named)
         {
             uintptr_t live = 0;
             if (s.slotAddr) Peek(s.slotAddr, live);

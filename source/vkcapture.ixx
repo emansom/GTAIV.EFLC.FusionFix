@@ -2156,10 +2156,22 @@ class VkCapture
                     strcmp(info->ppEnabledExtensionNames[i], "VK_EXT_graphics_pipeline_library") == 0)
                     gpl = true;
             pipelinekeys::VulkanReplay().gplEnabled = gpl;
-            Log("device %p: graphics pipeline libraries are %s - DXVK compiles optimized "
-                "pipelines %s", (void*)dev, gpl ? "ENABLED" : "off",
-                gpl ? "on its worker threads, so only a quiet wait can see them finish"
-                    : "inline on its CS thread, where a drained fence is the compile");
+            // NECESSARY, NOT SUFFICIENT, and this rig is the proof: DXVK enables
+            // the extension on the device whenever the driver offers it, and
+            // then decides separately whether to USE it --
+            // canUseGraphicsPipelineLibrary() also wants
+            // graphicsPipelineLibraryIndependentInterpolationDecoration and
+            // `dxvk.enableGraphicsPipelineLibrary != False`, and this machine's
+            // dxvk.conf sets that option to False. So this line says what can be
+            // seen from outside DXVK and no more.
+            Log("device %p: VK_EXT_graphics_pipeline_library is %s on the device. That is what "
+                "decides whether DXVK compiles optimized pipelines inline on its CS thread "
+                "(a drained fence is then the compile) or queues them to its worker threads "
+                "(only a quiet wait can see those finish) - but the extension being enabled "
+                "does not mean DXVK uses it: dxvk.enableGraphicsPipelineLibrary and the "
+                "driver decide, and neither is readable from here. Every wait in the warm "
+                "pass is a quiet wait, which covers both.",
+                (void*)dev, gpl ? "enabled" : "NOT enabled");
         }
         d->CreateGraphicsPipelines   = reinterpret_cast<PFN_vkCreateGraphicsPipelines>(load("vkCreateGraphicsPipelines"));
         d->CreateComputePipelines    = reinterpret_cast<PFN_vkCreateComputePipelines>(load("vkCreateComputePipelines"));

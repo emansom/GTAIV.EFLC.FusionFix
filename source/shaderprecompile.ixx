@@ -4358,7 +4358,20 @@ class ShaderPrecompiler
                 // away the compilation this whole pass exists to do. Waiting
                 // until DXVK is QUIET covers both, and costs one settle second
                 // per rotation out of a walk measured in hundreds.
-                WaitUntilIdle("a warm device chunk, before it is replaced", edev);
+                //
+                // It owns the progress counters while it runs -- it shows the
+                // settle as a bar of its own and ends by filling it -- so the
+                // walk's own are saved and put back, or the band would read
+                // 100 % from the first rotation to the end of the load.
+                {
+                    const uint32_t wTotal = workTotal;
+                    const uint32_t wDone = workDone.load();
+                    const auto wPhase = tPhase;
+                    WaitUntilIdle("a warm device chunk, before it is replaced", edev);
+                    workTotal = wTotal;
+                    workDone = wDone;
+                    tPhase = wPhase;
+                }
                 if (!RotateWarmDevice(plan))
                 {
                     rotateFailed++;
@@ -4451,7 +4464,9 @@ class ShaderPrecompiler
                 if (std::chrono::duration_cast<std::chrono::milliseconds>(nowLbl - tLastLabel).count() >= 250)
                 {
                     tLastLabel = nowLbl;
-                    curLabel = "engine pipeline " + std::to_string(drawn) + " / " + std::to_string(plan.jobs.size());
+                    // Short, because the band prints it after "stage k of n"
+                    // in a column the headline does not reach into.
+                    curLabel = "pipeline " + std::to_string(drawn) + " / " + std::to_string(plan.jobs.size());
                 }
                 // A lost device here would turn every remaining draw into a
                 // silent failure; stop and let the game have its frame back.
@@ -4806,11 +4821,14 @@ class ShaderPrecompiler
                 labelAt = now;
                 char label[128];
                 const uint32_t phase = vr.phase.load();
+                // The stage already says "Warming Vulkan pipelines" in the
+                // headline, so the label says only which recordings and how
+                // far: it shares its row with the time estimate.
                 if (phase == pipelinekeys::VulkanReplayState::kPreparing)
-                    _snprintf_s(label, sizeof(label), _TRUNCATE, "Vulkan pipelines, reading the recordings");
+                    _snprintf_s(label, sizeof(label), _TRUNCATE, "reading the recordings");
                 else
-                    _snprintf_s(label, sizeof(label), _TRUNCATE, "Vulkan pipelines from %s, %u of %u",
-                                phase == pipelinekeys::VulkanReplayState::kOwn ? "this PC" : "other PCs and Steam",
+                    _snprintf_s(label, sizeof(label), _TRUNCATE, "%s, %u of %u",
+                                phase == pipelinekeys::VulkanReplayState::kOwn ? "this PC" : "other PCs",
                                 workDone.load(), total);
                 curLabel = label;
             }
@@ -5044,37 +5062,41 @@ class ShaderPrecompiler
         // nobody can time is the one thing on this band that could be a lie.
         const bool cheap = !settling && cheapStage.load() == stageNo;
 
+        // FOUR SHORT STRINGS, AND THEY HAVE TO STAY SHORT. Each one is a
+        // COLUMN of the band, and the first live run of the merged build drew
+        // the detail and the estimate straight through each other because the
+        // two together were half again as wide as the band. bootgate.h shrinks
+        // a column that still does not fit, but shrinking is a fallback and
+        // not a layout: the elapsed clock belongs beside the percentage, where
+        // there is room, rather than on the end of the longest string in the
+        // band, and the settles say what they are in four words.
         char head[64], pct[24], detail[96], eta[48], clock[24];
         _snprintf_s(head, sizeof(head), _TRUNCATE, "%s",
-                    settling ? curTitle.c_str()
+                    settling ? "Waiting for the driver"
                              : (cheap ? "Reusing the warm cache" : curWhat));
-        _snprintf_s(pct, sizeof(pct), _TRUNCATE, "%d%%", (int)(frac * 100.0f));
-
         FormatClock(clock, sizeof(clock), overall);
-        if (cheap)
-        {
-            _snprintf_s(detail, sizeof(detail), _TRUNCATE,
-                        "the driver already has these pipelines - skipping the full pass   %s",
-                        clock);
-        }
-        else if (!curLabel.empty())
-        {
-            _snprintf_s(detail, sizeof(detail), _TRUNCATE, "stage %d of %d   %s   %s",
-                        stageNo, stageCount, curLabel.c_str(), clock);
-        }
+        if (settling)
+            _snprintf_s(pct, sizeof(pct), _TRUNCATE, "%s", clock);
         else
-        {
+            _snprintf_s(pct, sizeof(pct), _TRUNCATE, "%d%%   %s", (int)(frac * 100.0f), clock);
+
+        if (cheap)
+            _snprintf_s(detail, sizeof(detail), _TRUNCATE, "the driver already has these");
+        else if (!curLabel.empty())
             _snprintf_s(detail, sizeof(detail), _TRUNCATE, "stage %d of %d   %s",
-                        stageNo, stageCount, clock);
-        }
+                        stageNo, stageCount, curLabel.c_str());
+        else
+            _snprintf_s(detail, sizeof(detail), _TRUNCATE, "stage %d of %d", stageNo, stageCount);
 
         if (cheap)
         {
-            _snprintf_s(eta, sizeof(eta), _TRUNCATE, "this launch is seconds, not minutes");
+            _snprintf_s(eta, sizeof(eta), _TRUNCATE, "seconds, not minutes");
         }
         else if (settling)
         {
-            _snprintf_s(eta, sizeof(eta), _TRUNCATE, "not timed - this finishes when the driver does");
+            // Still the honest sentence, in a column's worth of words: this
+            // wait is not work done and cannot be estimated from.
+            _snprintf_s(eta, sizeof(eta), _TRUNCATE, "not timed - it ends when DXVK does");
         }
         else if (inStage >= 10.0 && frac >= 0.02f)
         {
@@ -5084,7 +5106,7 @@ class ShaderPrecompiler
         }
         else
         {
-            _snprintf_s(eta, sizeof(eta), _TRUNCATE, "working out how long this stage will take");
+            _snprintf_s(eta, sizeof(eta), _TRUNCATE, "working out how long this takes");
         }
 
         Upper(head); Upper(pct); Upper(detail); Upper(eta);

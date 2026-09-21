@@ -936,6 +936,44 @@ namespace bootgate
         return quads;
     }
 
+    // ---------------------------------------------------------------------
+    //  MAKING A COLUMN FIT ITS BOX
+    //
+    //  The band carries strings the pass builds from its own counters, and the
+    //  longest of them ("stage 3 of 3   from other PCs, 12345 of 67890") is
+    //  twice the width of the shortest. Printed at a fixed scale into a box it
+    //  does not fit, CFont wraps it -- and a wrapped line is drawn BELOW its
+    //  row, which on this band means on top of the bar or off the bottom of
+    //  the screen. The first live run of the merged build showed exactly that:
+    //  the detail and the estimate drawn through each other.
+    //
+    //  So each column shrinks to fit. The width is BUDGETED, not measured --
+    //  the game's own string-width call is not fingerprinted here and an upper
+    //  bound is all this needs. The budget is 0.028 of the screen width per
+    //  character per unit of the scale passed to FontSetScale, measured off
+    //  two live bands: "WARMING ENGINE PIPELINES" (24 characters) took 23.5 %
+    //  of the window at 0.38, and "WORKING OUT HOW LONG THIS STAGE WILL TAKE"
+    //  (40, all letters and therefore the widest kind of string this band
+    //  carries) took 27.7 % at 0.26 -- 0.0258 and 0.0266 per character per
+    //  unit. At this budget nothing the pass currently writes needs shrinking;
+    //  it is here for the strings a later build writes without thinking about
+    //  the width. The floor is 0.55: past that it would be shrinking to stay
+    //  legible, which is not a trade worth making, and the string is left to
+    //  wrap.
+    // ---------------------------------------------------------------------
+    constexpr float kCharWidthAtUnitScale = 0.028f;
+    constexpr float kFitFloor = 0.55f;
+
+    inline float FitRatio(const char* s, float boxWidth, float sx)
+    {
+        const size_t n = s ? strlen(s) : 0;
+        if (!n || sx <= 0.0f || boxWidth <= 0.0f) return 1.0f;
+        const float need = (float)n * kCharWidthAtUnitScale * sx;
+        if (need <= boxWidth) return 1.0f;
+        const float r = boxWidth / need;
+        return (r < kFitFloor) ? kFitFloor : r;
+    }
+
     inline void ToWide(const char* s, wchar_t* out, size_t cap)
     {
         size_t i = 0;
@@ -973,7 +1011,7 @@ namespace bootgate
         // row lands on the bar. The longest headline this can carry is a settle
         // ("WAITING FOR THE DRIVER") plus its clock in the other column, so the
         // split is where the two columns can never reach each other.
-        const float split = left + (right - left) * 0.62f;
+        const float split = left + (right - left) * 0.68f;
         const float y1 = (bandY + bandH * kRow1Frac) / h;
         const float y2 = (bandY + bandH * kRow2Frac) / h;
 
@@ -982,9 +1020,21 @@ namespace bootgate
         step = 3;  FontSetSlant(0.0f);
         step = 4;  FontSetColour(p.textARGB);
 
-        float sx = kHeadScaleX, sy = kHeadScaleY;
-        step = 6;  WidescreenFix(sx, sy);
-        step = 7;  FontSetScale(sx, sy);
+        // A ROW SHRINKS AS ONE. Each column is measured against its own box,
+        // and the row then draws at the smaller of the two ratios -- two
+        // columns of the same row in visibly different sizes reads as a bug,
+        // and the room a short column gives back is not worth it.
+        //
+        // The measurement is against the UNCORRECTED scale, because that is
+        // what kCharWidthAtUnitScale was calibrated with: the headline at
+        // kHeadScaleX measured 24 characters across 52.9 % of the window.
+        // WidescreenFix then takes the row to the aspect it draws at, and the
+        // ratio rides along.
+        float bx = kHeadScaleX, by = kHeadScaleY;
+        step = 6;  WidescreenFix(bx, by);
+        const float k1 = (std::min)(FitRatio(head, split - left, kHeadScaleX),
+                                    FitRatio(pct, right - split, kHeadScaleX));
+        step = 7;  FontSetScale(bx * k1, by * k1);
         if (head[0])
         {
             step = 5;  FontSetBox(left, split);
@@ -1008,15 +1058,21 @@ namespace bootgate
             step = 11; FontPrint(split, y1, wbuf);
         }
 
-        sx = kDetailScaleX; sy = kDetailScaleY;
-        step = 12; WidescreenFix(sx, sy);
-        step = 13; FontSetScale(sx, sy);
+        bx = kDetailScaleX; by = kDetailScaleY;
+        step = 12; WidescreenFix(bx, by);
         step = 14; FontSetColour(p.detailARGB);
         // The bottom row's own split. The detail is the longest string in the
-        // band ("STAGE 2 OF 3   ENGINE PIPELINE 27739 / 61191   0:52") and the
-        // estimate beside it is short, so it sits further right than the top
-        // row's.
-        const float split2 = left + (right - left) * 0.72f;
+        // band ("STAGE 2 OF 3   PIPELINE 27739 / 61191") and the estimate
+        // beside it is short; both fit at their preferred scale, and FitRatio
+        // is what keeps them apart when one of them does not.
+        // 0.56 is where the two longest strings this row carries need the same
+        // ratio -- "STAGE 2 OF 3   PIPELINE 27739 / 61191" (37 characters) on
+        // the left and "ABOUT 1:02 LEFT IN THIS STAGE" (29) on the right --
+        // so neither column is the one that shrinks the row.
+        const float split2 = left + (right - left) * 0.56f;
+        const float k2 = (std::min)(FitRatio(detail, split2 - left, kDetailScaleX),
+                                    FitRatio(eta, right - split2, kDetailScaleX));
+        step = 13; FontSetScale(bx * k2, by * k2);
         if (detail[0])
         {
             step = 15; FontSetBox(left, split2); FontSetAlign(1);
@@ -1106,8 +1162,24 @@ namespace bootgate
         strncpy_s(detail, sizeof(detail), p.detail, _TRUNCATE);
         strncpy_s(eta, sizeof(eta), p.eta, _TRUNCATE);
 
-        const float px1 = (std::max)(2.0f, (float)(int)(bandH / 26.0f));
-        const float px2 = (std::max)(1.0f, (float)(int)(bandH / 40.0f));
+        // THE GLYPH SET IS TWICE AS WIDE AS THE FONT, and this is where the
+        // band actually broke: 5x7 cells are a fixed six pixels each, so a row
+        // whose two columns are 49 and 40 characters needs 89 * 6 * px, and at
+        // the shipped px that is half again the width of the band. The first
+        // long hold of the merged build drew the detail and the estimate
+        // through each other for exactly this reason (the CFont path, measured
+        // on the same strings, has room to spare -- see FitRatio). So the cell
+        // size is solved for rather than assumed: whatever px makes both
+        // columns and a one-character gap fit, down to a floor where the text
+        // is still a text and not a texture.
+        const float avail = w - 2.0f * mx;
+        auto cell = [&](const char* a, const char* b, float want, float floorPx) {
+            const float chars = (float)(strlen(a) + strlen(b) + 2);
+            const float fit = avail / (chars * 6.0f);
+            return (std::max)(floorPx, (std::min)(want, fit));
+        };
+        const float px1 = cell(head, pct, (std::max)(2.0f, (float)(int)(bandH / 26.0f)), 2.0f);
+        const float px2 = cell(detail, eta, (std::max)(1.0f, (float)(int)(bandH / 40.0f)), 1.0f);
         const float y1  = bandY + bandH * kRow1Frac;
         const float y2  = bandY + bandH * kRow2Frac;
 
