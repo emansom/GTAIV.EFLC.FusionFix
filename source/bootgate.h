@@ -83,6 +83,29 @@ namespace bootgate
     constexpr uintptr_t kVA_SpriteQuad       = 0x008D4990;  // untextured quad, PIXEL coords
     constexpr uintptr_t kVA_SpriteFlush      = 0x008D3C20;
 
+    // CFont, in the order rageBoot_LoadscreenDrawLegendText 0x005CD010 calls it.
+    // Two of these were named wrongly by the first pass over that function and
+    // the mistake matters: 0x00924610 is the WRAP BOX, not the scale, and
+    // 0x00924500 is the scale, not an edge. 0x009222A0 settles it -- it reads
+    // the pair at +0x38/+0x3C as the left and right bounds of the text box and
+    // the align field at +0x28 decides which of them the x is measured from.
+    constexpr uintptr_t kVA_FontSetStyle  = 0x00924390;  // __cdecl(int)  0 = font1, the UI face
+    constexpr uintptr_t kVA_FontSetProp   = 0x009244E0;  // __cdecl(int)  proportional
+    constexpr uintptr_t kVA_FontSetSlant  = 0x00924310;  // __cdecl(float) the legend passes 0
+    constexpr uintptr_t kVA_FontSetAlign  = 0x009244A0;  // __cdecl(int) 0 centre 1 left 2 RIGHT 3 justify
+    constexpr uintptr_t kVA_FontSetColour = 0x009241F0;  // __cdecl(u32 argb)
+    constexpr uintptr_t kVA_FontSetBox    = 0x00924610;  // __cdecl(float left, float right), normalised
+    constexpr uintptr_t kVA_FontSetScale  = 0x00924500;  // __cdecl(float sx, float sy)
+    constexpr uintptr_t kVA_FontPrint     = 0x00921DA0;  // __cdecl(float x, float y, const wchar_t*, -1, -1)
+    constexpr uintptr_t kVA_FontFlush     = 0x00923950;  // __cdecl()
+    constexpr uintptr_t kVA_WidescreenFix = 0x008FC260;  // __cdecl(7, 0, float2*, 0) -- aspect-correct a scale
+    // CFont's four resolved font textures (0x0091F0F0 / 0x00922BB0):
+    // 0 font1, 1 font3, 2 font4 (Japanese builds only), 3 the streamed font2.
+    // A null here is exactly what faulted the first attempt at native text at
+    // this gate, so it is tested rather than assumed.
+    constexpr uintptr_t kVA_FontTextures  = 0x011956B8;
+    constexpr uint32_t  kFontStride       = 0x258;
+
     constexpr uintptr_t kVA_Viewports[3]     = { 0x0118D800, 0x0118D804, 0x0118D808 };
     constexpr uintptr_t kVA_ScreenInfo       = 0x017F5838;  // +0x2B0/+0x2B4 int x +0x288/+0x28C float
     constexpr uintptr_t kVA_LoadscreenShown  = 0x018B6F2E;
@@ -633,15 +656,171 @@ namespace bootgate
         return nullptr;
     }
 
-    // What the pass tells the loading screen to show. Written by the pass
-    // thread, read by the render thread, and nothing here is worth a lock: a
-    // torn fraction is one frame of a progress bar.
+    // ---------------------------------------------------------------------
+    //  The band, and where every number in it comes from.
+    //
+    //  The player asked for what the menus do -- "all black with separation bar
+    //  between the art and the black bottom bar" -- so the overlay is a solid
+    //  black band across the bottom with a rule between it and the artwork, and
+    //  nothing of ours is ever drawn on the art itself. That is what makes it
+    //  readable over EVERY loading screen in the rotation instead of over most
+    //  of them.
+    //
+    //  The colours are the game's own: kTextARGB is the exact value
+    //  rageBoot_LoadscreenDrawLegendText 0x005CD010 passes to CFont for the
+    //  legal notice on this same screen family (0xFFE1E1E1), and the band is
+    //  the flat black the loading screen itself clears to and falls back to
+    //  when an artwork layer has no texture (0xFF000000, 0x005CC760 /
+    //  0x005CC180). The proportions are ours: enough band for two rows of text
+    //  and the bar with the game's own safe-area inset, checked on screen
+    //  against the artwork rotation rather than derived from anything.
+    // ---------------------------------------------------------------------
+    //  AND THE FIRST TWO ARE THE MENU'S OWN, read from the frontend's tables
+    //  rather than guessed. CRenderPhaseFrontEnd_RenderPauseMenu_CB draws the
+    //  pause menu's bottom bar as
+    //      rect{0, H*layout[0x16].x, W, H}                      black, alpha only
+    //      rect{0, H*layout[0x16].x, W, H*(layout[0x16].x+0.002)}  colour[0x41]
+    //  where layout is the float2 array at *0x011609C8 (index * 8) and colour
+    //  is the u32 ARGB array at 0x0118DD98. So the band's height, its rule's
+    //  height and the rule's colour all come from the same numbers the pause
+    //  menu uses, and the constants below are only the fallback for a boot
+    //  where those tables are not populated.
+    //  AND THE TEXT COLOUR IS THE SAME ONE. The bottom-right legend the player
+    //  pointed at -- "the next stage after this loading screen has some text in
+    //  the right bottom corner" -- is drawn by 0x008B6C80, which is the pause
+    //  menu's help line: font style 0, ALIGN 2 (right) against a text box whose
+    //  right edge is the layout anchor, colour[0x41], and a drop shadow in
+    //  colour[0x02]. So the band's text uses colour[0x41] too, and the right
+    //  column is right-aligned the same way. Same index as the rule, which is
+    //  not a coincidence: in the pause menu they are the same colour.
+    constexpr uintptr_t kVA_MenuLayout   = 0x011609C8;  // float2[], index * 8
+    constexpr uintptr_t kVA_MenuColours  = 0x0118DD98;  // u32 ARGB[]
+    constexpr int       kMenuBottomBar   = 0x16;        // the bottom bar's top edge
+    constexpr int       kMenuRuleColour  = 0x41;        // the rule, and the legend's text
+    constexpr float     kMenuRuleFrac    = 0.002f;      // the frontend's own literal
+
+    constexpr float    kBandFrac     = 0.125f;   // band height / screen height
+    constexpr float    kMarginFrac   = 0.075f;   // left and right inset / screen width
+    constexpr float    kRow1Frac     = 0.11f;    // headline row, fraction into the band
+    constexpr float    kBarFrac      = 0.46f;    // bar top, fraction into the band
+    constexpr float    kBarHFrac     = 0.070f;   // bar height, fraction of the band
+    constexpr float    kRow2Frac     = 0.62f;    // detail row, fraction into the band
+    constexpr uint32_t kBandARGB     = 0xFF000000u;
+    constexpr uint32_t kSepARGB      = 0xFFB4B4B4u;
+    constexpr uint32_t kBarTrackARGB = 0x40FFFFFFu;
+    constexpr uint32_t kBarFillARGB  = 0xFFE1E1E1u;
+    constexpr uint32_t kTextARGB     = 0xFFE1E1E1u;   // the legend's own colour
+    constexpr uint32_t kDetailARGB   = 0xFF9A9A9Au;
+    constexpr int      kFontStyle    = 0;            // font1, the face the menus and HUD use
+    constexpr float    kHeadScaleX   = 0.38f, kHeadScaleY   = 0.55f;
+    constexpr float    kDetailScaleX = 0.26f, kDetailScaleY = 0.38f;
+
+    // ---------------------------------------------------------------------
+    //  The game's own text.
+    //
+    //  08-boot-gate §4.4 concluded that CFont cannot be used here, because a
+    //  live bisect faulted at the flush with a null font texture. That is one
+    //  measurement of ONE boot, and the code says it should not be so:
+    //  rageBoot_InitSession itself calls CFont::Reload 0x00922BB0 at 0x005C161A,
+    //  a handful of calls before the return we gate on, and that function ends
+    //  by resolving font1/font3 out of the freshly loaded "fonts" texture
+    //  dictionary. So the font may well be resident by the time we look.
+    //
+    //  Rather than decide the question in a comment: TEST IT, every session,
+    //  one pointer read -- and keep the 5x7 glyph set as the fallback for the
+    //  boots where it is null. The log says which one drew.
+    // ---------------------------------------------------------------------
+    inline void FontSetStyle(int s)  { ((void(__cdecl*)(int))Rebase(kVA_FontSetStyle))(s); }
+    inline void FontSetProp(int p)   { ((void(__cdecl*)(int))Rebase(kVA_FontSetProp))(p); }
+    inline void FontSetSlant(float f){ ((void(__cdecl*)(float))Rebase(kVA_FontSetSlant))(f); }
+    inline void FontSetAlign(int a)  { ((void(__cdecl*)(int))Rebase(kVA_FontSetAlign))(a); }
+    inline void FontSetColour(uint32_t c) { ((void(__cdecl*)(uint32_t))Rebase(kVA_FontSetColour))(c); }
+    inline void FontSetBox(float l, float r) { ((void(__cdecl*)(float, float))Rebase(kVA_FontSetBox))(l, r); }
+    inline void FontSetScale(float x, float y) { ((void(__cdecl*)(float, float))Rebase(kVA_FontSetScale))(x, y); }
+    inline void FontPrint(float x, float y, const wchar_t* s)
+    { ((void(__cdecl*)(float, float, const wchar_t*, int, int))Rebase(kVA_FontPrint))(x, y, s, -1, -1); }
+    inline void FontFlush()          { ((void(__cdecl*)())Rebase(kVA_FontFlush))(); }
+    inline void WidescreenFix(float& sx, float& sy)
+    {
+        float v[2] = { sx, sy };
+        ((int(__cdecl*)(int, void*, float*, void*))Rebase(kVA_WidescreenFix))(7, nullptr, v, nullptr);
+        sx = v[0]; sy = v[1];
+    }
+
+    // Is style `s` backed by a resident texture? This is the exact pointer
+    // rageBoot_Sprite_SetTexture is handed from 0x00923200, and a null one is
+    // the "access violation accessing 0x280" the first attempt hit.
+    inline bool FontStyleResident(int s)
+    {
+        if (s < 0 || s > 3) return false;
+        uintptr_t tex = 0;
+        if (!Peek(Rebase(kVA_FontTextures) + (uintptr_t)s * kFontStride, tex) || !tex) return false;
+        return Readable((const void*)tex, 4);
+    }
+
+    // font1 is the face the menus and the HUD use and is what we want; font3 is
+    // the game's other resident face and is worth having rather than falling
+    // back to a 5x7 bitmap. font4 is Japanese-only and 3 is the streamed font,
+    // which is exactly the one that may not be there. -1 means "no native text".
+    inline int ResolveFontStyle()
+    {
+        if (FontStyleResident(0)) return 0;
+        if (FontStyleResident(1)) return 1;
+        return -1;
+    }
+
+    // The CFont entry points, fingerprinted. A mismatch costs the native font
+    // and nothing else -- the glyph set draws instead -- so this is separate
+    // from ValidateCode, which decides whether the gate runs at all.
+    inline bool ValidateFont()
+    {
+        struct { uintptr_t va; const uint8_t b[6]; uint8_t n; } k[] = {
+            { kVA_FontSetStyle,  { 0x53, 0x56, 0xE8 },                         3 },  // PUSH EBX/ESI/CALL
+            { kVA_FontSetProp,   { 0xE8, 0x6B, 0x7C, 0xFF, 0xFF, 0x8D },       6 },
+            { kVA_FontSetSlant,  { 0xE8, 0x3B, 0x7E, 0xFF, 0xFF, 0xF3 },       6 },
+            { kVA_FontSetAlign,  { 0xE8, 0xAB, 0x7C, 0xFF, 0xFF, 0x8D },       6 },
+            { kVA_FontSetColour, { 0xE8, 0x5B, 0x7F, 0xFF, 0xFF, 0xF3 },       6 },
+            { kVA_FontSetBox,    { 0xE8, 0x3B, 0x7B, 0xFF, 0xFF, 0xF3 },       6 },
+            { kVA_FontSetScale,  { 0x83, 0xEC, 0x08, 0x56, 0xE8, 0x47 },       6 },
+            { kVA_FontPrint,     { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8 },       6 },
+            { kVA_FontFlush,     { 0x56, 0x57, 0xE8, 0xF9, 0x87, 0xFF },       6 },
+            { kVA_WidescreenFix, { 0x53, 0x8B, 0x5C, 0x24, 0x08, 0x85 },       6 },
+        };
+        for (const auto& e : k)
+            if (!BytesAre(e.va, e.b, e.n)) return false;
+        return true;
+    }
+
+    // ---------------------------------------------------------------------
+    //  What the pass tells the loading screen to show.
+    //
+    //  Four strings, laid out like the game's own menus: a headline and a
+    //  percentage on one row, the bar, then the detail and the time estimate
+    //  on a smaller row. Written by the pass thread, read by the render thread;
+    //  nothing here is worth a lock, because a torn line is one frame of a
+    //  caption and every buffer is always NUL-terminated.
+    // ---------------------------------------------------------------------
     struct Progress
     {
         volatile bool   active = false;
         volatile float  fraction = 0.0f;
-        char            line[48] = {};
+        char            head[64] = {};      // left, top row
+        char            pct[24] = {};       // right, top row
+        char            detail[96] = {};    // left, bottom row
+        char            eta[48] = {};       // right, bottom row
         volatile long   lineSeq = 0;
+        // Filled on the first draw so the log can say which text engine drew.
+        volatile bool   nativeFont = false;
+        volatile bool   nativeChecked = false;
+        volatile int    faultStep = 0;
+        volatile int    fontStyle = kFontStyle;
+        // The band's geometry, resolved once from the frontend's own tables.
+        volatile float    bandFrac = kBandFrac;
+        volatile float    ruleFrac = kMenuRuleFrac;
+        volatile uint32_t ruleARGB = kSepARGB;
+        volatile uint32_t textARGB = kTextARGB;
+        volatile uint32_t detailARGB = kDetailARGB;
+        volatile bool     styleFromGame = false;
     };
     inline Progress& Prog()
     {
@@ -649,20 +828,68 @@ namespace bootgate
         return p;
     }
 
-    inline void SetProgress(float frac, const char* line)
+    inline void CopyLine(char* dst, size_t cap, const char* src)
+    {
+        if (!src) { dst[0] = 0; return; }
+        strncpy_s(dst, cap, src, _TRUNCATE);
+        // '~' opens a token in the game's text system (~r~, ~n~ and friends).
+        // Our strings are built from counters, not from GXT, so the safe thing
+        // is to make sure one can never be mistaken for a token.
+        for (char* c = dst; *c; c++) if (*c == '~') *c = '-';
+    }
+
+    inline void SetProgress(float frac, const char* head, const char* pct,
+                            const char* detail, const char* eta)
     {
         Progress& p = Prog();
         p.fraction = (frac < 0.0f) ? 0.0f : (frac > 1.0f ? 1.0f : frac);
-        if (line)
+        if (head)   CopyLine(p.head, sizeof(p.head), head);
+        if (pct)    CopyLine(p.pct, sizeof(p.pct), pct);
+        if (detail) CopyLine(p.detail, sizeof(p.detail), detail);
+        if (eta)    CopyLine(p.eta, sizeof(p.eta), eta);
+        InterlockedIncrement(&p.lineSeq);
+    }
+
+    // Take the band's proportions and its rule's colour from the pause menu's
+    // own tables. Both are filled by the frontend, which has finished by the
+    // time this gate opens; both are range-checked, because a table that has
+    // been freed reads as plausible-looking rubbish rather than as zero.
+    inline void ResolveMenuStyle()
+    {
+        Progress& p = Prog();
+        uintptr_t tbl = 0;
+        float top = 0.0f;
+        if (Peek(Rebase(kVA_MenuLayout), tbl) && tbl &&
+            Peek(tbl + (uintptr_t)kMenuBottomBar * 8, top) &&
+            top > 0.70f && top < 0.96f)
         {
-            strncpy_s(p.line, sizeof(p.line), line, _TRUNCATE);
-            InterlockedIncrement(&p.lineSeq);
+            p.bandFrac = 1.0f - top;
+            p.styleFromGame = true;
+        }
+        uint32_t c = 0;
+        if (Peek(Rebase(kVA_MenuColours) + (uintptr_t)kMenuRuleColour * 4, c) && (c >> 24) >= 0x40)
+        {
+            p.ruleARGB = c;
+            p.textARGB = c;
+            // The second row is ours: the same colour at about two thirds, so
+            // the detail reads as subordinate to the headline without
+            // introducing a colour the game does not use.
+            const uint32_t r = ((c >> 16) & 0xFF) * 2 / 3;
+            const uint32_t g = ((c >> 8) & 0xFF) * 2 / 3;
+            const uint32_t b = (c & 0xFF) * 2 / 3;
+            p.detailARGB = (c & 0xFF000000u) | (r << 16) | (g << 8) | b;
         }
     }
 
+    // ---------------------------------------------------------------------
+    //  The two text engines.
+    // ---------------------------------------------------------------------
+
     // One quad per vertical run of lit pixels in a glyph column: a 24-character
     // line costs on the order of a hundred quads, not 5x7x24.
-    inline int DrawText(const char* s, float x, float y, float px, uint32_t argb)
+    inline float GlyphTextWidth(const char* s, float px) { return (float)strlen(s) * px * 6.0f; }
+
+    inline int DrawGlyphText(const char* s, float x, float y, float px, uint32_t argb)
     {
         int quads = 0;
         for (const char* c = s; *c && quads < 512; c++, x += px * 6.0f)
@@ -688,10 +915,105 @@ namespace bootgate
         return quads;
     }
 
-    // The whole overlay: a track, a fill and one line of text, in the loading
-    // screen's own coordinate space and its own primitive. No backdrop, no
-    // blur, nothing of ours behind it -- the game's artwork keeps animating
-    // underneath because the render thread keeps drawing it.
+    inline void ToWide(const char* s, wchar_t* out, size_t cap)
+    {
+        size_t i = 0;
+        for (; s[i] && i + 1 < cap; i++)
+        {
+            unsigned char c = (unsigned char)s[i];
+            out[i] = (c >= 0x20 && c <= 0x7E) ? (wchar_t)c : L' ';
+        }
+        out[i] = 0;
+    }
+
+    // The four lines, in the game's own font, through the same sequence
+    // rageBoot_LoadscreenDrawLegendText uses on the legal screens.
+    //
+    // The step number goes into Prog().faultStep, which is volatile, because
+    // that is the only way a value written inside a __try is guaranteed to be
+    // readable in its __except -- and on a fault the step is the whole
+    // diagnosis. It is cleared to 0 on the way out.
+    inline void DrawNativeText(float bandY, float bandH, float w, float h)
+    {
+        Progress& p = Prog();
+        volatile int& step = p.faultStep;
+        char head[64], pct[24], detail[96], eta[48];
+        strncpy_s(head, sizeof(head), p.head, _TRUNCATE);
+        strncpy_s(pct, sizeof(pct), p.pct, _TRUNCATE);
+        strncpy_s(detail, sizeof(detail), p.detail, _TRUNCATE);
+        strncpy_s(eta, sizeof(eta), p.eta, _TRUNCATE);
+
+        wchar_t wbuf[96];
+        const float left  = kMarginFrac;
+        const float right = 1.0f - kMarginFrac;
+        const float y1 = (bandY + bandH * kRow1Frac) / h;
+        const float y2 = (bandY + bandH * kRow2Frac) / h;
+
+        step = 1;  FontSetStyle(p.fontStyle);
+        step = 2;  FontSetProp(1);
+        step = 3;  FontSetSlant(0.0f);
+        step = 4;  FontSetColour(p.textARGB);
+        step = 5;  FontSetBox(left, right);
+
+        float sx = kHeadScaleX, sy = kHeadScaleY;
+        step = 6;  WidescreenFix(sx, sy);
+        step = 7;  FontSetScale(sx, sy);
+        if (head[0])
+        {
+            step = 8;  FontSetAlign(1);
+            ToWide(head, wbuf, 96);
+            step = 9;  FontPrint(left, y1, wbuf);
+        }
+        if (pct[0])
+        {
+            // RIGHT-ALIGNED TEXT IS PRINTED AT THE BOX'S LEFT EDGE, not its
+            // right. 0x009222A0 takes `x - boxLeft` as an INDENT and subtracts
+            // it from the width it may wrap in, so printing at the right edge
+            // leaves nothing to fit and every line breaks after its first word
+            // (seen on screen: "ABOUT" / "1:08 LEFT IN THIS STAGE"). Align 2
+            // ignores the x and measures from the box's right edge anyway,
+            // which is what 0x008B6C80 relies on when it prints the pause
+            // menu's help line at x = 0.
+            step = 10; FontSetAlign(2);
+            ToWide(pct, wbuf, 96);
+            step = 11; FontPrint(left, y1, wbuf);
+        }
+
+        sx = kDetailScaleX; sy = kDetailScaleY;
+        step = 12; WidescreenFix(sx, sy);
+        step = 13; FontSetScale(sx, sy);
+        step = 14; FontSetColour(p.detailARGB);
+        if (detail[0])
+        {
+            step = 15; FontSetAlign(1);
+            ToWide(detail, wbuf, 96);
+            step = 16; FontPrint(left, y2, wbuf);
+        }
+        if (eta[0])
+        {
+            step = 17; FontSetAlign(2);
+            ToWide(eta, wbuf, 96);
+            step = 18; FontPrint(left, y2, wbuf);
+        }
+        step = 19; FontFlush();
+        step = 0;
+        (void)w;
+    }
+
+    // ---------------------------------------------------------------------
+    //  The overlay.
+    //
+    //  The menus' own device, which is what the player asked for: a solid black
+    //  band across the bottom with a separator rule between it and the artwork,
+    //  and everything of ours inside the band. Nothing of ours is ever drawn
+    //  over the art itself, so it reads the same over every loading screen in
+    //  the rotation -- bright TBoGT neon or a dark TLAD alley.
+    //
+    //  Still the loading screen's own primitive (bind no texture, untextured
+    //  quad in PIXEL coordinates, flush), from the CL == 0 leave of
+    //  rageBoot_LoadscreenDrawLayers, so the artwork keeps animating
+    //  underneath and the mod presents no frame of its own.
+    // ---------------------------------------------------------------------
     inline void DrawProgress()
     {
         Progress& p = Prog();
@@ -700,26 +1022,66 @@ namespace bootgate
         float w = 0.0f, h = 0.0f;
         if (!ScreenSize(w, h)) return;
 
-        const float px   = (std::max)(2.0f, (float)(int)(h / 360.0f));
-        const float barX = (float)(int)(w * 0.12f);
-        const float barW = (float)(int)(w * 0.76f);
-        const float barH = (std::max)(6.0f, (float)(int)(h * 0.012f));
-        const float barY = (float)(int)(h * 0.88f);
-        const float pad  = (std::max)(1.0f, (float)(int)(px * 0.5f));
+        // Decide once per session what this band looks like and what can draw
+        // its text, and let the log say so.
+        if (!p.nativeChecked)
+        {
+            ResolveMenuStyle();
+            const int style = ResolveFontStyle();
+            p.fontStyle = style < 0 ? kFontStyle : style;
+            p.nativeFont = style >= 0 && ValidateFont();
+            p.nativeChecked = true;
+        }
+
+        const float bandH = (float)(int)((std::max)(56.0f, h * p.bandFrac));
+        const float bandY = (float)(int)(h - bandH);
+        const float sepH  = (std::max)(2.0f, (float)(int)(h * p.ruleFrac));
+        const float mx    = (float)(int)(w * kMarginFrac);
 
         SpriteSetTexture(nullptr, 0);
-        // track: a dark plate, so the bar reads over any artwork
-        SpriteQuad(barX - pad, barY - pad, barX + barW + pad, barY + barH + pad, 0.0f, 0xB0000000u);
-        SpriteQuad(barX, barY, barX + barW, barY + barH, 0.0f, 0xFF1A1A1Fu);
-        // fill
-        const float fillW = barW * p.fraction;
+        SpriteQuad(0.0f, bandY, w, h, 0.0f, kBandARGB);                   // the band
+        // The rule sits INSIDE the band along its top edge, which is where the
+        // pause menu puts its own (0x005A9F18: H*c .. H*(c+0.002)).
+        SpriteQuad(0.0f, bandY, w, bandY + sepH, 0.0f, p.ruleARGB);
+
+        const float barY = (float)(int)(bandY + bandH * kBarFrac);
+        const float barH = (std::max)(4.0f, (float)(int)(bandH * kBarHFrac));
+        SpriteQuad(mx, barY, w - mx, barY + barH, 0.0f, kBarTrackARGB);
+        const float fillW = (w - 2.0f * mx) * p.fraction;
         if (fillW >= 1.0f)
-            SpriteQuad(barX, barY, barX + fillW, barY + barH, 0.0f, 0xFFE0E6F0u);
-        // one line of text above it
-        char line[48];
-        strncpy_s(line, sizeof(line), p.line, _TRUNCATE);
-        if (line[0])
-            DrawText(line, barX, barY - px * 9.0f, px, 0xFFD8DEE9u);
+            SpriteQuad(mx, barY, mx + fillW, barY + barH, 0.0f, p.textARGB);
+        SpriteFlush();
+
+        if (p.nativeFont)
+        {
+            __try { DrawNativeText(bandY, bandH, w, h); }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                if (p.faultStep == 0) p.faultStep = -1;
+            }
+            if (p.faultStep != 0)
+                p.nativeFont = false;       // the glyph set draws for the rest of the load
+            else
+                return;
+        }
+
+        // Fallback: the 5x7 set, laid out on the same two rows.
+        char head[64], pct[24], detail[96], eta[48];
+        strncpy_s(head, sizeof(head), p.head, _TRUNCATE);
+        strncpy_s(pct, sizeof(pct), p.pct, _TRUNCATE);
+        strncpy_s(detail, sizeof(detail), p.detail, _TRUNCATE);
+        strncpy_s(eta, sizeof(eta), p.eta, _TRUNCATE);
+
+        const float px1 = (std::max)(2.0f, (float)(int)(bandH / 26.0f));
+        const float px2 = (std::max)(1.0f, (float)(int)(bandH / 40.0f));
+        const float y1  = bandY + bandH * kRow1Frac;
+        const float y2  = bandY + bandH * kRow2Frac;
+
+        SpriteSetTexture(nullptr, 0);
+        if (head[0])   DrawGlyphText(head, mx, y1, px1, p.textARGB);
+        if (pct[0])    DrawGlyphText(pct, w - mx - GlyphTextWidth(pct, px1), y1, px1, p.textARGB);
+        if (detail[0]) DrawGlyphText(detail, mx, y2, px2, p.detailARGB);
+        if (eta[0])    DrawGlyphText(eta, w - mx - GlyphTextWidth(eta, px2), y2, px2, p.detailARGB);
         SpriteFlush();
     }
 }
