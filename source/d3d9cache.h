@@ -55,8 +55,12 @@ namespace d3d9cache
     constexpr size_t kMaxCaptureKeys        = (kMaxFileBytes - (2u << 20)) / sizeof(KeyRecord);
     constexpr size_t kMaxCaptureShaderBytes = 1u << 20;
 
-    // Container v1 is v2 without KeyRecord::streamFreq; everything else is the same.
+    // Older records are the current one with a run of fields missing and the
+    // count/firstFrame tail following immediately: v1 has no streamFreq, v2 has no
+    // specialisation block (vsBools .. ffStage). Both are widened in memory, so a
+    // file written by the player's other PC, or an older build, still replays.
     constexpr size_t kRecordV1 = offsetof(KeyRecord, streamFreq) + 2 * sizeof(uint32_t);
+    constexpr size_t kRecordV2 = offsetof(KeyRecord, vsBools) + 2 * sizeof(uint32_t);
 
     // ---- names ---------------------------------------------------------------
     // The content hash that names and de-duplicates files (see pipelinekeys.h).
@@ -283,6 +287,44 @@ namespace d3d9cache
         return "no D3DDECL_END";
     }
 
+    // Position of a render state in KeyRecord::rs. Resolved once per state.
+    inline int RSIndex(D3DRENDERSTATETYPE rs)
+    {
+        for (uint32_t i = 0; i < pipelinekeys::kNumRS; i++)
+            if (pipelinekeys::kTrackedRS[i].rs == rs) return (int)i;
+        return -1;
+    }
+
+    // A pre-v3 record, given the specialisation state that reproduces what the
+    // replay ACTUALLY drew it with before the fields existed -- so an old file, or
+    // one from a player's other PC still on an older build, keeps working and keeps
+    // building the same pipelines. Every value here is a default the device
+    // measurably held at both gates on the rig this was developed on, with one
+    // inference:
+    //
+    //   clipPlaneCount. DXVK counts the planes that are ENABLED and whose
+    //   coefficients are not all zero, and the coefficients are gone. A game that
+    //   turns a plane on and leaves it at zero is asking for a no-op, so the count
+    //   is taken to be the popcount of the enable mask. That is the direction that
+    //   over-warms (a pipeline built that this key never needed) rather than the one
+    //   that stutters, and it is what a v3 capture of the same draw would record.
+    inline void WidenToV3(KeyRecord& k)
+    {
+        using namespace pipelinekeys;
+        static const int cpe = RSIndex(D3DRS_CLIPPLANEENABLE);
+
+        k.vsBools = 0;
+        k.psBools = 0;
+        k.projMask = 0;
+        for (uint32_t i = 0; i < kNumSamplers; i++) k.samplerMode[i] = kModeDefault;
+        DefaultFFStages(k.ffStage);
+
+        uint32_t enabled = cpe >= 0 ? (k.rs[cpe] & 0x3Fu) : 0u;
+        uint32_t n = 0;
+        for (; enabled; enabled &= enabled - 1) n++;
+        k.clipPlaneCount = (uint8_t)n;
+    }
+
     // One recorded key. `why` names the first bad field.
     inline bool CheckKey(const KeyRecord& k, std::string& why)
     {
@@ -319,6 +361,29 @@ namespace d3d9cache
             if (!f) continue;
             if (s == 0 || !(f & D3DSTREAMSOURCE_INSTANCEDATA) || (f & 0x7F800000u) || !(f & 0x7FFFFFu))
                 return fail("stream %u frequency 0x%x is not instance data", s, f);
+        }
+        // The v3 specialisation block. The replay feeds every one of these straight
+        // back into the device, so a value D3D9 would refuse has to be caught here
+        // rather than turned into a failing Set* call per draw.
+        if (k.clipPlaneCount > 6)
+            return fail("clip plane count %u is above D3D9's six", (uint32_t)k.clipPlaneCount);
+        for (uint32_t i = 0; i < kNumSamplers; i++)
+            if (k.samplerMode[i] > kModeDrefClamp)
+                return fail("sampler %u mode %u out of range", i, (uint32_t)k.samplerMode[i]);
+        for (uint32_t s = 0; s < kFFStages; s++)
+        {
+            const FFStage& f = k.ffStage[s];
+            if (f.colorOp < D3DTOP_DISABLE || f.colorOp > D3DTOP_LERP)
+                return fail("stage %u colour op %u is not a D3DTEXTUREOP", s, (uint32_t)f.colorOp);
+            if (f.alphaOp < D3DTOP_DISABLE || f.alphaOp > D3DTOP_LERP)
+                return fail("stage %u alpha op %u is not a D3DTEXTUREOP", s, (uint32_t)f.alphaOp);
+            // D3DTA_*: a selector in the low 4 bits plus COMPLEMENT / ALPHAREPLICATE.
+            const uint8_t argBits = D3DTA_SELECTMASK | D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE;
+            if (f.resultArg & ~(uint8_t)D3DTA_SELECTMASK)
+                return fail("stage %u result arg 0x%x is not a selector", s, (uint32_t)f.resultArg);
+            for (uint32_t a = 0; a < 3; a++)
+                if ((f.colorArg[a] & ~argBits) || (f.alphaArg[a] & ~argBits))
+                    return fail("stage %u argument %u has undefined D3DTA bits", s, a);
         }
         return true;
     }
@@ -526,7 +591,9 @@ namespace d3d9cache
         // Keys, widened from v1 if need be.
         {
             const CacheSection& s = *found[kSecKeys];
-            const size_t rec = h.version == 1 ? kRecordV1 : sizeof(KeyRecord);
+            const size_t rec = h.version == 1 ? kRecordV1
+                             : h.version == 2 ? kRecordV2
+                                              : sizeof(KeyRecord);
             if ((uint64_t)s.count * rec != s.size)
                 return reject(Verdict::Rejected, "key count " + std::to_string(s.count) + " does not match its section's " +
                                                  std::to_string(s.size) + " bytes");
@@ -535,10 +602,17 @@ namespace d3d9cache
             {
                 const uint8_t* p = data + s.offset + (size_t)i * rec;
                 KeyRecord k{};
-                if (h.version == 1)
+                if (h.version < 3)
                 {
-                    memcpy(&k, p, offsetof(KeyRecord, streamFreq));
-                    memcpy(&k.count, p + offsetof(KeyRecord, streamFreq), 2 * sizeof(uint32_t));
+                    // streamFreq = 0 ("never seen instanced") for v1; the
+                    // specialisation block gets the values that reproduce what the
+                    // replay drew these keys with BEFORE it existed, so an old file
+                    // is neither misread nor silently re-specialised (see Widen).
+                    const size_t head = h.version == 1 ? offsetof(KeyRecord, streamFreq)
+                                                       : offsetof(KeyRecord, vsBools);
+                    memcpy(&k, p, head);
+                    memcpy(&k.count, p + head, 2 * sizeof(uint32_t));
+                    WidenToV3(k);
                 }
                 else
                 {
@@ -666,7 +740,7 @@ namespace d3d9cache
         const auto& m = c.meta;
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                     "accepted - v%u%s, %zu keys, %zu declarations, %zu shaders; captured on %s / %s / %s, f%u-ms%d, %s",
-                    f.parse.version, f.parse.version == 1 ? " (upgraded in memory)" : "",
+                    f.parse.version, f.parse.version < pipelinekeys::kCacheVersion ? " (upgraded in memory)" : "",
                     c.keys.size(), c.decls.size(), c.shaders.size(),
                     Printable(c.strings[pipelinekeys::kMetaOS]).c_str(),
                     Printable(c.strings[pipelinekeys::kMetaAdapter]).c_str(),

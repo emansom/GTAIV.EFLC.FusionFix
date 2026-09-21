@@ -155,6 +155,16 @@ class ShaderCapture
         pipelinekeys::LogLine("[ShaderCapture] ", buf);
     }
 
+    // Where D3DRS_CLIPPLANEENABLE sits in KeyRecord::rs. Resolved once at load, by
+    // its D3DRENDERSTATETYPE, so reordering kTrackedRS cannot silently shift it.
+    static int RSIndexOf(D3DRENDERSTATETYPE rs)
+    {
+        for (uint32_t i = 0; i < kNumRS; i++)
+            if (kTrackedRS[i].rs == rs) return (int)i;
+        return -1;
+    }
+    static inline const int kRS_ClipPlaneEnable = RSIndexOf(D3DRS_CLIPPLANEENABLE);
+
     static inline uint64_t fnv1a(const void* data, size_t len, uint64_t h = 1469598103934665603ull)
     {
         auto p = static_cast<const uint8_t*>(data);
@@ -250,18 +260,168 @@ class ShaderCapture
         quality = (uint32_t)d.MultiSampleQuality;
     }
 
-    static uint8_t SamplerKind(DWORD stage)
+    // The type AND the mode of one sampler slot.
+    //
+    // The type is the resource type, which is all the v2 key carried. The MODE is
+    // how DXVK samples the slot -- plain, Fetch4 or depth-compare -- and it comes
+    // from the FORMAT of the bound texture plus two sampler states, none of which
+    // the resource type shows. It is its own spec constant (psSamplerModes /
+    // vsSamplerModes), so a slot sampled with Fetch4 is a different pipeline from
+    // the same slot sampled plainly, and the replay could never build the first
+    // kind: it binds ordinary colour textures, and DXVK clears Fetch4 the moment a
+    // texture that cannot do it is bound.
+    //
+    // The rules are dxvk 3.1.1's, from D3D9CommonTexture::DetermineShadowState /
+    // DetermineFetch4Compatibility and D3D9DeviceEx::UpdateActiveFetch4. Note that
+    // INTZ, DF16 and DF24 are explicitly BLACKLISTED from depth compare while still
+    // being Fetch4-capable -- which is the whole of GTA IV's depth sampling, so on
+    // this install the mode that actually occurs is Fetch4, not Dref.
+    static void SamplerSlot(DWORD stage, uint8_t& kind, uint8_t& mode)
     {
+        kind = pipelinekeys::kSamplerNone;
+        mode = pipelinekeys::kModeDefault;
+
         IDirect3DBaseTexture9* tex = nullptr;
-        if (FAILED(dev->GetTexture(stage, &tex)) || !tex) return 0;
-        D3DRESOURCETYPE t = tex->GetType();
-        tex->Release();
-        switch (t)
+        if (FAILED(dev->GetTexture(stage, &tex)) || !tex) return;
+
+        uint32_t fmt = 0;
+        switch (tex->GetType())
         {
-        case D3DRTYPE_TEXTURE:       return 1;
-        case D3DRTYPE_CUBETEXTURE:   return 2;
-        case D3DRTYPE_VOLUMETEXTURE: return 3;
-        default:                     return 0;
+        case D3DRTYPE_TEXTURE:
+        {
+            kind = pipelinekeys::kSampler2D;
+            D3DSURFACE_DESC d{};
+            if (SUCCEEDED(static_cast<IDirect3DTexture9*>(tex)->GetLevelDesc(0, &d))) fmt = (uint32_t)d.Format;
+            break;
+        }
+        case D3DRTYPE_CUBETEXTURE:
+        {
+            kind = pipelinekeys::kSamplerCube;
+            D3DSURFACE_DESC d{};
+            if (SUCCEEDED(static_cast<IDirect3DCubeTexture9*>(tex)->GetLevelDesc(0, &d))) fmt = (uint32_t)d.Format;
+            break;
+        }
+        case D3DRTYPE_VOLUMETEXTURE:
+        {
+            kind = pipelinekeys::kSamplerVolume;
+            D3DVOLUME_DESC d{};
+            if (SUCCEEDED(static_cast<IDirect3DVolumeTexture9*>(tex)->GetLevelDesc(0, &d))) fmt = (uint32_t)d.Format;
+            break;
+        }
+        default: break;
+        }
+        tex->Release();
+        if (kind == pipelinekeys::kSamplerNone) return;
+
+        // Depth compare wins over Fetch4 (D3D9SpecData::updateSamplers clears the
+        // Fetch4 bit wherever the depth bit is set).
+        if (d3d9cache::IsDepthFormat(fmt) && !d3d9cache::IsFourCC(fmt, "INTZ") &&
+            !d3d9cache::IsFourCC(fmt, "DF16") && !d3d9cache::IsFourCC(fmt, "DF24"))
+        {
+            // Dref or DrefClamp: which one depends on whether DXVK had to emulate
+            // the format with D32F, which is not observable through D3D9. Recorded
+            // as Dref; the replay binds a depth texture and lets DXVK decide, which
+            // is the same call the game's own texture got.
+            mode = pipelinekeys::kModeDref;
+            return;
+        }
+
+        // Fetch4 needs all three: the app asked for it on this sampler, the filter
+        // is POINT, and the format is one of DXVK's single-channel set.
+        static const uint32_t kFetch4Formats[] = {
+            MAKEFOURCC('I','N','T','Z'), MAKEFOURCC('D','F','1','6'), MAKEFOURCC('D','F','2','4'),
+            111 /*R16F*/, 114 /*R32F*/, 28 /*A8*/, 50 /*L8*/, 81 /*L16*/,
+        };
+        bool single = false;
+        for (uint32_t f : kFetch4Formats) single |= (fmt == f);
+        if (!single) return;
+
+        DWORD bias = 0, mag = 0;
+        if (FAILED(dev->GetSamplerState(stage, D3DSAMP_MIPMAPLODBIAS, &bias)) || bias != MAKEFOURCC('G','E','T','4'))
+            return;
+        if (FAILED(dev->GetSamplerState(stage, D3DSAMP_MAGFILTER, &mag)) || mag != D3DTEXF_POINT)
+            return;
+        mode = pipelinekeys::kModeFetch4;
+    }
+
+    // The rest of D3D9SpecData's device inputs: the b# registers, DXVK's clip-plane
+    // COUNT, the projected-texture mask and the fixed-function stage block.
+    //
+    // These are the fields the v2 key left to ambient state, and leaving them there
+    // is what made the same replay build 786 pipelines at one gate and 735 at
+    // another (harness state/2026-09-21-linux-boot-gate-control.md). Read back from
+    // the device like everything else here rather than shadowed from Set* hooks: a
+    // state block Apply would drift a shadow, and a wrong key is the failure this
+    // whole approach exists to escape.
+    static void RecordSpecState(KeyRecord& k)
+    {
+        BOOL b[16] = {};
+        if (SUCCEEDED(dev->GetVertexShaderConstantB(0, b, 16)))
+            for (int i = 0; i < 16; i++) if (b[i]) k.vsBools |= (uint16_t)(1u << i);
+        memset(b, 0, sizeof(b));
+        if (SUCCEEDED(dev->GetPixelShaderConstantB(0, b, 16)))
+            for (int i = 0; i < 16; i++) if (b[i]) k.psBools |= (uint16_t)(1u << i);
+
+        // DXVK keeps the planes that are enabled AND not all-zero, and it is the
+        // COUNT of those -- not which ones -- that reaches the spec constant.
+        const uint32_t enabled = kRS_ClipPlaneEnable >= 0 ? ((uint32_t)k.rs[kRS_ClipPlaneEnable] & 0x3Fu) : 0u;
+        if (enabled)
+        {
+            for (uint32_t i = 0; i < 6; i++)
+            {
+                if (!(enabled & (1u << i))) continue;
+                float p[4] = {};
+                if (SUCCEEDED(dev->GetClipPlane(i, p)) && (p[0] || p[1] || p[2] || p[3]))
+                    k.clipPlaneCount++;
+            }
+        }
+
+        // The projected bit of each texture stage. Not fixed-function-only: every
+        // pixel shader that samples declares the spec constant this lives in.
+        for (DWORD s = 0; s < pipelinekeys::kFFStages; s++)
+        {
+            DWORD v = 0;
+            if (SUCCEEDED(dev->GetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, &v)) && (v & D3DTTFF_PROJECTED))
+                k.projMask |= (uint8_t)(1u << s);
+        }
+
+        // The stage ops and arguments, which only a pipeline with NO pixel shader
+        // specialises on -- a programmable shader never declares those spec
+        // constants. 1180 of this rig's 14,543 recorded keys are such draws, so it
+        // is worth the reads, but only for them. DXVK stops at the first disabled
+        // stage and so do we; the rest are left disabled, which is what it derives
+        // for them anyway.
+        pipelinekeys::DefaultFFStages(k.ffStage);
+        if (!k.psHash)
+        {
+            for (DWORD s = 0; s < pipelinekeys::kFFStages; s++)
+            {
+                DWORD v = 0;
+                auto get = [&](D3DTEXTURESTAGESTATETYPE t, uint8_t& dst) {
+                    if (SUCCEEDED(dev->GetTextureStageState(s, t, &v))) dst = (uint8_t)v;
+                };
+                pipelinekeys::FFStage& f = k.ffStage[s];
+                get(D3DTSS_COLOROP, f.colorOp);
+                if (f.colorOp == D3DTOP_DISABLE)
+                {
+                    // Everything from here on is disabled whatever it says.
+                    for (DWORD r = s; r < pipelinekeys::kFFStages; r++)
+                    {
+                        k.ffStage[r] = pipelinekeys::FFStage{};
+                        k.ffStage[r].colorOp = (uint8_t)D3DTOP_DISABLE;
+                        k.ffStage[r].alphaOp = (uint8_t)D3DTOP_DISABLE;
+                    }
+                    break;
+                }
+                get(D3DTSS_ALPHAOP, f.alphaOp);
+                get(D3DTSS_RESULTARG, f.resultArg);
+                get(D3DTSS_COLORARG0, f.colorArg[0]);
+                get(D3DTSS_COLORARG1, f.colorArg[1]);
+                get(D3DTSS_COLORARG2, f.colorArg[2]);
+                get(D3DTSS_ALPHAARG0, f.alphaArg[0]);
+                get(D3DTSS_ALPHAARG1, f.alphaArg[1]);
+                get(D3DTSS_ALPHAARG2, f.alphaArg[2]);
+            }
         }
     }
 
@@ -347,9 +507,16 @@ class ShaderCapture
         }
 
         for (uint32_t i = 0; i < kPSSamplers; i++)
-            k.samplerType[i] = SamplerKind(i);
+            SamplerSlot(i, k.samplerType[i], k.samplerMode[i]);
         for (uint32_t i = 0; i < kVSSamplers; i++)
-            k.samplerType[kPSSamplers + i] = SamplerKind(D3DVERTEXTEXTURESAMPLER0 + i);
+            SamplerSlot(D3DVERTEXTEXTURESAMPLER0 + i, k.samplerType[kPSSamplers + i], k.samplerMode[kPSSamplers + i]);
+        // DXVK only ever asks for Fetch4 on a PIXEL sampler, and only while a
+        // programmable pixel shader is bound (d3d9_device.cpp:7469).
+        for (uint32_t i = 0; i < kNumSamplers; i++)
+            if (k.samplerMode[i] == kModeFetch4 && (i >= kPSSamplers || !k.psHash))
+                k.samplerMode[i] = kModeDefault;
+
+        RecordSpecState(k);
 
         // Hash everything except the bookkeeping tail.
         uint64_t h = fnv1a(&k, offsetof(KeyRecord, count));

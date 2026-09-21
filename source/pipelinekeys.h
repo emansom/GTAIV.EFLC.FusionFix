@@ -40,6 +40,60 @@ namespace pipelinekeys
     // Sampler kinds stored in KeyRecord::samplerType.
     enum SamplerKind : uint8_t { kSamplerNone = 0, kSampler2D = 1, kSamplerCube = 2, kSamplerVolume = 3 };
 
+    // How DXVK samples a slot, stored in KeyRecord::samplerMode. Same encoding as
+    // dxvk 3.1.1's D3D9SamplerMode (d3d9_state.h), which is what lands in the
+    // psSamplerModes / vsSamplerModes spec constants -- a different mode is a
+    // different pipeline. Which one a slot gets is NOT a function of the texture's
+    // resource type: it comes from the FORMAT of the texture bound there plus the
+    // sampler state, neither of which the v2 key carried.
+    //   Fetch4    D3DSAMP_MIPMAPLODBIAS == 'GET4' and MAGFILTER == POINT and the
+    //             format is one of DXVK's single-channel set (INTZ, DF16, DF24,
+    //             R16F, R32F, A8, L8, L16)
+    //   Dref      the format is a depth format DXVK depth-compares; INTZ, DF16 and
+    //             DF24 are explicitly BLACKLISTED from this
+    //   DrefClamp Dref on a format DXVK had to emulate with D32F
+    enum SamplerMode : uint8_t { kModeDefault = 0, kModeFetch4 = 1, kModeDref = 2, kModeDrefClamp = 3 };
+
+    // One fixed-function texture stage, as DXVK reads it for D3D9SpecData's
+    // stageOps/stageArgs (spec IDs 8..19). Only pipelines with NO pixel shader use
+    // these -- a programmable shader never declares those spec constants, so DXVK
+    // zeroes them and they split nothing. Recorded raw rather than pre-packed: DXVK
+    // derives the packed form from the raw values together with the bound textures
+    // and the render target, and the replay rebuilds all three, so letting DXVK do
+    // the packing is the only way the two can never disagree.
+#pragma pack(push, 1)
+    struct FFStage
+    {
+        uint8_t colorOp;        // D3DTSS_COLOROP
+        uint8_t alphaOp;        // D3DTSS_ALPHAOP
+        uint8_t resultArg;      // D3DTSS_RESULTARG
+        uint8_t colorArg[3];    // D3DTSS_COLORARG0, 1, 2
+        uint8_t alphaArg[3];    // D3DTSS_ALPHAARG0, 1, 2
+    };
+#pragma pack(pop)
+    constexpr uint32_t kFFStages = 8;   // caps::TextureStageCount
+
+    // D3D9's own defaults for the texture stages, which is what a device that has
+    // never been told otherwise holds. Used for keys from a pre-v3 file: those
+    // predate the field, and the default block is both the likeliest truth for a
+    // shader-only engine and exactly what the replay used to draw them with, so an
+    // old file keeps producing the pipelines it always did.
+    inline void DefaultFFStages(FFStage* out)
+    {
+        for (uint32_t s = 0; s < kFFStages; s++)
+        {
+            out[s].colorOp   = (uint8_t)(s == 0 ? D3DTOP_MODULATE : D3DTOP_DISABLE);
+            out[s].alphaOp   = (uint8_t)(s == 0 ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE);
+            out[s].resultArg = (uint8_t)D3DTA_CURRENT;
+            out[s].colorArg[0] = (uint8_t)D3DTA_CURRENT;
+            out[s].colorArg[1] = (uint8_t)D3DTA_TEXTURE;
+            out[s].colorArg[2] = (uint8_t)D3DTA_CURRENT;
+            out[s].alphaArg[0] = (uint8_t)D3DTA_CURRENT;
+            out[s].alphaArg[1] = (uint8_t)D3DTA_TEXTURE;
+            out[s].alphaArg[2] = (uint8_t)D3DTA_CURRENT;
+        }
+    }
+
     // The render states we record. `pipeline` marks the ones that (as far as we can
     // tell from DXVK's d3d9 backend) are baked into the Vulkan pipeline rather than
     // set dynamically. Everything is recorded either way — the flag splits the two
@@ -129,6 +183,23 @@ namespace pipelinekeys
         uint32_t rs[kNumRS];                // values of kTrackedRS, in order
         uint8_t  samplerType[kNumSamplers]; // SamplerKind per sampler
         uint32_t streamFreq[kMaxStreams];   // InstanceFreq() per stream the declaration uses (v2+)
+        // ---- v3: the rest of what DXVK specialises a D3D9 pipeline on ---------
+        // Everything below is DEVICE state at the draw that v2 left to whatever
+        // the last thing to touch the device happened to leave behind. It all
+        // enters DxvkGraphicsPipelineStateInfo::sc through D3D9SpecData, so with
+        // pipeline libraries off -- this rig -- each one costs a real compile.
+        uint16_t vsBools;                   // b0..b15, vertex stage   (spec ID 3)
+        uint16_t psBools;                   // b0..b15, pixel stage    (spec ID 6)
+        // The number of clip planes DXVK counts, which is NOT the enable mask: it
+        // walks the six planes and keeps those that are enabled AND whose
+        // coefficients are not all zero (d3d9_device.cpp, UpdateClipPlanes). The
+        // plane VALUES are therefore part of the key, and nothing recorded them.
+        uint8_t  clipPlaneCount;            //                         (spec ID 0)
+        // D3DTTFF_PROJECTED per texture stage 0..7. Every pixel shader that
+        // samples a texture declares spec ID 2, so this is not fixed-function-only.
+        uint8_t  projMask;                  //                         (spec ID 2)
+        uint8_t  samplerMode[kNumSamplers]; // SamplerMode per slot    (spec IDs 3-5)
+        FFStage  ffStage[kFFStages];        // no pixel shader only    (spec IDs 8-19)
         uint32_t count;                     // how many draws hit this key
         uint32_t firstFrame;                // frame ordinal of first sighting
     };
@@ -657,7 +728,10 @@ namespace pipelinekeys
     //
     //   v1  first single-file container
     //   v2  KeyRecord::streamFreq -- instanced streams are a different pipeline
-    constexpr uint32_t kCacheVersion = 2;
+    //   v3  KeyRecord gains the rest of D3D9SpecData's device inputs: the b#
+    //       registers per stage, DXVK's clip-plane COUNT, the projected-texture
+    //       mask, the per-slot sampler mode and the fixed-function stage state
+    constexpr uint32_t kCacheVersion = 3;
 
     enum CacheSectionId : uint32_t
     {

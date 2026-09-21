@@ -141,6 +141,14 @@ struct PrecompileConfig
     bool    emitLog       = false;  // PrecompileEmitLog: write every emitted identity for the scorer
     int     sliceMs       = 8;      // PrecompileSliceMs: warm work per loading-screen frame
     int     gateMaxSeconds = 0;     // PrecompileGateMaxSeconds: 0 = hold until the pass is done
+    // Where the pass runs. 1 = the boot gate at rageBoot_InitSession, which is
+    // the only place the engine walk has its render phases; 0 = the old
+    // loading-screen gate, one blocking call on the first loading screen, which
+    // is also what a build the boot gate cannot be armed on falls back to.
+    // Kept selectable because it is the control arm for any measurement of the
+    // gate, and the 2026-09-21 comparison had to be made with two BINARIES for
+    // want of it -- which is one more variable than the question needed.
+    bool    bootGate      = true;   // PrecompileBootGate
     bool    reuseStamp    = true;   // PrecompileReuseWarmCache
     int     reflectionMsaa = 0;     // EXPERIMENTAL/ReflectionMSAAQuality, read for the sample count
     // The engine walk (enginewarm.h). 0 = off, 1 = the tied coordinate, 2 = the
@@ -186,6 +194,14 @@ struct ShaderIO
     // land in KeyRecord::samplerType[16..19].
     uint8_t samplerDim[16] = {};
     bool    usesSampler[16] = {};
+    // Which b# registers the shader READS, exactly as DXVK's own analysis builds
+    // D3D9ShaderConstantsInfo::boolMask (d3d9_shader_analysis.cpp:127): every
+    // source operand whose register type is CONSTBOOL. The device masks its 16
+    // bool constants with this before they reach the spec constant, so two draws
+    // that differ only in a b# the bound shader never reads are ONE pipeline.
+    // Without the mask the recorded b# would split the key space for nothing.
+    uint32_t boolMask = 0;
+    bool     boolMaskValid = false;   // false: the walk could not be trusted (see below)
 };
 
 static void ParseShaderIO(const uint8_t* bytecode, uint32_t size, bool isVS, ShaderIO& out)
@@ -206,6 +222,7 @@ static void ParseShaderIO(const uint8_t* bytecode, uint32_t size, bool isVS, Sha
     // applied to. So: no version, no mask.
     const uint32_t major = (dw[0] >> 8) & 0xFF;
     if (major < 2) return;
+    out.boolMaskValid = true;   // the walk is trustworthy from SM2 on
     uint32_t i = 1; // skip version token
     while (i < n)
     {
@@ -234,6 +251,32 @@ static void ParseShaderIO(const uint8_t* bytecode, uint32_t size, bool isVS, Sha
             }
             i += 3;                              // dcl is always 2 operand dwords in SM3
             continue;
+        }
+        // def / defi / defb carry raw float, int and bool DATA in their operand
+        // dwords, not register tokens, so they are stepped over whole: scanning
+        // them for register types would invent b# references out of constants.
+        if (op == 0x0051 || op == 0x0052 || op == 0x0053)
+        {
+            i += 1 + ((tok >> 24) & 0xF);
+            continue;
+        }
+        // Every other instruction's operands ARE register tokens, and any of them
+        // naming CONSTBOOL is a b# the shader reads. Scanning all of an
+        // instruction's operands rather than decoding which position is the source
+        // costs a false positive at worst (the destination can never be CONSTBOOL,
+        // so there are none in practice) -- and a false positive only SPLITS a key,
+        // which wastes a duplicate draw, while a miss MERGES two pipelines into one
+        // and stutters.
+        {
+            const uint32_t len = (tok >> 24) & 0xF;
+            for (uint32_t a = 1; a <= len && i + a < n; a++)
+            {
+                const uint32_t p = dw[i + a];
+                if (!(p & 0x80000000u)) continue;       // not a parameter token
+                if ((((p >> 28) & 0x7u) | ((p >> 8) & 0x18u)) != 14u) continue;   // D3DSPR_CONSTBOOL
+                const uint32_t reg = p & 0x7FFu;
+                if (reg < 16) out.boolMask |= 1u << reg;
+            }
         }
         // The instruction-length field (bits 24..27) is authoritative from SM2 on,
         // and it is legitimately 0 for the zero-operand instructions -- ELSE, ENDIF,
@@ -440,6 +483,18 @@ class ShaderPrecompiler
     static inline IDirect3DTexture9*       tex2D  = nullptr;
     static inline IDirect3DCubeTexture9*   texCube = nullptr;
     static inline IDirect3DVolumeTexture9* texVol = nullptr;
+    // Two more, for the sampler MODES (KeyRecord::samplerMode). A slot DXVK samples
+    // with Fetch4 or with depth compare is a different pipeline, and neither mode
+    // can be reached with an ordinary A8R8G8B8 texture: DXVK derives both from the
+    // bound texture's FORMAT (DetermineFetch4Compatibility / DetermineShadowState),
+    // so the replay has to bind a texture of a format that qualifies.
+    //   texFetch4  R32F, one of DXVK's single-channel set; with
+    //              D3DSAMP_MIPMAPLODBIAS = 'GET4' and MAGFILTER = POINT it is the
+    //              whole of what UpdateActiveFetch4 asks for.
+    //   texShadow  D24S8, a depth format that is NOT on the INTZ/DF16/DF24
+    //              blacklist, so DXVK depth-compares it.
+    static inline IDirect3DTexture9*       texFetch4 = nullptr;
+    static inline IDirect3DTexture9*       texShadow = nullptr;
 
     // one scratch RT surface per color format we might need
     struct ScratchRT { D3DFORMAT fmt; IDirect3DSurface9* surf; };
@@ -572,6 +627,13 @@ class ShaderPrecompiler
         uint32_t fogEnable = 0, fogVertex = 0, fogTable = 0, fogRange = 0;
         uint32_t pointSprite = 0, pointScale = 0, specular = 0;
         uint32_t alphaTest = 0, alphaFunc = 0, clipPlanes = 0, srgbWrite = 0, shadeMode = 0;
+        // The clip-plane COEFFICIENTS, which is what DXVK actually counts -- an
+        // enabled plane that is all zero does not reach the spec constant. This is
+        // the field the first ambient reading did not have, and it is where the
+        // 786-vs-735 difference turned out to live: the loading screen's D3DSBT_ALL
+        // block puts the engine's (zero) planes back between slices.
+        uint32_t planeNonZero = 0;                  // bit per plane with a non-zero coefficient
+        uint32_t planeCount = 0;                    // what DXVK would count, given clipPlanes
         bool     readable = false;                  // false: a pure device refused Get*
     };
 
@@ -611,6 +673,14 @@ class ShaderPrecompiler
         a.clipPlanes  = rs(D3DRS_CLIPPLANEENABLE);
         a.srgbWrite   = rs(D3DRS_SRGBWRITEENABLE);
         a.shadeMode   = rs(D3DRS_SHADEMODE);
+        for (DWORD i = 0; i < 6; i++)
+        {
+            float p[4] = {};
+            if (FAILED(d->GetClipPlane(i, p))) continue;
+            if (!(p[0] || p[1] || p[2] || p[3])) continue;
+            a.planeNonZero |= 1u << i;
+            if (a.clipPlanes & (1u << i)) a.planeCount++;
+        }
         return a;
     }
 
@@ -630,10 +700,11 @@ class ShaderPrecompiler
                     a.colorOp[2], a.alphaOp[2], a.colorOp[3], a.alphaOp[3]);
         Log("ambient spec %s: vsBools 0x%04X psBools 0x%04X, texture transform flags %s, "
             "stage ops (colour/alpha, 0-3) %s, fog %u (v%u t%u r%u), point sprite %u scale %u, "
-            "specular %u, alpha test %u func %u, clip planes 0x%X, sRGB write %u, shade %u",
+            "specular %u, alpha test %u func %u, clip planes enabled 0x%X non-zero 0x%X "
+            "-> DXVK would count %u, sRGB write %u, shade %u",
             where, a.vsBools, a.psBools, t, c, a.fogEnable, a.fogVertex, a.fogTable, a.fogRange,
             a.pointSprite, a.pointScale, a.specular, a.alphaTest, a.alphaFunc,
-            a.clipPlanes, a.srgbWrite, a.shadeMode);
+            a.clipPlanes, a.planeNonZero, a.planeCount, a.srgbWrite, a.shadeMode);
     }
 
     // The b# the GAME's device is carrying when the gate opens. The walk pins
@@ -967,6 +1038,12 @@ class ShaderPrecompiler
         dev->CreateTexture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex2D, nullptr);
         dev->CreateCubeTexture(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &texCube, nullptr);
         dev->CreateVolumeTexture(4, 4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &texVol, nullptr);
+        // ...and the two the sampler MODES need. Either may legitimately fail to be
+        // created here (a device or driver that does not take the format); the
+        // replay then falls back to the plain texture, which warms the default-mode
+        // pipeline instead of the mode the key asked for, and says so once.
+        dev->CreateTexture(4, 4, 1, 0, D3DFMT_R32F, D3DPOOL_MANAGED, &texFetch4, nullptr);
+        dev->CreateTexture(4, 4, 1, D3DUSAGE_DEPTHSTENCIL, D3DFMT_D24S8, D3DPOOL_DEFAULT, &texShadow, nullptr);
 
         // Six non-degenerate user clip planes.
         //
@@ -980,6 +1057,18 @@ class ShaderPrecompiler
         // 14543 keys and 4.75 M draws carry a clip plane. The state block the
         // pass takes is D3DSBT_ALL, which covers clip planes, so these are put
         // back with everything else.
+        //
+        // SETTING THEM ONCE HERE IS NOT ENOUGH, and that is the bug this round
+        // exists to fix. At the boot gate the pass runs in 8 ms slices and the
+        // loading screen's own D3DSBT_ALL block is applied between every one of
+        // them -- clip planes included -- so from the second slice onward every
+        // clip-plane key was building a clipPlaneCount = 0 pipeline, i.e. the same
+        // pipeline as its no-clip sibling. That is the 786-at-one-gate,
+        // 735-at-the-other difference: collapsing this one axis costs 61 of the
+        // replay's 1093 identities, measured offline against these same two cache
+        // files. ApplySpecState now sets the planes PER DRAW from the key, and
+        // re-applies after every slice boundary. This block stays because the
+        // synthetic coverage pass draws before the first recorded key does.
         for (DWORD i = 0; i < 6; i++)
         {
             const float plane[4] = { 0.0f, 0.0f, 1.0f, (float)(i + 1) };
@@ -1717,6 +1806,14 @@ class ShaderPrecompiler
     // 1098, with the 602 base identities unchanged: ~1330 duplicate draws.
     static inline std::unordered_map<uint64_t, std::array<bool, pipelinekeys::kVSSamplers>> vsSamplerUse;
 
+    // And the b# registers each shader reads, under the same hash. DXVK masks the
+    // device's 16 bool constants with this before they become a spec constant
+    // (d3d9_device.cpp:7443, 7459), so this is what keeps the recorded b# from
+    // splitting keys on registers nothing looks at. An absent entry means the
+    // bytecode was never seen or could not be walked: the key then keeps the raw
+    // b#, which over-counts rather than under-warms, exactly as the sampler masks do.
+    static inline std::unordered_map<uint64_t, uint32_t> shaderBoolMask;
+
     // Record a shader's declared sampler slots under its bytecode hash, from whichever
     // source resolved it first. One helper so the five call sites (the .fxc database,
     // the engine's own programs, the runtime registry, the cache's bytecode and our own
@@ -1724,6 +1821,7 @@ class ShaderPrecompiler
     static void NoteSamplerUse(uint64_t hash, bool isVS, const ShaderIO& io)
     {
         if (!hash) return;
+        if (io.boolMaskValid) shaderBoolMask.emplace(hash, io.boolMask);
         if (isVS)
         {
             if (vsSamplerUse.count(hash)) return;
@@ -1753,6 +1851,11 @@ class ShaderPrecompiler
     static inline const int kRS_AlphaFunc       = RSIndexOf(D3DRS_ALPHAFUNC);
     static inline const int kRS_FogEnable       = RSIndexOf(D3DRS_FOGENABLE);
     static inline const int kRS_ClipPlanes      = RSIndexOf(D3DRS_CLIPPLANEENABLE);
+    static inline const int kRS_FogVertexMode   = RSIndexOf(D3DRS_FOGVERTEXMODE);
+    static inline const int kRS_FogTableMode    = RSIndexOf(D3DRS_FOGTABLEMODE);
+    static inline const int kRS_PointSprite     = RSIndexOf(D3DRS_POINTSPRITEENABLE);
+    static inline const int kRS_PointScale      = RSIndexOf(D3DRS_POINTSCALEENABLE);
+    static inline const int kRS_SpecularEnable  = RSIndexOf(D3DRS_SPECULARENABLE);
     static inline const int kRS_BlendEnable     = RSIndexOf(D3DRS_ALPHABLENDENABLE);
     static inline const int kRS_SeparateAlpha   = RSIndexOf(D3DRS_SEPARATEALPHABLENDENABLE);
     static inline const int kRS_ColorBlend[3]   = { RSIndexOf(D3DRS_SRCBLEND), RSIndexOf(D3DRS_DESTBLEND),
@@ -1837,6 +1940,14 @@ class ShaderPrecompiler
     // or fixed-function configuration these shader-based draws never run.
     // maskVS = false reproduces the key as it was before vertex sampler slots were
     // masked, which is only used to measure what the mask is worth on this install.
+    //
+    // 2026-09-21: the four fields this started with were not all of D3D9SpecData,
+    // and the rest -- the b# registers, the clip-plane COUNT, the projected mask,
+    // the sampler MODES and the fixed-function stage block -- were left to whatever
+    // the device happened to be holding. That is what let the same 1093 draws build
+    // 786 pipelines at one gate and 735 at another. They are in the key now, each
+    // masked the way DXVK masks it, so a field a shader never looks at still splits
+    // nothing.
     static uint64_t ReplayPipelineKey(const pipelinekeys::KeyRecord& k, bool maskVS = true)
     {
         struct Reduced
@@ -1844,6 +1955,17 @@ class ShaderPrecompiler
             uint64_t base;
             uint32_t alphaEnable, alphaFunc, fogEnable, clipPlanes;
             uint8_t  samplerType[pipelinekeys::kNumSamplers];
+            // spec ID 1, the rest of the fog dword. Only reached when fog is on,
+            // because DXVK forces both modes to D3DFOG_NONE when it is not.
+            uint32_t fogVertex, fogPixel;
+            // spec ID 0 / 2: point mode is only evaluated for a POINTLIST draw,
+            // and enablePointScale additionally needs a fixed-function vertex path.
+            uint32_t pointSprite, pointScale;
+            uint32_t specular;                 // spec ID 2, enableGlobalSpecular
+            uint8_t  projMask;                 // spec ID 2, masked to the used slots
+            uint16_t vsBools, psBools;         // spec IDs 3 / 6, masked per shader
+            uint8_t  samplerMode[pipelinekeys::kNumSamplers];
+            pipelinekeys::FFStage ffStage[pipelinekeys::kFFStages];
         } r;
         memset(&r, 0, sizeof(r));
 
@@ -1851,7 +1973,38 @@ class ShaderPrecompiler
         r.alphaEnable = RSOr0(k, kRS_AlphaTestEnable);
         r.alphaFunc   = RSOr0(k, kRS_AlphaFunc);
         r.fogEnable   = RSOr0(k, kRS_FogEnable);
-        r.clipPlanes  = RSOr0(k, kRS_ClipPlanes) & 0x3Fu;
+        // The clip-plane COUNT is what DXVK specialises on, not the enable mask:
+        // a plane that is enabled but zero does not count. Keying on the mask both
+        // split keys that are one pipeline and merged keys that are two.
+        r.clipPlanes  = k.clipPlaneCount;
+
+        if (r.fogEnable)
+        {
+            r.fogVertex = RSOr0(k, kRS_FogVertexMode);
+            r.fogPixel  = RSOr0(k, kRS_FogTableMode);
+        }
+        if (k.primType == D3DPT_POINTLIST)
+        {
+            r.pointSprite = RSOr0(k, kRS_PointSprite) != 0;
+            r.pointScale  = (!k.vsHash && RSOr0(k, kRS_PointScale)) ? 1u : 0u;
+        }
+        r.specular = RSOr0(k, kRS_SpecularEnable) != 0;
+
+        // The stage ops only reach a pipeline with no pixel shader; a programmable
+        // one never declares those spec constants, so DXVK zeroes them.
+        if (!k.psHash)
+            memcpy(r.ffStage, k.ffStage, sizeof(r.ffStage));
+
+        // b#, masked to the registers each stage's shader actually reads.
+        {
+            auto masked = [](uint64_t hash, uint16_t bits) -> uint16_t {
+                if (!hash) return 0;
+                auto it = shaderBoolMask.find(hash);
+                return it == shaderBoolMask.end() ? bits : (uint16_t)(bits & it->second);
+            };
+            r.vsBools = masked(k.vsHash, k.vsBools);
+            r.psBools = masked(k.psHash, k.psBools);
+        }
 
         // Mask each stage's sampler slots to the ones that stage's shader declares:
         // an undeclared slot is in DXVK's nullOrUnusedMask however the device state
@@ -1861,14 +2014,28 @@ class ShaderPrecompiler
         const std::array<bool, 16>* use = nullptr;
         if (auto it = psSamplerUse.find(k.psHash); it != psSamplerUse.end()) use = &it->second;
         for (uint32_t i = 0; i < pipelinekeys::kPSSamplers; i++)
-            r.samplerType[i] = (!use || (*use)[i]) ? k.samplerType[i] : 0;
+        {
+            const bool used = (!use || (*use)[i]);
+            r.samplerType[i] = used ? k.samplerType[i] : 0;
+            // The MODE rides the same mask -- DXVK clears it for null or unused
+            // slots (D3D9SpecData::updateSamplers: `newModes & ~nullTypes`).
+            r.samplerMode[i] = (used && k.samplerType[i]) ? k.samplerMode[i] : 0;
+            // samplerProjMask is `projected & bound & declared`, and the shader
+            // only consults it for stages 0..7.
+            if (i < pipelinekeys::kFFStages && used && k.samplerType[i] && (k.projMask & (1u << i)))
+                r.projMask |= (uint8_t)(1u << i);
+        }
 
         const std::array<bool, pipelinekeys::kVSSamplers>* vuse = nullptr;
         if (maskVS)
             if (auto it = vsSamplerUse.find(k.vsHash); it != vsSamplerUse.end()) vuse = &it->second;
         for (uint32_t i = 0; i < pipelinekeys::kVSSamplers; i++)
-            r.samplerType[pipelinekeys::kPSSamplers + i] =
-                (!vuse || (*vuse)[i]) ? k.samplerType[pipelinekeys::kPSSamplers + i] : 0;
+        {
+            const uint32_t slot = pipelinekeys::kPSSamplers + i;
+            const bool used = (!vuse || (*vuse)[i]);
+            r.samplerType[slot] = used ? k.samplerType[slot] : 0;
+            r.samplerMode[slot] = (used && k.samplerType[slot]) ? k.samplerMode[slot] : 0;
+        }
 
         return pipelinekeys::Fnv1a(&r, sizeof(r));
     }
@@ -2783,6 +2950,153 @@ class ShaderPrecompiler
         }
     }
 
+    // ===================================================================
+    //  THE SPECIALISATION HALF OF A KEY, PUT BACK ON THE DEVICE
+    //
+    //  Everything below is device state DXVK folds into D3D9SpecData and
+    //  therefore into DxvkGraphicsPipelineStateInfo::sc. With pipeline
+    //  libraries off -- this rig -- each distinct value is its own compile,
+    //  so a replay that leaves any of it to whatever the device happens to be
+    //  holding builds a DIFFERENT set of pipelines depending on where it runs.
+    //  That is exactly what the boot-gate move exposed, and it is not a gate
+    //  bug: the gate only made an already-wrong key visible.
+    //
+    //  The cache is invalidated whenever the slice driver hands the device back
+    //  to the loading screen, because RestoreEngineState applies a D3DSBT_ALL
+    //  block that takes every one of these with it.
+    // ===================================================================
+    static inline uint32_t specEpoch = 0xFFFFFFFFu;
+    static inline uint32_t specVsBools = 0xFFFFFFFFu, specPsBools = 0xFFFFFFFFu;
+    static inline uint32_t specClipCount = 0xFFFFFFFFu, specClipMask = 0xFFFFFFFFu;
+    static inline uint32_t specProjMask = 0xFFFFFFFFu;
+    static inline uint32_t specFetch4Slots = 0;       // slots left in the Fetch4 sampler state
+    static inline bool     specFetch4Valid = false;
+    static inline bool     specFFValid = false;
+    static inline pipelinekeys::FFStage specFF[pipelinekeys::kFFStages];
+    static inline uint32_t specFallbacks = 0;        // modes a missing texture could not reach
+
+    static void InvalidateSpecState()
+    {
+        specEpoch = 0xFFFFFFFFu;
+        specVsBools = specPsBools = 0xFFFFFFFFu;
+        specClipCount = specClipMask = specProjMask = 0xFFFFFFFFu;
+        specFFValid = false;
+        specFetch4Valid = false;
+    }
+
+    // The texture a slot needs for the mode the key recorded. Falls back to the
+    // plain one when the device would not give us the format, which warms the
+    // default-mode pipeline rather than nothing.
+    static IDirect3DBaseTexture9* TexForSlot(uint8_t kind, uint8_t mode)
+    {
+        using namespace pipelinekeys;
+        if (kind == kSamplerNone) return nullptr;
+        if (mode == kModeFetch4 && texFetch4) return texFetch4;
+        if ((mode == kModeDref || mode == kModeDrefClamp) && texShadow) return texShadow;
+        if (mode != kModeDefault) specFallbacks++;   // the format was not available
+        switch (kind)
+        {
+        case kSampler2D:     return tex2D;
+        case kSamplerCube:   return texCube;
+        case kSamplerVolume: return texVol;
+        default:             return nullptr;
+        }
+    }
+
+    static void ApplySpecState(IDirect3DDevice9* d, const pipelinekeys::KeyRecord& k)
+    {
+        using namespace pipelinekeys;
+        if (specEpoch != sliceEpoch) { InvalidateSpecState(); specEpoch = sliceEpoch; }
+
+        if (specVsBools != k.vsBools)
+        {
+            BOOL b[16];
+            for (int i = 0; i < 16; i++) b[i] = (k.vsBools >> i) & 1 ? TRUE : FALSE;
+            d->SetVertexShaderConstantB(0, b, 16);
+            specVsBools = k.vsBools;
+        }
+        if (specPsBools != k.psBools)
+        {
+            BOOL b[16];
+            for (int i = 0; i < 16; i++) b[i] = (k.psBools >> i) & 1 ? TRUE : FALSE;
+            d->SetPixelShaderConstantB(0, b, 16);
+            specPsBools = k.psBools;
+        }
+
+        // Clip planes. The recorded COUNT is what DXVK specialises on; the enable
+        // mask comes from the key's own render states, which the draw loop has
+        // already set. Make exactly `clipPlaneCount` of the ENABLED planes
+        // non-degenerate and zero the rest, which is the one arrangement that
+        // reproduces the count whatever the mask is.
+        const uint32_t clipMask = (uint32_t)RSOr0(k, kRS_ClipPlanes) & 0x3Fu;
+        if (specClipMask != clipMask || specClipCount != k.clipPlaneCount)
+        {
+            uint32_t left = k.clipPlaneCount;
+            for (DWORD i = 0; i < 6; i++)
+            {
+                const bool live = (clipMask & (1u << i)) && left;
+                if (live) left--;
+                const float on[4]  = { 0.0f, 0.0f, 1.0f, (float)(i + 1) };
+                const float off[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                d->SetClipPlane(i, live ? on : off);
+            }
+            specClipMask = clipMask;
+            specClipCount = k.clipPlaneCount;
+        }
+
+        // The projected-texture bit per stage. Not fixed-function-only: every
+        // pixel shader that samples declares the spec constant it lives in.
+        if (specProjMask != k.projMask)
+        {
+            for (DWORD s = 0; s < kFFStages; s++)
+                d->SetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS,
+                                        (k.projMask >> s) & 1 ? D3DTTFF_PROJECTED : D3DTTFF_DISABLE);
+            specProjMask = k.projMask;
+        }
+
+        // The fixed-function stage block, for the keys that have no pixel shader.
+        // A programmable pipeline never declares spec IDs 8..19, so DXVK zeroes
+        // them there and setting them would be wasted calls.
+        if (!k.psHash && (!specFFValid || memcmp(specFF, k.ffStage, sizeof(specFF)) != 0))
+        {
+            for (DWORD s = 0; s < kFFStages; s++)
+            {
+                const FFStage& f = k.ffStage[s];
+                d->SetTextureStageState(s, D3DTSS_COLOROP,   f.colorOp);
+                d->SetTextureStageState(s, D3DTSS_ALPHAOP,   f.alphaOp);
+                d->SetTextureStageState(s, D3DTSS_RESULTARG, f.resultArg);
+                d->SetTextureStageState(s, D3DTSS_COLORARG0, f.colorArg[0]);
+                d->SetTextureStageState(s, D3DTSS_COLORARG1, f.colorArg[1]);
+                d->SetTextureStageState(s, D3DTSS_COLORARG2, f.colorArg[2]);
+                d->SetTextureStageState(s, D3DTSS_ALPHAARG0, f.alphaArg[0]);
+                d->SetTextureStageState(s, D3DTSS_ALPHAARG1, f.alphaArg[1]);
+                d->SetTextureStageState(s, D3DTSS_ALPHAARG2, f.alphaArg[2]);
+            }
+            memcpy(specFF, k.ffStage, sizeof(specFF));
+            specFFValid = true;
+        }
+
+        // Fetch4 is a sampler state, so it has to be taken OFF the slots that had
+        // it as well as put on the ones that want it -- DXVK reads it per slot on
+        // every draw, and a leftover 'GET4' would specialise the next key.
+        uint32_t want = 0;
+        for (uint32_t i = 0; i < kPSSamplers; i++)
+            if (k.samplerMode[i] == kModeFetch4 && k.samplerType[i] && texFetch4) want |= 1u << i;
+        // After a slice boundary the loading screen's own sampler states are back
+        // and we do not know what they hold, so every slot is written rather than
+        // only the ones that changed.
+        const uint32_t change = specFetch4Valid ? (want ^ specFetch4Slots) : ((1u << kPSSamplers) - 1u);
+        for (uint32_t i = 0; i < kPSSamplers; i++)
+        {
+            if (!((change >> i) & 1)) continue;
+            const bool on = (want >> i) & 1;
+            d->SetSamplerState(i, D3DSAMP_MIPMAPLODBIAS, on ? MAKEFOURCC('G','E','T','4') : 0);
+            d->SetSamplerState(i, D3DSAMP_MAGFILTER, on ? D3DTEXF_POINT : D3DTEXF_LINEAR);
+        }
+        specFetch4Slots = want;
+        specFetch4Valid = true;
+    }
+
     static void ReplayPass()
     {
         using namespace pipelinekeys;
@@ -2830,6 +3144,38 @@ class ShaderPrecompiler
         if (seenUnmaskedVS.size() > seenPipeline.size())
             Log("replay: the vertex-sampler mask removed %zu duplicate draws (%zu keys without it, %zu with)",
                 seenUnmaskedVS.size() - seenPipeline.size(), seenUnmaskedVS.size(), seenPipeline.size());
+
+        // What the specialisation state added to the key is worth, and how much of
+        // it this recording actually exercises. A field that never varies must not
+        // split anything -- that is the whole dedup contract -- so say which ones
+        // vary and by how many draws, rather than asserting the key got no coarser.
+        {
+            std::unordered_set<uint64_t> without;
+            without.reserve(replayRecs.size());
+            uint32_t withBools = 0, withClip = 0, withProj = 0, withMode = 0, ff = 0;
+            for (const auto& k : replayRecs)
+            {
+                KeyRecord flat = k;
+                flat.vsBools = flat.psBools = 0;
+                flat.clipPlaneCount = 0;
+                flat.projMask = 0;
+                memset(flat.samplerMode, 0, sizeof(flat.samplerMode));
+                pipelinekeys::DefaultFFStages(flat.ffStage);
+                without.insert(ReplayPipelineKey(flat));
+
+                if (k.vsBools || k.psBools) withBools++;
+                if (k.clipPlaneCount) withClip++;
+                if (k.projMask) withProj++;
+                for (uint32_t i = 0; i < kNumSamplers; i++)
+                    if (k.samplerMode[i]) { withMode++; break; }
+                if (!k.psHash) ff++;
+            }
+            Log("replay: the specialisation state is worth %zu pipelines (%zu keys without it, %zu with); "
+                "of %zu recorded keys, %u carry a b# register, %u a clip plane, %u a projected stage, "
+                "%u a Fetch4/depth-compare sampler, %u no pixel shader",
+                seenPipeline.size() - without.size(), without.size(), seenPipeline.size(),
+                replayRecs.size(), withBools, withClip, withProj, withMode, ff);
+        }
         // Warm the pipelines the game uses MOST first. If a budget or an early exit
         // cuts the pass short, what got built is then the part that matters, not an
         // arbitrary prefix of the file.
@@ -3020,31 +3366,20 @@ class ShaderPrecompiler
                 dev->SetRenderState(kTrackedRS[i].rs, k.rs[i]);
 
             // Sampler dimensions are folded into DXVK's SPIR-V spec constants, so a
-            // 2D texture where the game bound a cube is a different pipeline.
+            // 2D texture where the game bound a cube is a different pipeline -- and
+            // so is a slot DXVK samples with Fetch4 or depth compare, which is what
+            // the recorded MODE picks the texture for.
             for (uint32_t i = 0; i < kPSSamplers; i++)
-            {
-                IDirect3DBaseTexture9* t = nullptr;
-                switch (k.samplerType[i])
-                {
-                case kSampler2D:     t = tex2D;   break;
-                case kSamplerCube:   t = texCube; break;
-                case kSamplerVolume: t = texVol;  break;
-                default:             t = nullptr; break;
-                }
-                dev->SetTexture(i, t);
-            }
+                dev->SetTexture(i, TexForSlot(k.samplerType[i], k.samplerMode[i]));
             for (uint32_t i = 0; i < kVSSamplers; i++)
-            {
-                IDirect3DBaseTexture9* t = nullptr;
-                switch (k.samplerType[kPSSamplers + i])
-                {
-                case kSampler2D:     t = tex2D;   break;
-                case kSamplerCube:   t = texCube; break;
-                case kSamplerVolume: t = texVol;  break;
-                default:             t = nullptr; break;
-                }
-                dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + i, t);
-            }
+                dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + i,
+                                TexForSlot(k.samplerType[kPSSamplers + i], k.samplerMode[kPSSamplers + i]));
+
+            // The rest of D3D9SpecData: b#, the clip-plane count, the projected
+            // mask, the fixed-function stages and the Fetch4 sampler state. After
+            // the textures, because the Fetch4 state DXVK keeps per slot is only
+            // meaningful once the texture that can do it is bound.
+            ApplySpecState(dev, k);
 
             // One degenerate primitive: the vertex buffer is zeroed, so nothing is
             // rasterised, but the pipeline is created -- which is the whole point.
@@ -3643,6 +3978,19 @@ class ShaderPrecompiler
         d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
         d->SetRenderState(D3DRS_POINTSPRITEENABLE, FALSE);
         d->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
+        // The other two thirds of spec constant 2, which every pixel shader
+        // that SAMPLES declares (d3d9_shader.cpp:951) -- not just the
+        // fixed-function ones. Left ambient, the projected-texture mask and
+        // D3DRS_SPECULARENABLE ride along in the key of every job, and they are
+        // the gate's on the game's device and zero on a device of our own.
+        d->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
+        for (DWORD s = 0; s < pipelinekeys::kFFStages; s++)
+            d->SetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+        // And Fetch4, which is a SAMPLER state: the recorded replay runs before
+        // this walk and may have left 'GET4' on a slot, which would specialise
+        // spec constant 5 on every job that binds a texture there.
+        for (DWORD s = 0; s < pipelinekeys::kPSSamplers; s++)
+            d->SetSamplerState(s, D3DSAMP_MIPMAPLODBIAS, 0);
         // The four vertex-texture samplers are half of DXVK's spec constant 3
         // and nothing in this pass ever binds them, so whatever the recorded
         // replay last left there would ride along on every engine draw. Null
@@ -6073,6 +6421,7 @@ class ShaderPrecompiler
         cfg.emitLog       = ini.ReadInteger("SHADERS", "PrecompileEmitLog", 0) != 0;
         cfg.sliceMs       = ini.ReadInteger("SHADERS", "PrecompileSliceMs", 8);
         cfg.gateMaxSeconds = ini.ReadInteger("SHADERS", "PrecompileGateMaxSeconds", 0);
+        cfg.bootGate       = ini.ReadInteger("SHADERS", "PrecompileBootGate", 1) != 0;
         cfg.reuseStamp    = ini.ReadInteger("SHADERS", "PrecompileReuseWarmCache", 1) != 0;
         cfg.warmMusic     = ini.ReadInteger("SHADERS", "PrecompileWarmMusic", 1) != 0;
         cfg.warmMusicTracks = ini.ReadString("SHADERS", "PrecompileWarmMusicTracks", "");
@@ -6117,7 +6466,14 @@ public:
             // and the loading-screen gate above carries the feature exactly as
             // it always did.
             gateCheck = bootgate::ValidateCode();
-            if (!gateCheck.ok)
+            if (!cfg.bootGate)
+            {
+                gateFailed = true;
+                Log("boot gate OFF by PrecompileBootGate = 0: the pass runs at the old "
+                    "loading-screen gate instead. That is the control arm, not a shipping "
+                    "configuration - the engine walk has no render phases there.");
+            }
+            else if (!gateCheck.ok)
             {
                 gateFailed = true;
                 Log("boot gate OFF: %s. Falling back to the loading-screen gate - the warm "
