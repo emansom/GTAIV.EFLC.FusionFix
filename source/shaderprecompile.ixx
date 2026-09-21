@@ -3466,6 +3466,16 @@ class ShaderPrecompiler
         Log("replay: drew %u of %zu pipelines in %llds%s (skipped %u duplicate-state, %u no-shader, %u no-decl, %u no-RT)",
             drawn, drawList.size(), (long long)(elapsedMs() / 1000), exitedEarly ? " [stopped early]" : "",
             skippedDup, skippedShader, skippedDecl, skippedRT);
+        // A sampler mode the device could not give us a texture for. Not fatal --
+        // the slot warms its default-mode pipeline instead -- but it means the key
+        // asked for something this device cannot reach, which is worth knowing
+        // before anyone explains a stutter by the key being wrong.
+        if (specFallbacks)
+            Log("replay: %u sampler slots wanted Fetch4 or depth compare and got the plain "
+                "texture instead (R32F scratch %s, D24S8 scratch %s) - those slots warmed the "
+                "default-mode pipeline, not the one the key recorded",
+                specFallbacks, texFetch4 ? "created" : "REFUSED by the device",
+                texShadow ? "created" : "REFUSED by the device");
 
         if (!missingVS.empty() || !missingPS.empty())
         {
