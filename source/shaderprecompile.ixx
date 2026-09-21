@@ -2209,7 +2209,7 @@ class ShaderPrecompiler
 
     // What all files together may add, whatever they claim: the reader bounds each
     // file, this bounds the sum. A real capture is ~15,000 keys and ~50 KB of bytecode.
-    static constexpr size_t kMaxReplayKeys      = 200000;     // ~65 MB of records
+    static constexpr size_t kMaxReplayKeys      = 200000;     // ~85 MB of records at v3
     static constexpr size_t kMaxReplayBlobBytes = 4u << 20;
 
     static void LogStr(const std::string& s) { pipelinekeys::LogLine("[ShaderPrecompile] ", s.c_str()); }

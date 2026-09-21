@@ -50,8 +50,8 @@ namespace d3d9cache
     // What this PC's own capture may grow to, so that it always reads back -- here
     // and on the PCs it is shared with -- under kMaxFileBytes: keys up to that less
     // 2 MB, and at most 1 MB of carried bytecode, which leaves ~1 MB for everything
-    // else (a real capture has 29 declarations and ~50 KB of bytecode). ~44,000 keys;
-    // a capture that has seen ~3.5 million draws holds 14,500.
+    // else (a real capture has 29 declarations and ~50 KB of bytecode). ~33,000 keys
+    // at the v3 record size; a capture that has seen ~3.5 million draws holds 14,500.
     constexpr size_t kMaxCaptureKeys        = (kMaxFileBytes - (2u << 20)) / sizeof(KeyRecord);
     constexpr size_t kMaxCaptureShaderBytes = 1u << 20;
 
