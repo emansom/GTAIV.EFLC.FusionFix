@@ -829,7 +829,25 @@ class ShaderPrecompiler
         void* rt[4]{}; void* ds{};
         D3DVIEWPORT9 vp{};
         RECT scissor{};
+        // The specialisation state the replay now writes per draw. It all rides in
+        // the D3DSBT_ALL block the pass takes, so it should come back untouched --
+        // but "should" is what the rest of this snapshot exists to stop being.
+        float clip[6][4]{};
+        DWORD tss[pipelinekeys::kFFStages][10]{};
+        DWORD samp[pipelinekeys::kPSSamplers][2]{};
+        BOOL  vsB[16]{}, psB[16]{};
         bool valid{};
+    };
+
+    // The texture stage states the replay writes, in the order the snapshot keeps them.
+    static constexpr D3DTEXTURESTAGESTATETYPE kTSSWatched[10] = {
+        D3DTSS_COLOROP, D3DTSS_ALPHAOP, D3DTSS_RESULTARG,
+        D3DTSS_COLORARG0, D3DTSS_COLORARG1, D3DTSS_COLORARG2,
+        D3DTSS_ALPHAARG0, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2,
+        D3DTSS_TEXTURETRANSFORMFLAGS,
+    };
+    static constexpr D3DSAMPLERSTATETYPE kSampWatched[2] = {
+        D3DSAMP_MIPMAPLODBIAS, D3DSAMP_MAGFILTER,
     };
 
     template <typename T> static void* GrabPtr(T* p) { if (p) p->Release(); return (void*)p; }
@@ -877,6 +895,14 @@ class ShaderPrecompiler
         IDirect3DSurface9* ds = nullptr; dev->GetDepthStencilSurface(&ds); s.ds = GrabPtr(ds);
         dev->GetViewport(&s.vp);
         dev->GetScissorRect(&s.scissor);
+
+        for (DWORD i = 0; i < 6; i++) dev->GetClipPlane(i, s.clip[i]);
+        for (DWORD st = 0; st < pipelinekeys::kFFStages; st++)
+            for (int t = 0; t < 10; t++) dev->GetTextureStageState(st, kTSSWatched[t], &s.tss[st][t]);
+        for (DWORD sm = 0; sm < pipelinekeys::kPSSamplers; sm++)
+            for (int t = 0; t < 2; t++) dev->GetSamplerState(sm, kSampWatched[t], &s.samp[sm][t]);
+        dev->GetVertexShaderConstantB(0, s.vsB, 16);
+        dev->GetPixelShaderConstantB(0, s.psB, 16);
         s.valid = true;
     }
 
@@ -938,10 +964,41 @@ class ShaderPrecompiler
         if (memcmp(&before.vp, &after.vp, sizeof(D3DVIEWPORT9)) != 0) note("viewport");
         if (memcmp(&before.scissor, &after.scissor, sizeof(RECT)) != 0) note("scissor rect");
 
+        for (int i = 0; i < 6; i++)
+            if (memcmp(before.clip[i], after.clip[i], sizeof(before.clip[i])) != 0)
+            {
+                char b[96];
+                _snprintf_s(b, sizeof(b), _TRUNCATE, "clip plane %d", i);
+                note(b);
+            }
+        for (uint32_t st = 0; st < pipelinekeys::kFFStages; st++)
+            for (int t = 0; t < 10; t++)
+                if (before.tss[st][t] != after.tss[st][t])
+                {
+                    char b[128];
+                    _snprintf_s(b, sizeof(b), _TRUNCATE, "texture stage %u state %d: %lu -> %lu",
+                                st, (int)kTSSWatched[t], (unsigned long)before.tss[st][t],
+                                (unsigned long)after.tss[st][t]);
+                    note(b);
+                }
+        for (uint32_t sm = 0; sm < pipelinekeys::kPSSamplers; sm++)
+            for (int t = 0; t < 2; t++)
+                if (before.samp[sm][t] != after.samp[sm][t])
+                {
+                    char b[128];
+                    _snprintf_s(b, sizeof(b), _TRUNCATE, "sampler %u state %d: %lu -> %lu",
+                                sm, (int)kSampWatched[t], (unsigned long)before.samp[sm][t],
+                                (unsigned long)after.samp[sm][t]);
+                    note(b);
+                }
+        if (memcmp(before.vsB, after.vsB, sizeof(before.vsB)) != 0) note("vertex bool constants b0..b15");
+        if (memcmp(before.psB, after.psB, sizeof(before.psB)) != 0) note("pixel bool constants b0..b15");
+
         if (diffs == 0)
             Log("state verified: device handed back byte-identical across %u render states, "
-                "%u samplers, shaders, streams (incl. frequency) and targets",
-                pipelinekeys::kNumRS, pipelinekeys::kNumSamplers);
+                "%u samplers, shaders, streams (incl. frequency), targets, 6 clip planes, "
+                "%u texture stages and both bool constant sets",
+                pipelinekeys::kNumRS, pipelinekeys::kNumSamplers, pipelinekeys::kFFStages);
         else
             Log("state NOT restored: %d differences (listed above) - THIS is the black-sky bug", diffs);
     }
