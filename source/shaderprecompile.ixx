@@ -3366,6 +3366,9 @@ class ShaderPrecompiler
                 pipelinekeys::DefaultFFStages(flat.ffStage);
                 without.insert(ReplayPipelineKey(flat));
 
+                // Whether a key has a pixel shader is recorded by every version, so
+                // it is counted over all of them; the four fields below are not.
+                if (!k.psHash) ff++;
                 if (replaySources[replaySrc[r]].version < pipelinekeys::kCacheVersion) { widened++; continue; }
                 recorded++;
                 if (k.vsBools || k.psBools) withBools++;
@@ -3373,14 +3376,13 @@ class ShaderPrecompiler
                 if (k.projMask) withProj++;
                 for (uint32_t i = 0; i < kNumSamplers; i++)
                     if (k.samplerMode[i]) { withMode++; break; }
-                if (!k.psHash) ff++;
             }
             Log("replay: the specialisation state is worth %zu pipelines (%zu keys without it, %zu with); "
-                "of %u keys that RECORDED it, %u carry a b# register, %u a clip plane, %u a projected stage, "
-                "%u a Fetch4/depth-compare sampler, %u no pixel shader (%u more keys predate the fields and "
-                "were widened, so they cannot carry any)",
+                "%u of %zu keys have no pixel shader; of the %u that RECORDED the specialisation fields, "
+                "%u carry a b# register, %u a clip plane, %u a projected stage, %u a Fetch4/depth-compare "
+                "sampler (%u keys predate the fields and were widened, so they cannot carry any)",
                 seenPipeline.size() - without.size(), without.size(), seenPipeline.size(),
-                recorded, withBools, withClip, withProj, withMode, ff, widened);
+                ff, replayRecs.size(), recorded, withBools, withClip, withProj, withMode, widened);
         }
         // Warm the pipelines the game uses MOST first. If a budget or an early exit
         // cuts the pass short, what got built is then the part that matters, not an
