@@ -155,6 +155,9 @@ struct PrecompileConfig
     // cache survives; 2 = only probe whether such a device can be created here
     // and say what it cost (diagnostic); 0 = the game's device, as before.
     int     warmDevice    = 1;      // PrecompileWarmDevice
+    // Debugging only: name whatever ends the process, and what the address
+    // space looked like when it did. Off by default -- see ArmCrashLogging.
+    bool    crashLog      = false;  // PrecompileCrashLog
 };
 
 // ===========================================================================
@@ -505,8 +508,17 @@ class ShaderPrecompiler
     //  raise plenty of others all the time. It is rate limited in TIME rather
     //  than by a plain count, so a burst during startup cannot use up the
     //  budget for a fault two minutes into gameplay.
+    //
+    //  OFF BY DEFAULT (PrecompileCrashLog), because with these two installed
+    //  the process spins instead of exiting: four launches of this build hung
+    //  in the teardown after ExitProcess had been logged, on both the long pass
+    //  and the 8 s one, where a build without them quit cleanly from the same
+    //  gate. That is a debugging aid paying for itself only while something is
+    //  being debugged, so it is opt-in and it takes itself back out of the way
+    //  on the way through ExitProcess.
     // -------------------------------------------------------------------
     static inline SafetyHookInline shExitProcess{};
+    static inline void* vehHandle = nullptr;
     static inline std::atomic<int64_t> lastVehUs{ 0 };
     static inline std::atomic<uint32_t> vehSeen{ 0 }, vehLogged{ 0 };
 
@@ -547,16 +559,22 @@ class ShaderPrecompiler
             code, from, (unsigned)((uintptr_t)from - (uintptr_t)GetModuleHandleW(nullptr) + 0x400000));
         Log("memory at ExitProcess: %s", pipelinekeys::VaLine().c_str());
         Log("exceptions seen by then: %u fatal-class (%u logged)", vehSeen.load(), vehLogged.load());
-        shExitProcess.stdcall<void>(code);
+        // Everything past this point is teardown, and there is nothing left for
+        // either of these to say about it. Out of the way first.
+        if (vehHandle) { RemoveVectoredExceptionHandler(vehHandle); vehHandle = nullptr; }
+        shExitProcess.reset();
+        ExitProcess(code);
     }
 
     static void ArmCrashLogging()
     {
-        AddVectoredExceptionHandler(0 /* last */, &ExceptionLogger);
+        if (!cfg.crashLog) return;
+        vehHandle = AddVectoredExceptionHandler(0 /* last */, &ExceptionLogger);
         if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll"))
             if (void* fn = (void*)GetProcAddress(k32, "ExitProcess"))
                 shExitProcess = safetyhook::create_inline(fn, reinterpret_cast<void*>(&ExitProcessDetour));
-        Log("crash logging armed (vectored handler%s)", shExitProcess ? " + ExitProcess" : ", ExitProcess NOT hooked");
+        Log("crash logging armed (PrecompileCrashLog: vectored handler%s)",
+            shExitProcess ? " + ExitProcess" : ", ExitProcess NOT hooked");
     }
 
     // Drain the message queue so Windows keeps the window "responsive" while the
@@ -5519,6 +5537,7 @@ class ShaderPrecompiler
         cfg.exportBaseline = ini.ReadInteger("SHADERS", "PrecompileExportBaseline", 0) != 0;
         cfg.engineWarm    = ini.ReadInteger("SHADERS", "PrecompileEngineWarm", 0);
         cfg.warmDevice    = ini.ReadInteger("SHADERS", "PrecompileWarmDevice", 1);
+        cfg.crashLog      = ini.ReadInteger("SHADERS", "PrecompileCrashLog", 0) != 0;
         cfg.emitLog       = ini.ReadInteger("SHADERS", "PrecompileEmitLog", 0) != 0;
         cfg.sliceMs       = ini.ReadInteger("SHADERS", "PrecompileSliceMs", 8);
         cfg.gateMaxSeconds = ini.ReadInteger("SHADERS", "PrecompileGateMaxSeconds", 0);
