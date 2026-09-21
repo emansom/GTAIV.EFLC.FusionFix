@@ -149,6 +149,13 @@ struct PrecompileConfig
     // gate, and the 2026-09-21 comparison had to be made with two BINARIES for
     // want of it -- which is one more variable than the question needed.
     bool    bootGate      = true;   // PrecompileBootGate
+    // Whether D3DRS_MULTISAMPLEANTIALIAS is part of the replay's identity.
+    // DXVK's source says it should be -- BindRasterizerState maps it to
+    // DxvkRsInfo::sampleCount 0 or 1, and DxvkGraphicsPipelineStateInfo is
+    // compared as bytes -- but a controlled in-game A/B says otherwise (see the
+    // note beside it in ReplayBaseKey). Kept as a switch so that claim can be
+    // re-tested on another driver in one run instead of a rebuild.
+    bool    keySampleCount = false; // PrecompileKeySampleCount
     bool    reuseStamp    = true;   // PrecompileReuseWarmCache
     int     reflectionMsaa = 0;     // EXPERIMENTAL/ReflectionMSAAQuality, read for the sample count
     // The engine walk (enginewarm.h). 0 = off, 1 = the tied coordinate, 2 = the
@@ -1999,17 +2006,28 @@ class ShaderPrecompiler
         // the same with the sample mask. Cull mode and front face really are
         // dynamic and stay out.
         //
-        // D3DRS_MULTISAMPLEANTIALIAS is the one that costs something here, and it
-        // is worth stating why it is not a no-op on a single-sampled target:
-        // BindRasterizerState maps it to sampleCount 0 ("take it from the render
-        // pass") or 1, and DxvkGraphicsPipelineStateInfo is compared as bytes, so
-        // the two are two cache entries and two compiles even where the resulting
-        // VkPipeline would be identical. Measured over the two files the replay
-        // loads: 95 of 1093 identities carry both values, so 95 pipelines the game
-        // builds were being skipped as duplicates of each other.
+        // D3DRS_MULTISAMPLEANTIALIAS is OFF by default, and it is the one case here
+        // where reading DXVK's source gives the wrong answer. The source says it
+        // should be keyed: BindRasterizerState maps it to sampleCount 0 ("take it
+        // from the render pass") or 1, sampleCount is a five-bit field of DxvkRsInfo,
+        // DxvkRsInfo is a member of DxvkGraphicsPipelineStateInfo, and that struct is
+        // compared with bit::bcmpeq -- so two draws differing only in it look like two
+        // cache entries. The render state really does vary (0 on 561 of 14,543 keys)
+        // and 95 of the 1093 identities carry both values.
+        //
+        // Measured instead, same binary, same gate, same everything else
+        // (2026-09-21, /tmp/ff-results-keygap/full/run1 and run3): keying on it draws
+        // 1188 pipelines and DXVK finishes with 786; NOT keying on it draws 1093 and
+        // DXVK finishes with 786. The same 786, so the 95 extra draws produced not one
+        // pipeline. Whatever collapses them -- RADV has
+        // extendedDynamicState3RasterizationSamples, so the multisample state is
+        // dynamic here -- the axis is 95 draws of pure loading time on this rig and
+        // it is off. PrecompileKeySampleCount = 1 turns it back on for one run, which
+        // is how to re-test the claim on a driver without that extension rather than
+        // by rebuilding.
         b.flatShading = RSOr0(k, kRS_ShadeMode) == D3DSHADE_FLAT;
         b.polygonMode = RSOr0(k, kRS_FillMode);
-        b.sampleCount = RSOr0(k, kRS_MsaaEnable) ? 0u : 1u;
+        b.sampleCount = cfg.keySampleCount ? (RSOr0(k, kRS_MsaaEnable) ? 0u : 1u) : 1u;
         // DXVK only honours the mask when RT0 is multisampled above NONMASKABLE
         // (m_validSampleMask, d3d9_device.cpp:1762); otherwise it forces 0xffff,
         // so keying on it there would split for nothing.
@@ -6544,6 +6562,7 @@ class ShaderPrecompiler
         cfg.sliceMs       = ini.ReadInteger("SHADERS", "PrecompileSliceMs", 8);
         cfg.gateMaxSeconds = ini.ReadInteger("SHADERS", "PrecompileGateMaxSeconds", 0);
         cfg.bootGate       = ini.ReadInteger("SHADERS", "PrecompileBootGate", 1) != 0;
+        cfg.keySampleCount = ini.ReadInteger("SHADERS", "PrecompileKeySampleCount", 0) != 0;
         cfg.reuseStamp    = ini.ReadInteger("SHADERS", "PrecompileReuseWarmCache", 1) != 0;
         cfg.warmMusic     = ini.ReadInteger("SHADERS", "PrecompileWarmMusic", 1) != 0;
         cfg.warmMusicTracks = ini.ReadString("SHADERS", "PrecompileWarmMusicTracks", "");
