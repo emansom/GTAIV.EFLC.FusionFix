@@ -94,6 +94,64 @@ namespace pipelinekeys
         }
     }
 
+    // Which of COLORARG0/1/2 an op actually reads, exactly as
+    // D3D9DeviceEx::GetTextureStageArgMask decides it (d3d9_device.cpp:8273).
+    inline uint32_t FFArgMask(uint8_t op)
+    {
+        switch (op)
+        {
+        case D3DTOP_DISABLE:
+        case D3DTOP_BUMPENVMAP:
+        case D3DTOP_BUMPENVMAPLUMINANCE:  return 0b000u;
+        case D3DTOP_SELECTARG1:
+        case D3DTOP_PREMODULATE:          return 0b010u;
+        case D3DTOP_SELECTARG2:           return 0b100u;
+        case D3DTOP_MULTIPLYADD:
+        case D3DTOP_LERP:                 return 0b111u;
+        default:                          return 0b110u;
+        }
+    }
+
+    // Put a stage block into the one form DXVK would derive from it, so that two
+    // ways of saying the same thing hash the same.
+    //
+    // THIS IS NOT COSMETIC. The capture writes a disabled stage as all-zero with
+    // both ops DISABLE, which is what D3D9SpecData::disableTextureStage stores
+    // (d3d9_state.h:266); DefaultFFStages -- what a pre-v3 record is widened to --
+    // writes D3D9's own defaults, resultArg = CURRENT and args CURRENT/TEXTURE/
+    // CURRENT. Both mean "this stage is off", and without this they hash
+    // differently, so a v3 capture replayed beside the shipped v2 baseline would
+    // draw every no-pixel-shader identity twice for nothing.
+    //
+    // Two more rules, from the same place, which merge rather than split: DXVK
+    // stops at the first stage whose COLOROP is DISABLE and calls
+    // disableTextureStage for every stage from there on (d3d9_device.cpp:8471), and
+    // it zeroes each argument the op does not consume (:8408-8417). Bytes DXVK
+    // discards cannot make two pipelines, so keying on them only costs draws.
+    inline void CanonicalFFStages(FFStage* st)
+    {
+        bool off = false;
+        for (uint32_t s = 0; s < kFFStages; s++)
+        {
+            FFStage& f = st[s];
+            if (off || f.colorOp == D3DTOP_DISABLE)
+            {
+                off = true;
+                f = FFStage{};
+                f.colorOp = (uint8_t)D3DTOP_DISABLE;
+                f.alphaOp = (uint8_t)D3DTOP_DISABLE;
+                continue;
+            }
+            const uint32_t cm = FFArgMask(f.colorOp);
+            const uint32_t am = FFArgMask(f.alphaOp);
+            for (uint32_t a = 0; a < 3; a++)
+            {
+                if (!(cm & (1u << a))) f.colorArg[a] = 0;
+                if (!(am & (1u << a))) f.alphaArg[a] = 0;
+            }
+        }
+    }
+
     // The render states we record. `pipeline` marks the ones that (as far as we can
     // tell from DXVK's d3d9 backend) are baked into the Vulkan pipeline rather than
     // set dynamically. Everything is recorded either way — the flag splits the two

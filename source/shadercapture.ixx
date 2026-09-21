@@ -314,9 +314,10 @@ class ShaderCapture
         if (kind == pipelinekeys::kSamplerNone) return;
 
         // Depth compare wins over Fetch4 (D3D9SpecData::updateSamplers clears the
-        // Fetch4 bit wherever the depth bit is set).
-        if (d3d9cache::IsDepthFormat(fmt) && !d3d9cache::IsFourCC(fmt, "INTZ") &&
-            !d3d9cache::IsFourCC(fmt, "DF16") && !d3d9cache::IsFourCC(fmt, "DF24"))
+        // Fetch4 bit wherever the depth bit is set). IsShadowFormat is DXVK's
+        // DetermineShadowState and not our wider IsDepthFormat, which would call
+        // RAWZ and S8_LOCKABLE depth-compared when DXVK does not.
+        if (d3d9cache::IsShadowFormat(fmt))
         {
             // Dref or DrefClamp: which one depends on whether DXVK had to emulate
             // the format with D32F, which is not observable through D3D9. Recorded

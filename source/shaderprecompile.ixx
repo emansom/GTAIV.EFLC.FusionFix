@@ -1652,6 +1652,16 @@ class ShaderPrecompiler
         dev->SetDepthStencilSurface(prevDS);
         if (prevDS) prevDS->Release();
         bb->Release();
+
+        // This frame wrote state the replay caches but does not read back: the
+        // overlay's own render states, and whatever ID3DXFont left behind when the
+        // text changed. On the boot gate the slice driver bumps sliceEpoch and the
+        // cache is dropped for exactly this reason; here there are no slices, so
+        // without this the cache would survive every overlay frame and the two
+        // gates would not be comparable -- which is the one thing the old gate
+        // exists for. A handful of redundant Set* calls on the next draw is the
+        // whole cost.
+        InvalidateSpecState();
     }
 
     // -------------------------------------------------------------------
@@ -2013,25 +2023,39 @@ class ShaderPrecompiler
         // the same with the sample mask. Cull mode and front face really are
         // dynamic and stay out.
         //
-        // D3DRS_MULTISAMPLEANTIALIAS is OFF by default, and it is the one case here
-        // where reading DXVK's source gives the wrong answer. The source says it
-        // should be keyed: BindRasterizerState maps it to sampleCount 0 ("take it
-        // from the render pass") or 1, sampleCount is a five-bit field of DxvkRsInfo,
-        // DxvkRsInfo is a member of DxvkGraphicsPipelineStateInfo, and that struct is
-        // compared with bit::bcmpeq -- so two draws differing only in it look like two
-        // cache entries. The render state really does vary (0 on 561 of 14,543 keys)
-        // and 95 of the 1093 identities carry both values.
+        // D3DRS_MULTISAMPLEANTIALIAS is the exception, and it is worth being exact
+        // about why, because two DIFFERENT DXVK counters answer differently and the
+        // one that matters here is the second.
         //
-        // Measured instead, same binary, same gate, same everything else
-        // (2026-09-21, /tmp/ff-results-keygap/full/run1 and run3): keying on it draws
-        // 1188 pipelines and DXVK finishes with 786; NOT keying on it draws 1093 and
-        // DXVK finishes with 786. The same 786, so the 95 extra draws produced not one
-        // pipeline. Whatever collapses them -- RADV has
-        // extendedDynamicState3RasterizationSamples, so the multisample state is
-        // dynamic here -- the axis is 95 draws of pure loading time on this rig and
-        // it is off. PrecompileKeySampleCount = 1 turns it back on for one run, which
-        // is how to re-test the claim on a driver without that extension rather than
-        // by rebuilding.
+        // Its D3D9 default is TRUE, not FALSE (d3d9_device.cpp:8768 sets it in the
+        // device's own reset), and it really does vary on this install: 0 on 561 of
+        // the 14,543 keys, with 95 of the 1093 identities carrying both values.
+        //
+        // In DXVK's pipeline STATE it is keyed: BindRasterizerState maps it to
+        // sampleCount 0 ("take it from the render pass") or 1, that is a five-bit
+        // field of DxvkRsInfo, DxvkRsInfo is a member of
+        // DxvkGraphicsPipelineStateInfo, and that struct is compared with
+        // bit::bcmpeq -- so two draws differing only in it are two entries in
+        // m_pipelines and DXVK's "Graphics pipelines" HUD number counts both.
+        //
+        // In what DXVK COMPILES it is not. The VkPipeline is looked up by
+        // DxvkGraphicsPipelineFastInstanceKey, which carries no rs.sampleCount of
+        // its own: the word reaches msInfo.rasterizationSamples only when
+        // state.ms.sampleCount() is ZERO (dxvk_graphics.cpp:356-361), and ms's
+        // sample count comes from the framebuffer (dxvk_context.cpp:7660), so it is
+        // zero only for a render pass with no attachments at all. Both values
+        // therefore produce a byte-identical fast key, one m_fastPipelines entry and
+        // one vkCreateGraphicsPipelines call. That is not a property of this driver;
+        // it is a property of the D3D9 front end, and it needs no extension.
+        //
+        // Measured, which is what found it, same binary, same gate, cold both times
+        // (2026-09-21, /tmp/ff-results-keygap/full/run1 and run2): keying on it draws
+        // 1188 pipelines, NOT keying on it draws 1093, and both end at 786 -- our
+        // counter is the vkCreateGraphicsPipelines hook, i.e. compiles, not cache
+        // entries. So the axis is 95 draws of loading time in exchange for 95 state
+        // entries DXVK would otherwise add during gameplay: a hash insert each, no
+        // compile. It is off because compiles are what stutter.
+        // PrecompileKeySampleCount = 1 turns it back on for one run.
         b.flatShading = RSOr0(k, kRS_ShadeMode) == D3DSHADE_FLAT;
         b.polygonMode = RSOr0(k, kRS_FillMode);
         b.sampleCount = cfg.keySampleCount ? (RSOr0(k, kRS_MsaaEnable) ? 0u : 1u) : 1u;
@@ -2107,8 +2131,17 @@ class ShaderPrecompiler
 
         // The stage ops only reach a pipeline with no pixel shader; a programmable
         // one never declares those spec constants, so DXVK zeroes them.
+        //
+        // Canonicalised here and nowhere else, so every source agrees: the capture
+        // writes a disabled stage all-zero and a widened pre-v3 record writes D3D9's
+        // defaults, and a key that told those apart would draw the same pipeline
+        // twice. It also drops the arguments the op does not consume, which DXVK
+        // discards too.
         if (!k.psHash)
+        {
             memcpy(r.ffStage, k.ffStage, sizeof(r.ffStage));
+            pipelinekeys::CanonicalFFStages(r.ffStage);
+        }
 
         // b#, masked to the registers each stage's shader actually reads.
         {
@@ -2227,6 +2260,11 @@ class ShaderPrecompiler
     {
         std::string label;
         bool dropIn = false;
+        // The container version the file was WRITTEN at. A file older than v3 has
+        // its specialisation fields filled in by WidenToV3 rather than recorded, so
+        // any count of "how many keys carry a b# register" over those records is
+        // reporting the widening, not the game. Kept here so the log can say which.
+        uint32_t version = 0;
         uint32_t added = 0, drawn = 0, samePipeline = 0, noShader = 0, noDecl = 0, noRT = 0;
     };
     static inline std::vector<ReplaySource> replaySources;
@@ -2327,7 +2365,7 @@ class ShaderPrecompiler
 
         const size_t recsBefore = replayRecs.size();
         const uint32_t src = (uint32_t)replaySources.size();
-        replaySources.push_back({ what, dropIn });
+        replaySources.push_back({ what, dropIn, f.parse.version });
 
         // File-local declaration index -> our index.
         std::vector<uint32_t> remap(c.decls.size(), 0);
@@ -3128,8 +3166,18 @@ class ShaderPrecompiler
     {
         using namespace pipelinekeys;
         if (kind == kSamplerNone) return nullptr;
-        if (mode == kModeFetch4 && texFetch4) return texFetch4;
-        if ((mode == kModeDref || mode == kModeDrefClamp) && texShadow) return texShadow;
+        // Both scratch textures are 2D, and the sampler TYPE and the sampler MODE
+        // share one spec dword (psSamplerTypes is spec ID 4, and vsSamplerTypes
+        // rides with vsSamplerModes in spec ID 3). Handing a cube or volume slot a
+        // 2D texture to reach its mode would build a pipeline with the right mode
+        // and the WRONG type: not the identity the key recorded, and not the plain
+        // one either. Bind the plain texture of the right kind instead and count it
+        // as the fallback it is.
+        if (kind == kSampler2D)
+        {
+            if (mode == kModeFetch4 && texFetch4) return texFetch4;
+            if ((mode == kModeDref || mode == kModeDrefClamp) && texShadow) return texShadow;
+        }
         if (mode != kModeDefault) specFallbacks++;   // the format was not available
         switch (kind)
         {
@@ -3216,9 +3264,18 @@ class ShaderPrecompiler
         // Fetch4 is a sampler state, so it has to be taken OFF the slots that had
         // it as well as put on the ones that want it -- DXVK reads it per slot on
         // every draw, and a leftover 'GET4' would specialise the next key.
+        //
+        // "Off" is the FOURCC 'GET1', not 0. DXVK latches the bit on 'GET4' and
+        // clears it ONLY on 'GET1'; any other value, zero included, leaves
+        // fetch4SamplerState exactly as it was (SetStateSamplerState,
+        // d3d9_device.cpp:4583-4586, which has no else branch). Writing 0 here
+        // would leave the latch set on that slot for the rest of the session --
+        // invisible to the state verifier, because the D3D9-visible bias value
+        // does compare equal -- and the game's INTZ depth binds with POINT
+        // filtering would then turn a real Fetch4 on during gameplay.
         uint32_t want = 0;
         for (uint32_t i = 0; i < kPSSamplers; i++)
-            if (k.samplerMode[i] == kModeFetch4 && k.samplerType[i] && texFetch4) want |= 1u << i;
+            if (k.samplerMode[i] == kModeFetch4 && k.samplerType[i] == kSampler2D && texFetch4) want |= 1u << i;
         // After a slice boundary the loading screen's own sampler states are back
         // and we do not know what they hold, so every slot is written rather than
         // only the ones that changed.
@@ -3227,7 +3284,7 @@ class ShaderPrecompiler
         {
             if (!((change >> i) & 1)) continue;
             const bool on = (want >> i) & 1;
-            d->SetSamplerState(i, D3DSAMP_MIPMAPLODBIAS, on ? MAKEFOURCC('G','E','T','4') : 0);
+            d->SetSamplerState(i, D3DSAMP_MIPMAPLODBIAS, on ? MAKEFOURCC('G','E','T','4') : MAKEFOURCC('G','E','T','1'));
             d->SetSamplerState(i, D3DSAMP_MAGFILTER, on ? D3DTEXF_POINT : D3DTEXF_LINEAR);
         }
         specFetch4Slots = want;
@@ -3286,12 +3343,21 @@ class ShaderPrecompiler
         // it this recording actually exercises. A field that never varies must not
         // split anything -- that is the whole dedup contract -- so say which ones
         // vary and by how many draws, rather than asserting the key got no coarser.
+        //
+        // COUNTED OVER RECORDED KEYS ONLY. A key from a pre-v3 file did not record
+        // these fields: WidenToV3 fills them in with zeros, D3D9's default stage
+        // block and the popcount of the clip-plane enable mask. Counting those in
+        // would report the widening as if it were a fact about the game -- which is
+        // how a previous round printed four zeroes and read them as a measurement --
+        // so they are excluded and their number is stated instead.
         {
             std::unordered_set<uint64_t> without;
             without.reserve(replayRecs.size());
             uint32_t withBools = 0, withClip = 0, withProj = 0, withMode = 0, ff = 0;
-            for (const auto& k : replayRecs)
+            uint32_t recorded = 0, widened = 0;
+            for (size_t r = 0; r < replayRecs.size(); r++)
             {
+                const KeyRecord& k = replayRecs[r];
                 KeyRecord flat = k;
                 flat.vsBools = flat.psBools = 0;
                 flat.clipPlaneCount = 0;
@@ -3300,6 +3366,8 @@ class ShaderPrecompiler
                 pipelinekeys::DefaultFFStages(flat.ffStage);
                 without.insert(ReplayPipelineKey(flat));
 
+                if (replaySources[replaySrc[r]].version < pipelinekeys::kCacheVersion) { widened++; continue; }
+                recorded++;
                 if (k.vsBools || k.psBools) withBools++;
                 if (k.clipPlaneCount) withClip++;
                 if (k.projMask) withProj++;
@@ -3308,10 +3376,11 @@ class ShaderPrecompiler
                 if (!k.psHash) ff++;
             }
             Log("replay: the specialisation state is worth %zu pipelines (%zu keys without it, %zu with); "
-                "of %zu recorded keys, %u carry a b# register, %u a clip plane, %u a projected stage, "
-                "%u a Fetch4/depth-compare sampler, %u no pixel shader",
+                "of %u keys that RECORDED it, %u carry a b# register, %u a clip plane, %u a projected stage, "
+                "%u a Fetch4/depth-compare sampler, %u no pixel shader (%u more keys predate the fields and "
+                "were widened, so they cannot carry any)",
                 seenPipeline.size() - without.size(), without.size(), seenPipeline.size(),
-                replayRecs.size(), withBools, withClip, withProj, withMode, ff);
+                recorded, withBools, withClip, withProj, withMode, ff, widened);
         }
         // Warm the pipelines the game uses MOST first. If a budget or an early exit
         // cuts the pass short, what got built is then the part that matters, not an
@@ -3596,6 +3665,13 @@ class ShaderPrecompiler
         dev->SetIndices(nullptr);
         for (uint32_t i = 0; i < kPSSamplers; i++) dev->SetTexture(i, nullptr);
         for (uint32_t i = 0; i < kVSSamplers; i++) dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + i, nullptr);
+        // Fetch4 is the one piece of state the D3DSBT_ALL restore cannot undo:
+        // the game's own bias value goes through the same SetStateSamplerState
+        // and only 'GET1' clears DXVK's latch, so sweep every pixel sampler here
+        // unconditionally. It is self-healing -- if the game itself had Fetch4
+        // on a slot, the state block writes 'GET4' back and re-latches it.
+        for (uint32_t i = 0; i < kPSSamplers; i++)
+            dev->SetSamplerState(i, D3DSAMP_MIPMAPLODBIAS, MAKEFOURCC('G','E','T','1'));
 
         // If we stopped early the bar must still reach 100%, or it reads as a hang.
         if (exitedEarly) workDone = workTotal;
@@ -3607,9 +3683,11 @@ class ShaderPrecompiler
         // the slot warms its default-mode pipeline instead -- but it means the key
         // asked for something this device cannot reach, which is worth knowing
         // before anyone explains a stutter by the key being wrong.
+        // Counted per slot per DRAW, not per distinct slot: one slot on five hundred
+        // keys is five hundred here. Say "binds" so nobody reads it as coverage.
         if (specFallbacks)
-            Log("replay: %u sampler slots wanted Fetch4 or depth compare and got the plain "
-                "texture instead (R32F scratch %s, D24S8 scratch %s) - those slots warmed the "
+            Log("replay: %u sampler binds wanted Fetch4 or depth compare and got the plain "
+                "texture instead (R32F scratch %s, D24S8 scratch %s) - those binds warmed the "
                 "default-mode pipeline, not the one the key recorded",
                 specFallbacks, texFetch4 ? "created" : "REFUSED by the device",
                 texShadow ? "created" : "REFUSED by the device");
@@ -4135,9 +4213,10 @@ class ShaderPrecompiler
             d->SetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
         // And Fetch4, which is a SAMPLER state: the recorded replay runs before
         // this walk and may have left 'GET4' on a slot, which would specialise
-        // spec constant 5 on every job that binds a texture there.
+        // spec constant 5 on every job that binds a texture there. 'GET1' is the
+        // only value that clears DXVK's latch -- 0 leaves it exactly as it was.
         for (DWORD s = 0; s < pipelinekeys::kPSSamplers; s++)
-            d->SetSamplerState(s, D3DSAMP_MIPMAPLODBIAS, 0);
+            d->SetSamplerState(s, D3DSAMP_MIPMAPLODBIAS, MAKEFOURCC('G','E','T','1'));
         // The four vertex-texture samplers are half of DXVK's spec constant 3
         // and nothing in this pass ever binds them, so whatever the recorded
         // replay last left there would ride along on every engine draw. Null
@@ -5356,6 +5435,15 @@ class ShaderPrecompiler
         SAFE_RELEASE(tex2D);
         SAFE_RELEASE(texCube);
         SAFE_RELEASE(texVol);
+        SAFE_RELEASE(texFetch4);
+        // texShadow is the one texture here that has to live in D3DPOOL_DEFAULT
+        // (D3DUSAGE_DEPTHSTENCIL admits no other pool), so it is a LOSABLE
+        // resource: DXVK refuses Reset outright while one is alive
+        // (D3D9DeviceEx::Reset -> "device still has alive losable resources"),
+        // and GTA IV resets for a resolution or fullscreen change. Leaving it
+        // behind would not leak memory, it would break every later Reset for
+        // the rest of the session.
+        SAFE_RELEASE(texShadow);
         SAFE_RELEASE(backdrop);
         SAFE_RELEASE(overlayBase);
         overlayTitle.clear(); overlaySub.clear();

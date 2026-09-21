@@ -288,9 +288,14 @@ namespace warmmusic
         // loading tune, -24.3 for the menu music, -28.0 for the starting tune
         // and -24.3 for the credits. Nothing here is silent.
         return {
-            { Kind::Stems, 0, "",                                 150 },  // the loading music, as shipped
-            { Kind::Named, 0, "MENU_MUSIC_1",                     240 },  // the pause / frontend menu music
+            // THE OPENER IS SHORT ON PURPOSE. Once the driver's cache is warm this
+            // gate is about 126 seconds, so anything past the second entry is never
+            // heard on the shipped path -- the first measured default run played one
+            // 126-second loading tune and nothing else. The episode's own music is
+            // therefore entry two, and the scene-setting material follows it.
+            { Kind::Stems, 0, "",                                  45 },  // the loading music, as shipped
             { Kind::Named, 0, "RADIO_VLADIVOSTOK_CHIKI",          330 },
+            { Kind::Named, 0, "MENU_MUSIC_1",                     240 },  // the pause / frontend menu music
             { Kind::Named, 0, "RADIO_VLADIVOSTOK_REPREZENTY",     330 },
             { Kind::Named, 0, "RADIO_VLADIVOSTOK_ADD_SPEED",      330 },
             { Kind::Stems, 0, "",                                  90 },  // back to the loading music
@@ -346,9 +351,11 @@ namespace warmmusic
         // instead, and the engine's stems, if they were the thing playing when
         // the gate opened, are handed back untouched at the end as before.
         return {
-            { Kind::Named, 0, "LOADING_TUNE",                            150 },  // EP1_SFX\LOADINGTUNE_1
-            { Kind::Named, 0, "EP1_INTRO_MUSIC_TRACK",                   180 },  // the episode's intro theme
+            // Short opener, hard rock second: a warm-cache gate is about 126 seconds
+            // and only the first two entries are ever reached on the shipped path.
+            { Kind::Named, 0, "LOADING_TUNE",                             45 },  // EP1_SFX\LOADINGTUNE_1
             { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_00_HIGHWAYSTAR_PH", 330 },
+            { Kind::Named, 0, "EP1_INTRO_MUSIC_TRACK",                   180 },  // the episode's intro theme
             { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_HAIROFTHEDOG_PH",   330 },
             { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_WHEELOFSTEEL_PH",   330 },
             { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_LORDOFTHETHIGHS_PH",330 },
@@ -394,9 +401,11 @@ namespace warmmusic
         // here is the EP2_SFX\MENU_MUSIC set that TBoGT's own table puts
         // behind it, and it is the loudest thing in the rotation at -23.4.
         return {
-            { Kind::Named, 0, "LOADING_TUNE",                            150 },  // EP2_SFX\LOADING_TUNE
-            { Kind::Named, 0, "MENU_MUSIC_1",                            240 },  // EP2_SFX\MENU_MUSIC
+            // Short opener, the club second: a warm-cache gate is about 126 seconds
+            // and only the first two entries are ever reached on the shipped path.
+            { Kind::Named, 0, "LOADING_TUNE",                             45 },  // EP2_SFX\LOADING_TUNE
             { Kind::Named, 0, "E2_RADIO_DANCE_MIX_CROOKERS_MIX",         600 },  // Electro-Choc, the Crookers mix
+            { Kind::Named, 0, "MENU_MUSIC_1",                            240 },  // EP2_SFX\MENU_MUSIC
             { Kind::Named, 0, "E2_RADIO_VLADIVOSTOK_EUROBEAT_MIX",       600 },  // Vladivostok FM, the eurobeat mix
             { Kind::Named, 0, "RADIO_DANCE_MIX_FK",                      420 },  // Electro-Choc, the Francois K mix
             { Kind::Named, 0, "DANCING_HERCULES_MIX",                    300 },  // the Hercules dance floor

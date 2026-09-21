@@ -207,6 +207,22 @@ namespace d3d9cache
                (f >= 82 && f <= 85) || IsFourCCDepth(f);
     }
 
+    // The formats DXVK actually depth-COMPARES a bound texture with, which is a
+    // different question from "is this a depth format" and has to be asked with
+    // DXVK's own answer: D3D9CommonTexture::DetermineShadowState is its IsDepthFormat
+    // (d3d9_format.h:288) minus the INTZ/DF16/DF24 blacklist, and that list is
+    // NARROWER than the one above -- it has no RAWZ and no D3DFMT_S8_LOCKABLE.
+    // Using the wide one to record a sampler MODE would put a mode in the key that
+    // DXVK never sets, so the replay would warm a pipeline the game cannot produce
+    // and leave the one it does produce cold.
+    inline bool IsShadowFormat(uint32_t f)
+    {
+        return f == 70 /* D16_LOCKABLE */ || f == 71 /* D32   */ || f == 73 /* D15S1        */ ||
+               f == 75 /* D24S8        */ || f == 77 /* D24X8 */ || f == 79 /* D24X4S4      */ ||
+               f == 80 /* D16          */ || f == 82 /* D32F_LOCKABLE */ || f == 83 /* D24FS8 */ ||
+               f == 84 /* D32_LOCKABLE */;
+    }
+
     // nullptr if `v` is a value D3D9 defines for render state `rs`, else what it is
     // not. Only the enum- and float-valued states are checked: booleans, masks and
     // reference values take any DWORD in D3D9. Keyed by state, not by position, so
