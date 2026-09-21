@@ -81,6 +81,7 @@ module;
 #include "pipelinekeys.h"
 #include "d3d9cache.h"
 #include "enginewarm.h"
+#include "warmmusic.h"
 
 export module shaderprecompile;
 
@@ -146,6 +147,15 @@ struct PrecompileConfig
     // from RAGE's own live tables, so it needs no recording at all -- see the
     // ini text for what the recorded cache still covers that it cannot.
     int     engineWarm    = 0;      // PrecompileEngineWarm
+    // The warm-up's music (warmmusic.h). The hold can run for tens of minutes
+    // and the loading screen's own six stems loop every forty seconds, so the
+    // rotation brings in the rest of what the game has resident here. 0 turns
+    // it off entirely and leaves the engine's loading music exactly as shipped.
+    bool        warmMusic = true;        // PrecompileWarmMusic
+    std::string warmMusicTracks;         // PrecompileWarmMusicTracks, empty = the shipped rotation
+    // vkcapture owns this one; it is read here only so the band can say "stage
+    // 2 of 3" instead of guessing how many stages the load has.
+    bool    replayVulkan  = true;   // ReplayVulkanPipelines
 };
 
 // ===========================================================================
@@ -450,6 +460,37 @@ class ShaderPrecompiler
     // measures something that is not work done -- the waits for DXVK to go quiet.
     static inline const char* curWhat = "Compiling shaders";
     static inline std::string curTitle;
+    // WHERE THE PLAYER IS IN THE WHOLE LOAD, which the bar alone cannot say: it
+    // restarts at every phase, and on a cold cache there are three of them and
+    // the whole thing is tens of minutes. The band shows "STAGE k OF n" and
+    // scopes its time estimate to the stage it is actually measuring, because
+    // an estimate that silently means "of this phase" is a lie on a 40-minute
+    // load. Set by the phases themselves; counted once, at the pass's start.
+    static inline int stageNo = 0;
+    static inline int stageCount = 1;
+    // Enter the next stage. stageCount is what the configuration says will run;
+    // it grows rather than lies if a stage turns up that was not counted, and
+    // HoldForVulkanReplay shrinks it when its stage turns out to have nothing
+    // to do. curLabel belongs to the stage that set it, so it goes too.
+    static void EnterStage(const char* what)
+    {
+        stageNo++;
+        if (stageNo > stageCount) stageCount = stageNo;
+        curWhat = what;
+        curLabel.clear();
+        // The bar belongs to the stage that is measuring it. Leaving the last
+        // stage's counters in place would show the new one as finished before
+        // it has drawn a thing, which is exactly the kind of lie a 40-minute
+        // load cannot afford.
+        workDone = 0;
+        workTotal = 1;
+        tPhase = std::chrono::steady_clock::now();
+    }
+    // The repeat path: the warm stamp matched and the driver still had the
+    // pipelines, so the engine walk stopped after its 512-job probe. That is a
+    // completely different load from the full pass and the band has to say so
+    // -- in the stage it happened in, not for the rest of the load.
+    static inline std::atomic<int> cheapStage{ 0 };
     static inline std::chrono::steady_clock::time_point tStart;
     static inline std::chrono::steady_clock::time_point tPhase;   // what the bar's ETA extrapolates from
     static inline std::chrono::steady_clock::time_point tLastPresent;
@@ -3665,6 +3706,21 @@ class ShaderPrecompiler
                     skippedWarm = true;
                     stopped = true;
                     stopWhy = " [driver cache already warm, stamp matched]";
+                    // Say so on the loading screen too: this load is seconds,
+                    // not the twenty minutes the full pass takes, and a player
+                    // watching a bar jump to the end deserves the reason. Give
+                    // it long enough to be read -- the loading screen keeps
+                    // drawing while the pass fiber sleeps, and 1.2 s on a load
+                    // that just saved twenty minutes is not a cost.
+                    cheapStage = stageNo;
+                    curLabel.clear();
+                    workDone = workTotal;
+                    lastProgressUs = 0;
+                    PublishProgress();
+                    // Only when the band is what the player is looking at: on
+                    // the fail-safe gate the mod presents its own frames and
+                    // this would be 1.2 s of frozen overlay for nothing.
+                    if (bootgate::Prog().active) PassSleep(1200);
                     break;
                 }
             }
@@ -3871,6 +3927,9 @@ class ShaderPrecompiler
         if (!vr.running || BudgetSpent())
         {
             vr.passDone = true;
+            // The stage was counted from the configuration and it is not going
+            // to happen, so the band must stop promising it.
+            if (stageCount > stageNo) stageCount = stageNo;
             Log("order: 2. no Vulkan replay to hold the loading screen for (%s), t=%.3f",
                 vr.running ? "PrecompileBudgetSeconds reached, it runs in the background" : "none running", vr.Seconds());
             return false;
@@ -3882,7 +3941,7 @@ class ShaderPrecompiler
         const auto h0 = std::chrono::steady_clock::now();
         tPhase = h0;
         workDone = 0;
-        curWhat = "Warming Vulkan pipelines";
+        EnterStage("Warming Vulkan pipelines");
         bool budgetHit = false;
         auto labelAt = h0 - std::chrono::seconds(1);
         while (vr.running)
@@ -4073,12 +4132,38 @@ class ShaderPrecompiler
         engineStateOK = false;
     }
 
-    // What the loading screen shows. Uppercase and stripped, because the only
-    // text engine available at this gate is the 5x7 glyph set in bootgate.h --
-    // CFont faults here (its textures are unloaded between the frontend and
-    // the first gameplay frame) and an ID3DXFont would draw through the device
-    // immediately, which is not where this frame is being recorded.
+    // -------------------------------------------------------------------
+    //  What the loading screen shows.
+    //
+    //  Four strings for the band bootgate.h draws inside the game's own loading
+    //  screen: a headline and a percentage on the top row, the detail and a
+    //  time estimate on the bottom one. Every one of them comes from a counter
+    //  the pass already keeps and already logs, so what the player reads and
+    //  what FusionFix.shaders.log says are the same thing.
+    //
+    //  THE ESTIMATE IS SCOPED, DELIBERATELY. The bar measures ONE phase, and a
+    //  cold first launch runs three of them; extrapolating the current phase's
+    //  rate and calling the answer "time left" would under-report a 40-minute
+    //  load by a factor of three. So the band says which stage of how many it
+    //  is on, and the estimate says "left in this stage" -- and says nothing at
+    //  all until there is enough of the stage behind it to extrapolate from.
+    //  Uppercase throughout, which is how the game sets its own UI labels.
+    // -------------------------------------------------------------------
     static inline int64_t lastProgressUs = 0;
+
+    static void Upper(char* s)
+    {
+        for (char* c = s; *c; c++) if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);
+    }
+
+    static void FormatClock(char* out, size_t cap, double seconds)
+    {
+        if (seconds < 0.0) seconds = 0.0;
+        if (seconds > 359999.0) seconds = 359999.0;     // 99:59:59
+        const int s = (int)seconds;
+        if (s >= 3600) _snprintf_s(out, cap, _TRUNCATE, "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60);
+        else           _snprintf_s(out, cap, _TRUNCATE, "%d:%02d", s / 60, s % 60);
+    }
 
     static void PublishProgress()
     {
@@ -4088,25 +4173,66 @@ class ShaderPrecompiler
         const int64_t now = pipelinekeys::ClockUs();
         if (now - lastProgressUs < 100000) return;
         lastProgressUs = now;
-        float frac = (float)workDone.load() / (float)(workTotal ? workTotal : 1);
-        frac = std::clamp(frac, 0.0f, 1.0f);
-        char line[48];
-        const auto secs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              std::chrono::steady_clock::now() - tPhase).count() / 1000.0;
-        if (secs >= 3.0 && frac >= 0.03f)
+
+        const uint32_t done = workDone.load();
+        const uint32_t total = workTotal ? workTotal : 1;
+        float frac = std::clamp((float)done / (float)total, 0.0f, 1.0f);
+
+        const auto nowTp = std::chrono::steady_clock::now();
+        const double inStage = std::chrono::duration<double>(nowTp - tPhase).count();
+        const double overall = std::chrono::duration<double>(nowTp - tStart).count();
+        // curTitle is set only by the settles, which measure a quiet second and
+        // not work done; their bar is not progress and must not be estimated
+        // from. The headline is then the settle's own sentence.
+        const bool settling = !curTitle.empty();
+
+        const bool cheap = cheapStage.load() == stageNo;
+
+        char head[64], pct[24], detail[96], eta[48], clock[24];
+        _snprintf_s(head, sizeof(head), _TRUNCATE, "%s",
+                    cheap ? "Reusing the warm cache"
+                          : (settling ? curTitle.c_str() : curWhat));
+        _snprintf_s(pct, sizeof(pct), _TRUNCATE, "%d%%", (int)(frac * 100.0f));
+
+        FormatClock(clock, sizeof(clock), overall);
+        if (cheap)
         {
-            double eta = secs * (1.0 - frac) / frac;
-            if (eta > 5999.0) eta = 5999.0;
-            _snprintf_s(line, sizeof(line), _TRUNCATE, "%s  %d%%  ETA %d:%02d",
-                        curWhat, (int)(frac * 100.0f), (int)eta / 60, (int)eta % 60);
+            _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                        "the driver already has these pipelines - skipping the full pass   %s",
+                        clock);
+        }
+        else if (!curLabel.empty())
+        {
+            _snprintf_s(detail, sizeof(detail), _TRUNCATE, "stage %d of %d   %s   %s",
+                        stageNo, stageCount, curLabel.c_str(), clock);
         }
         else
         {
-            _snprintf_s(line, sizeof(line), _TRUNCATE, "%s  %d%%", curWhat, (int)(frac * 100.0f));
+            _snprintf_s(detail, sizeof(detail), _TRUNCATE, "stage %d of %d   %s",
+                        stageNo, stageCount, clock);
         }
-        for (char* c = line; *c; c++)
-            if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);
-        bootgate::SetProgress(frac, line);
+
+        if (cheap)
+        {
+            _snprintf_s(eta, sizeof(eta), _TRUNCATE, "this launch is seconds, not minutes");
+        }
+        else if (settling)
+        {
+            _snprintf_s(eta, sizeof(eta), _TRUNCATE, "not timed - this finishes when the driver does");
+        }
+        else if (inStage >= 10.0 && frac >= 0.02f)
+        {
+            char left[24];
+            FormatClock(left, sizeof(left), inStage * (1.0 - frac) / frac);
+            _snprintf_s(eta, sizeof(eta), _TRUNCATE, "about %s left in this stage", left);
+        }
+        else
+        {
+            _snprintf_s(eta, sizeof(eta), _TRUNCATE, "working out how long this stage will take");
+        }
+
+        Upper(head); Upper(pct); Upper(detail); Upper(eta);
+        bootgate::SetProgress(frac, head, pct, detail, eta);
     }
 
     // Called from the pass fiber wherever the pass used to present a frame of
@@ -4326,8 +4452,19 @@ class ShaderPrecompiler
         }
         gateFromBoot = true;
         bootgate::Prog().active = true;
-        bootgate::SetProgress(0.0f, "PREPARING SHADERS");
+        bootgate::SetProgress(0.0f, "PREPARING SHADERS", "0%",
+                              "READING THE SHADER DATABASE", "");
         gateOpen = true;
+
+        // The music, before the hold: the loading screen's own six stems loop
+        // every forty seconds and this hold is measured in tens of minutes.
+        // Engine calls only, on this thread, and End() below runs on every path.
+        warmmusic::Log() = &Log;
+        warmmusic::Begin(t0, cfg.warmMusic, cfg.warmMusicTracks);
+        // Belt and braces: a fault anywhere below this point must not leave a
+        // track of ours playing into gameplay. End() is idempotent, so the
+        // explicit call at the end of the hold stays where it reads best.
+        struct MusicOff { ~MusicOff() { warmmusic::End(); } } musicOff;
 
         // Hold. The loading-screen thread picks the pass up on its next tick
         // and runs it in slices between the frames it draws; nothing else runs
@@ -4385,11 +4522,37 @@ class ShaderPrecompiler
                 AbandonPass("it did not unwind and can no longer be resumed");
                 break;
             }
+            warmmusic::Tick(now);
             bootgate::PumpOs();
             Sleep(1);
         }
         gateOpen = false;
+        // Nothing of ours may still be audible when the loading screen comes
+        // down, and the engine's own loading music has to be playing again if
+        // it was when we arrived -- the game's first frame is what stops it.
+        warmmusic::End();
         bootgate::Prog().active = false;
+        {
+            bootgate::Progress& pr = bootgate::Prog();
+            char how[96];
+            if (!pr.nativeChecked)
+                _snprintf_s(how, sizeof(how), _TRUNCATE, "nothing - the loading screen never drew a frame");
+            else if (pr.nativeFont)
+                _snprintf_s(how, sizeof(how), _TRUNCATE, "the game's own font (CFont style %d)",
+                            (int)pr.fontStyle);
+            else if (pr.faultStep)
+                _snprintf_s(how, sizeof(how), _TRUNCATE,
+                            "the 5x7 glyph set - CFont faulted at step %d", (int)pr.faultStep);
+            else
+                _snprintf_s(how, sizeof(how), _TRUNCATE,
+                            "the 5x7 glyph set - no font texture is resident here");
+            Log("gate: progress drew with %s; band %.1f%% of the screen, rule %.3f, colour "
+                "0x%08X, text 0x%08X / 0x%08X (%s)", how, (double)pr.bandFrac * 100.0,
+                (double)pr.ruleFrac, (unsigned)pr.ruleARGB,
+                (unsigned)pr.textARGB, (unsigned)pr.detailARGB,
+                pr.styleFromGame ? "the pause menu's own tables"
+                                 : "the shipped fallback - the menu layout table was not readable");
+        }
         Log("gate: released after %.1f s, %u slices", (pipelinekeys::ClockUs() - t0) / 1e6,
             sliceCount);
         // The pin is released here, and the very next instruction the engine
@@ -4447,6 +4610,15 @@ class ShaderPrecompiler
         tStart = std::chrono::steady_clock::now();
         tPhase = tStart;
         tLastPresent = tStart - std::chrono::milliseconds(1000);
+
+        // How many stages this load will have, from the configuration, so the
+        // band can tell the player where in the whole thing they are. The
+        // stages are: the shader/replay pass, the engine walk if it is on, and
+        // the Vulkan replay if it is.
+        stageNo = 0;
+        stageCount = 1 + (cfg.engineWarm > 0 ? 1 : 0) + (cfg.replayVulkan ? 1 : 0);
+        cheapStage = 0;
+        EnterStage("Compiling shaders");
 
         // The slice driver may already have taken the device, so that the very
         // first slice -- the one that loads the .fxc database and creates every
@@ -4567,7 +4739,7 @@ class ShaderPrecompiler
             // PrecompileBudgetSeconds cut sheds the speculative work first.
             if (cfg.engineWarm > 0)
             {
-                curWhat = "Warming engine pipelines";
+                EnterStage("Warming engine pipelines");
                 Log("order: 1b. engine warm phase (level %d), t=%.3f",
                     cfg.engineWarm, pipelinekeys::VulkanReplay().Seconds());
                 EngineWarmPass(db);
@@ -4914,6 +5086,9 @@ class ShaderPrecompiler
         cfg.sliceMs       = ini.ReadInteger("SHADERS", "PrecompileSliceMs", 8);
         cfg.gateMaxSeconds = ini.ReadInteger("SHADERS", "PrecompileGateMaxSeconds", 0);
         cfg.reuseStamp    = ini.ReadInteger("SHADERS", "PrecompileReuseWarmCache", 1) != 0;
+        cfg.warmMusic     = ini.ReadInteger("SHADERS", "PrecompileWarmMusic", 1) != 0;
+        cfg.warmMusicTracks = ini.ReadString("SHADERS", "PrecompileWarmMusicTracks", "");
+        cfg.replayVulkan  = ini.ReadInteger("SHADERS", "ReplayVulkanPipelines", 1) != 0;
         // Not ours, but it is the only thing that can put a sample count on a
         // render target, and the sample count is in the pipeline key. The
         // engine cannot be asked at the gate (no D3D texture exists behind a
