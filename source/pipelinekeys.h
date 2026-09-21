@@ -61,6 +61,21 @@ namespace pipelinekeys
     // derives the packed form from the raw values together with the bound textures
     // and the render target, and the replay rebuilds all three, so letting DXVK do
     // the packing is the only way the two can never disagree.
+    //
+    // WHAT A REAL CAPTURE OF THIS INSTALL HOLDS, measured 2026-09-21 off the first
+    // v3 recording (14,543 keys, 10.2 M draws, GTA IV Complete Edition + FusionFix
+    // + Liberty City Plates under DXVK 3.1.1): 1180 keys have no pixel shader and
+    // ALL 1180 carry ONE stage block, which is D3D9's own default -- exactly what
+    // the replay had been binding before the field existed. 473 keys carry a clip
+    // plane, every one of them count 1, which is what widening a pre-v3 record from
+    // the popcount of the enable mask infers. Nothing carries a b# register, a
+    // projected stage or a Fetch4/depth-compare sampler. The v3 capture and the v2
+    // snapshot it replaced therefore produce the SAME partition -- 5445 replay
+    // identities and 599 base identities offline either way -- so on this install
+    // the fields cost nothing and prove the widening right rather than replacing
+    // it. That is a fact about this install, not about the game: a mod that draws
+    // its own 2D, or an episode that does, can still need a second stage block, and
+    // the pass's own "of N keys that RECORDED it" line is how to check.
 #pragma pack(push, 1)
     struct FFStage
     {

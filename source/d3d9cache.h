@@ -324,6 +324,13 @@ namespace d3d9cache
     //   is taken to be the popcount of the enable mask. That is the direction that
     //   over-warms (a pipeline built that this key never needed) rather than the one
     //   that stutters, and it is what a v3 capture of the same draw would record.
+    //
+    // THAT INFERENCE IS NOW MEASURED, not argued: the first v3 capture of this
+    // install (2026-09-21, 14,543 keys) records 473 keys with a clip plane and
+    // every one of them at count 1 -- the same 473 the popcount widening produces,
+    // since no key enables more than one plane. Every other widened field is what
+    // the capture recorded too, so the widened v2 file and the v3 capture partition
+    // into the same 5445 replay identities and 599 base identities.
     inline void WidenToV3(KeyRecord& k)
     {
         using namespace pipelinekeys;
