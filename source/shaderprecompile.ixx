@@ -1913,6 +1913,12 @@ class ShaderPrecompiler
     static inline const int kRS_PointSprite     = RSIndexOf(D3DRS_POINTSPRITEENABLE);
     static inline const int kRS_PointScale      = RSIndexOf(D3DRS_POINTSCALEENABLE);
     static inline const int kRS_SpecularEnable  = RSIndexOf(D3DRS_SPECULARENABLE);
+    // DxvkRsInfo / DxvkMsInfo: rasterizer and multisample state that is BAKED into
+    // DxvkGraphicsPipelineStateInfo (dxvk_context.cpp:2956, 2972), not dynamic.
+    static inline const int kRS_ShadeMode       = RSIndexOf(D3DRS_SHADEMODE);
+    static inline const int kRS_FillMode        = RSIndexOf(D3DRS_FILLMODE);
+    static inline const int kRS_MsaaEnable      = RSIndexOf(D3DRS_MULTISAMPLEANTIALIAS);
+    static inline const int kRS_MsaaMask        = RSIndexOf(D3DRS_MULTISAMPLEMASK);
     static inline const int kRS_BlendEnable     = RSIndexOf(D3DRS_ALPHABLENDENABLE);
     static inline const int kRS_SeparateAlpha   = RSIndexOf(D3DRS_SEPARATEALPHABLENDENABLE);
     static inline const int kRS_ColorBlend[3]   = { RSIndexOf(D3DRS_SRCBLEND), RSIndexOf(D3DRS_DESTBLEND),
@@ -1956,6 +1962,9 @@ class ShaderPrecompiler
             uint32_t rt[pipelinekeys::kMaxRT], ds, ms, msq;
             uint32_t writeMask[pipelinekeys::kMaxRT];
             uint32_t blendEnable, color[3], alpha[3];
+            // DxvkRsInfo and DxvkMsInfo, both members of
+            // DxvkGraphicsPipelineStateInfo and both compared byte for byte.
+            uint32_t flatShading, polygonMode, sampleCount, sampleMask;
         } b;
         memset(&b, 0, sizeof(b));   // hashed as bytes, so padding must be zero too
 
@@ -1982,6 +1991,30 @@ class ShaderPrecompiler
                 b.alpha[j] = separate ? RSOr0(k, kRS_AlphaBlend[j]) : b.color[j];
             }
         }
+
+        // The rasterizer and multisample words, which the key dropped as "dynamic"
+        // and are not: DxvkContext::setRasterizerState packs depth clip, polygon
+        // mode, SAMPLE COUNT, conservative mode, FLAT SHADING and line mode into
+        // DxvkRsInfo and puts it in m_state.gp.state.rs; setMultisampleState does
+        // the same with the sample mask. Cull mode and front face really are
+        // dynamic and stay out.
+        //
+        // D3DRS_MULTISAMPLEANTIALIAS is the one that costs something here, and it
+        // is worth stating why it is not a no-op on a single-sampled target:
+        // BindRasterizerState maps it to sampleCount 0 ("take it from the render
+        // pass") or 1, and DxvkGraphicsPipelineStateInfo is compared as bytes, so
+        // the two are two cache entries and two compiles even where the resulting
+        // VkPipeline would be identical. Measured over the two files the replay
+        // loads: 95 of 1093 identities carry both values, so 95 pipelines the game
+        // builds were being skipped as duplicates of each other.
+        b.flatShading = RSOr0(k, kRS_ShadeMode) == D3DSHADE_FLAT;
+        b.polygonMode = RSOr0(k, kRS_FillMode);
+        b.sampleCount = RSOr0(k, kRS_MsaaEnable) ? 0u : 1u;
+        // DXVK only honours the mask when RT0 is multisampled above NONMASKABLE
+        // (m_validSampleMask, d3d9_device.cpp:1762); otherwise it forces 0xffff,
+        // so keying on it there would split for nothing.
+        b.sampleMask = (k.msType > D3DMULTISAMPLE_NONMASKABLE)
+                     ? (RSOr0(k, kRS_MsaaMask) & 0xFFFFu) : 0xFFFFu;
         return pipelinekeys::Fnv1a(&b, sizeof(b));
     }
 
