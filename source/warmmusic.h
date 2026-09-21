@@ -14,25 +14,78 @@
 //  game's own mixer, so the player's music volume applies exactly as it does to
 //  the loading music it replaces.
 //
-//  WHAT IS REACHABLE HERE, AND WHAT IS NOT (pc/audio/config/sounds.dat15):
-//    * The LOADING wave bank is loaded for the loading screen and holds
-//      LOADING_TUNE, MENU_STREAMED, the DEATH_ set, STARTING_TUNE,
-//      END_CREDITS_THEME_TUNE and INTRO_CUTSCENE_TRACK. Every sound whose wave
-//      lives there can be created by name at the gate.
+//  AND IT ROTATES THE EPISODE'S OWN MUSIC. Which episode is loading is read at
+//  the gate from the engine's own episode index (comvars' _dwCurrentEpisode,
+//  which FusionFix already finds by pattern and which every other episodic fix
+//  in this mod tests: 0 = IV, 1 = TLAD, 2 = TBoGT), never from a path or a
+//  file listing. Each episode gets a list drawn only from what THAT episode's
+//  audio data defines -- Vladivostok FM for Niko, Liberty Rock Radio's TLAD
+//  half for Johnny, Electro-Choc's club mixes and K109's TBoGT disco for Luis
+//  -- plus that episode's own loading and menu music. The candidate names were
+//  read out of the shipped tables (pc/audio/config/sounds.dat15 for the base
+//  game, TLAD/pc/audio/config/EP1_*.DAT15 and TBoGT/.../EP2_*.DAT15 for the
+//  episodes, whose entries are [u32][u32][u8 length][name]) and then every one
+//  of them was PLAYED AT THIS GATE AND RECORDED off the system mix, because
+//  the tables are not the last word: see EVERY NAME HERE WAS HEARD below.
+//
+//  WHY THE LISTS ARE PER EPISODE, measured rather than assumed (2026-09-21).
+//  An episode-foreign name does NOT fail the same way in every episode:
+//    * on an IV boot, E2_RADIO_DANCE_MIX_CROOKERS_MIX is REFUSED outright --
+//      "the engine has no sound called ...", which is the safe failure;
+//    * on a TLAD boot, the same name is CREATED and then plays absolute
+//      digital silence, -120 dBFS for its whole slot, which is the failure
+//      this file exists to avoid;
+//    * on a TBoGT boot, TLAD's E1_RADIO_LIBERTY_ROCK_HAIROFTHEDOG_PH plays
+//      perfectly, byte-identical in the capture to the way it plays in TLAD.
+//  So "the engine made the sound" is not evidence that it will be audible,
+//  and the only safe rule is the one this file follows: play an episode's
+//  names only in that episode.
+//
+//  LOADING_TUNE does the episode work for free: all three tables define it,
+//  each pointing at its own wave (EP1_SFX\LOADINGTUNE_1, EP2_SFX\LOADING_TUNE),
+//  and the three captures have three different spectra -- centroid 3090 Hz on
+//  IV, 1641 on TLAD, 3443 on TBoGT -- so the override is real.
+//
+//  EVERY NAME HERE WAS HEARD, and some obvious ones did not survive it. Each
+//  list below was played at this gate with PrecompileWarmMusicTracks* at
+//  ~12-25 s an entry while the system mix was recorded, and each slot's RMS
+//  was measured. Struck out by measurement:
+//    * MENU_MUSIC_STREAMED -- SILENT in ALL THREE episodes, including a 25 s
+//      slot and a second pass on an IV boot. This is the name the previous
+//      rotation used for "the pause / frontend menu music", and the run that
+//      "spent ten minutes on it" spent ten minutes on silence. The frontend
+//      music that IS audible here is MENU_MUSIC_1 (-24 dBFS on IV, -23 on
+//      TBoGT, each episode's own arrangement) -- but not on TLAD, where
+//      MENU_MUSIC_1, MENU_MUSIC_DULCIMER and MENU_MUSIC_PERCUSSION are all
+//      silent, so TLAD's list carries no menu music and leans on the
+//      episode's own loading tune and intro theme instead.
+//    * INTRO_MUSIC_TRACK -- silent on an IV boot, although the episode's own
+//      EP1_INTRO_MUSIC_TRACK is fine on TLAD.
+//    * the INSTALL_MUSIC_ set -- silent, measured earlier and again here.
+//  Kept because they were heard: the six-stem loading set, LOADING_TUNE,
+//  STARTING_TUNE, END_CREDITS_MUSIC, MENU_MUSIC_1 (IV and TBoGT), all twelve
+//  Vladivostok FM songs, all fourteen of TLAD's Liberty Rock records and four
+//  of the base station's, EP1_INTRO_MUSIC_TRACK, E1_END_CREDITS_FIRST_TRACK,
+//  both Electro-Choc mixes, the TBoGT eurobeat mix, ten K109 records and the
+//  Hercules dance-floor mix.
+//
+//  WHAT IS REACHABLE HERE, AND WHAT IS NOT:
 //    * The frontend audio entity 0x01176888 owns both loading-music stem sets --
 //      LOADING_MUSIC_* and INSTALL_MUSIC_* (the console install screen's, a
 //      second full arrangement of the same theme that the PC build still ships)
-//      -- through ONE engine call with a flag.
-//    * Radio tracks and MENU_MUSIC_STREAMED are STREAMED sounds: they have no
-//      wave until one is loaded through a STREAM wave slot, and the engine's
-//      own way of doing that on this very screen is 0x008E47C0, which plays
-//      LOADING_TUNE through the slot it looks up by the name "RADIO3_A".
-//      RADIO_DANCE_MIX_FK is Electro-Choc's continuous François K club mix,
-//      which is the closest thing the base game has to a "club track" that is
-//      one sound rather than a radio station with a DJ, adverts and a schedule.
+//      -- through ONE engine call with a flag. The LOADING_ set is audible in
+//      IV and in TLAD; the INSTALL_ set is silent (its waves are not in the
+//      PC build's LOADING bank).
+//    * Radio tracks are STREAMED sounds: they have no wave until one is loaded
+//      through a STREAM wave slot, and the engine's own way of doing that on
+//      this very screen is 0x008E47C0, which plays LOADING_TUNE through the
+//      slot it looks up by the name "RADIO3_A". That is the slot every Named
+//      track here goes through, and the streaming is not instant: a track
+//      given a 12 s slot in the probe runs was occasionally silent on its
+//      first play and audible on its second. The shipped slots are minutes.
 //    * What is NOT reachable: a radio STATION (it wants the world, a listener
-//      and the retune machinery) and the episodes' club interiors. A name that
-//      the engine will not make costs a log line and the next track.
+//      and the retune machinery). A name that the engine will not make costs a
+//      log line and the next track.
 //
 //  RULES IT KEEPS
 //    * Never leave anything of ours playing into gameplay: End() stops our
@@ -161,10 +214,42 @@ namespace warmmusic
         int         seconds = 0;
     };
 
-    // The shipped rotation. It opens on what the game itself is already playing,
-    // so the first minute of a warm-up sounds exactly like an ordinary load, and
-    // only then brings in the rest.
-    inline std::vector<Track> DefaultTracks()
+    // ---------------------------------------------------------------------
+    //  Which episode is loading.
+    //
+    //  THE GLOBAL, not a path. comvars resolves _dwCurrentEpisode by pattern
+    //  ("83 3D ? ? ? ? ? 75 0F 6A 02") and the whole mod reads it: cheats.ixx
+    //  tests it for the TLAD and TBoGT cheat sets, cutscenecam.ixx for TBoGT,
+    //  altdialogue.ixx indexes an array with it, and currentEpisodePath() maps
+    //  it through { "", "TLAD", "TBoGT" } -- so 0/1/2 is the mod's own settled
+    //  reading of it and this file does not get a second opinion.
+    //
+    //  The pointer arrives from the gate (this header is in the global module
+    //  fragment and cannot import comvars). It is validated the same way every
+    //  other engine read here is: readable, and holding a value this build's
+    //  episode index can actually be. Anything else means "do not know", and
+    //  "do not know" plays the mixed rotation rather than an episode's names.
+    // ---------------------------------------------------------------------
+    enum class Episode { Unknown = -1, IV = 0, TLAD = 1, TBoGT = 2 };
+
+    inline const char* EpisodeName(Episode e)
+    {
+        switch (e)
+        {
+        case Episode::IV:    return "GTA IV";
+        case Episode::TLAD:  return "The Lost and Damned";
+        case Episode::TBoGT: return "The Ballad of Gay Tony";
+        default:             return "an episode it could not name";
+        }
+    }
+
+    // ResolveEpisode is further down, with the other engine reads: it needs the
+    // guarded Peek, and nothing in this file may fault.
+
+    // The shipped rotation for the base game. It opens on what the game itself
+    // is already playing, so the first minute of a warm-up sounds exactly like
+    // an ordinary load, and only then brings in the rest.
+    inline std::vector<Track> DefaultTracksIV()
     {
         // EVERY ENTRY HAS A DURATION, and that is a correction from a measured
         // run. "0 seconds" means "until the sound ends by itself", which is
@@ -176,38 +261,198 @@ namespace warmmusic
         // Tick has a hard cap over the top of it for anything the ini asks for
         // at 0.
         //
-        // THE FOUR CONTINUOUS MIXES. GTA IV's radio is stations with DJs,
-        // adverts and a schedule, which need the world and a listener -- except
-        // for four stations that are one long DJ mix and nothing else, and
-        // those are a single sound each, the same shape as the one that was
-        // proven to play here. All four are in this build's own audio data
-        // (pc/audio/config/sounds.dat15, flat names): Electro-Choc's Francois
-        // K mix, Bobby Konders' Massive B Soundsystem, DJ Premier's The
-        // Classics and RamJam FM. A name the engine will not make costs a log
-        // line and the next entry, so a station whose wave will not stream at
-        // this gate is not a risk -- it is a line in FusionFix.shaders.log.
+        // NIKO'S EPISODE IS VLADIVOSTOK FM. Its twelve songs are the Russian
+        // pop of the base game, they are single sounds of exactly the shape
+        // that was proven to play at this gate, and twelve of them at five
+        // minutes is over an hour before the list can come round. Each name is
+        // a flat sound in pc/audio/config/sounds.dat15 (RADIO_VLADIVOSTOK\X
+        // gives the wave, RADIO_VLADIVOSTOK_X the sound the engine creates);
+        // the station's DJ links (RADIO_VLADIVOSTOK_SOLO_*) and idents
+        // (_ID_*) are deliberately not here, because a warm-up wants music and
+        // not Ruslana reading the news.
         //
-        // Roughly 45 minutes before it repeats, which is the hour the cold
-        // first launch is allowed to take with one track heard twice.
+        // The durations are a CAP, not a length. A radio track ends by itself
+        // at three to five minutes and the engine nulls our slot, which is how
+        // the rotation moves on; 330 seconds is only there so a track that
+        // turns out to loop cannot hold the screen. (That is the correction
+        // the first long hold forced: "0 seconds" means "until it ends by
+        // itself", and a track that loops never does, so one held the rotation
+        // for ten minutes.)
+        //
+        // A name the engine will not make costs a log line and the next entry,
+        // so a track whose wave will not stream at this gate is not a risk --
+        // it is a line in FusionFix.shaders.log.
+        //
+        // Every entry below was played at this gate and recorded: -21.8 to
+        // -31.0 dBFS for the twelve songs, -42.5 for the stems, -33.2 for the
+        // loading tune, -24.3 for the menu music, -28.0 for the starting tune
+        // and -24.3 for the credits. Nothing here is silent.
         return {
             { Kind::Stems, 0, "",                                 150 },  // the loading music, as shipped
-            { Kind::Named, 0, "MENU_MUSIC_STREAMED",              240 },  // the pause / frontend menu music
-            { Kind::Named, 0, "RADIO_DANCE_MIX_FK",               420 },  // Electro-Choc
+            { Kind::Named, 0, "MENU_MUSIC_1",                     240 },  // the pause / frontend menu music
+            { Kind::Named, 0, "RADIO_VLADIVOSTOK_CHIKI",          330 },
+            { Kind::Named, 0, "RADIO_VLADIVOSTOK_REPREZENTY",     330 },
+            { Kind::Named, 0, "RADIO_VLADIVOSTOK_ADD_SPEED",      330 },
             { Kind::Stems, 0, "",                                  90 },  // back to the loading music
-            { Kind::Named, 0, "RADIO_BOBBY_KONDERS_MASSIVEB_MIX", 420 },  // Massive B Soundsystem
-            { Kind::Named, 0, "RADIO_NY_CLASSICS_CLASSICS_MIX",   420 },  // The Classics
-            { Kind::Named, 0, "RADIO_RAMJAMFM_RAMJAM_MIX",        420 },  // RamJam FM
-            { Kind::Named, 0, "INTRO_MUSIC_TRACK",                180 },  // the intro cutscene track
+            { Kind::Named, 0, "RADIO_VLADIVOSTOK_MON_AMI",        330 },
+            { Kind::Named, 0, "RADIO_VLADIVOSTOK_HOT_SUMMER",     330 },
+            { Kind::Named, 0, "RADIO_VLADIVOSTOK_UNDERGROUND",    330 },
+            { Kind::Named, 0, "RADIO_VLADIVOSTOK_NOCHJU",         330 },
+            { Kind::Named, 0, "RADIO_VLADIVOSTOK_LIBERTYCITY",    330 },
+            { Kind::Named, 0, "LOADING_TUNE",                     150 },  // the game's own loading tune
+            { Kind::Named, 0, "RADIO_VLADIVOSTOK_PLAY",           330 },
+            { Kind::Named, 0, "RADIO_VLADIVOSTOK_KARAOKE",        330 },
+            { Kind::Named, 0, "RADIO_VLADIVOSTOK_BEGO_RANCHO_SONG", 330 },
+            { Kind::Named, 0, "RADIO_VLADIVOSTOK_RIFFMASTER_TONY",  330 },
+            { Kind::Named, 0, "STARTING_TUNE",                    120 },
             { Kind::Named, 0, "END_CREDITS_MUSIC",                300 },  // the end-credits theme
         };
-        // NOT HERE, AND MEASURED: the INSTALL_MUSIC_ set. 0x008E55F0's flag
-        // picks it and the sounds exist in sounds.dat15, but the PC build's
-        // LOADING wave bank holds no INSTALL_ wave -- the bank is
-        // LOADING_TUNE, MENU_STREAMED, the DEATH_ set, STARTING_TUNE,
-        // END_CREDITS_THEME_TUNE and INTRO_CUTSCENE_TRACK -- and a run with it
-        // in the rotation recorded -inf dB for its whole slot. Silence is
-        // worse than repetition, so it is out.
+        // NOT HERE, AND MEASURED: MENU_MUSIC_STREAMED and INTRO_MUSIC_TRACK,
+        // both -120 dBFS for their whole slot on an IV boot (the first of them
+        // twice, once in a slot of 25 s), and the INSTALL_MUSIC_ set, silent
+        // for the same reason -- the PC build's LOADING bank holds none of
+        // those waves. Silence is worse than repetition, so they are out; the
+        // header has the whole measurement.
+        //
+        // ALSO NOT HERE ANY MORE: the four continuous DJ mixes (Electro-Choc's
+        // Francois K, Massive B Soundsystem, The Classics, RamJam FM). They
+        // are still the right shape and still play, but only one of them is
+        // Niko's music by genre and Electro-Choc belongs to Luis's list now.
+        // PrecompileWarmMusicTracksIV is how to have them back.
     }
+
+    // TLAD: Liberty Rock Radio. Johnny's episode re-scores LRR with fourteen
+    // more hard-rock records of its own (E1_RADIO_LIBERTY_ROCK_*_PH in
+    // TLAD/pc/audio/config/EP1_RADIO_SOUNDS.DAT15, waves in EP1_SFX.rpf, which
+    // e1_radio.xml registers as a wavepack) on top of the base station's
+    // seventeen, and it redefines LOADING_TUNE to its own loading music -- so
+    // that name, unchanged, is already the episode's. The four base LRR
+    // records at the end are the hardest of the base station's, kept so the
+    // list is over an hour and a half.
+    //
+    // NO MENU MUSIC IN THIS ONE, and that is measured rather than an
+    // oversight: on a TLAD boot MENU_MUSIC_STREAMED, MENU_MUSIC_1,
+    // MENU_MUSIC_DULCIMER and MENU_MUSIC_PERCUSSION are all -120 dBFS for
+    // their whole slot, so there is no name through which the episode's
+    // frontend music is audible at this gate. Its loading tune (-32.3) and
+    // its intro theme (-28.7) carry the non-radio part of the list instead.
+    inline std::vector<Track> DefaultTracksTLAD()
+    {
+        // NO STEMS IN THIS LIST EITHER. The six-stem loading set
+        // (LOADING_MUSIC_*) is base-game-only -- neither episode table
+        // redefines it -- and it IS audible on a TLAD boot (-38.3 dBFS,
+        // centroid 505 Hz), which is the problem: it is Niko's cellos, on
+        // Johnny's loading screen. The episode's own LOADING_TUNE opens
+        // instead, and the engine's stems, if they were the thing playing when
+        // the gate opened, are handed back untouched at the end as before.
+        return {
+            { Kind::Named, 0, "LOADING_TUNE",                            150 },  // EP1_SFX\LOADINGTUNE_1
+            { Kind::Named, 0, "EP1_INTRO_MUSIC_TRACK",                   180 },  // the episode's intro theme
+            { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_00_HIGHWAYSTAR_PH", 330 },
+            { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_HAIROFTHEDOG_PH",   330 },
+            { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_WHEELOFSTEEL_PH",   330 },
+            { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_LORDOFTHETHIGHS_PH",330 },
+            { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_RENEGADE_PH",       330 },
+            { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_WILDSIDE_PH",       330 },
+            { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_SATURDAYNIGHTSPECIAL_PH", 330 },
+            { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_GOTOHELL_PH",       330 },
+            { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_FUNKNUMBER49_PH",   330 },
+            { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_FREERIDE_PH",       330 },
+            { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_DEADORALIVE_PH",    330 },
+            { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_CHINAGROVE_PH",     330 },
+            { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_EVERYPICTURETELLS_PH", 330 },
+            { Kind::Named, 0, "E1_RADIO_LIBERTY_ROCK_DRIVINWHEEL_PH",    330 },
+            { Kind::Named, 0, "RADIO_LIBERTY_ROCK_IWANNABEYOURDOG",      330 },
+            { Kind::Named, 0, "RADIO_LIBERTY_ROCK_ROCKYMOUNTAINWAY",     330 },
+            { Kind::Named, 0, "RADIO_LIBERTY_ROCK_JAILBREAK",            330 },
+            { Kind::Named, 0, "RADIO_LIBERTY_ROCK_HERSTRUT",             330 },
+            { Kind::Named, 0, "E1_END_CREDITS_FIRST_TRACK",              300 },  // the episode's credits
+        };
+        // All twenty were played at this gate and recorded: -23.0 to -37.1
+        // dBFS. The one that needed a second look is
+        // RADIO_LIBERTY_ROCK_IWANNABEYOURDOG, silent on its first 12-second
+        // probe slot and fine (-28.0) when the rotation came round to it --
+        // the stream slot had not finished loading it. With a slot of five
+        // and a half minutes that cannot happen.
+    }
+
+    // TBoGT: the club. Luis's episode gives Electro-Choc a second continuous
+    // club mix (the Crookers one, E2_RADIO_DANCE_MIX_CROOKERS_MIX), turns
+    // Vladivostok FM into a eurobeat mix, adds ten disco records to K109 The
+    // Studio, and redefines LOADING_TUNE and the MENU_MUSIC_ set to its own --
+    // all in TBoGT/pc/audio/config/EP2_*.DAT15 with the waves in EP2_SFX.rpf,
+    // which both e2_audio.xml and e2_radio.xml register. The base game's own
+    // Electro-Choc mix is still loaded under the episode and is still the same
+    // club, so it is in this list and not Niko's.
+    //
+    // Every entry was played at this gate and recorded: -23.4 to -32.0 dBFS,
+    // sixteen of sixteen audible, none refused.
+    inline std::vector<Track> DefaultTracksTBoGT()
+    {
+        // MENU_MUSIC_1, not MENU_MUSIC_STREAMED. MENU_MUSIC_STREAMED is
+        // silent at this gate in every episode (see the header); MENU_MUSIC_1
+        // here is the EP2_SFX\MENU_MUSIC set that TBoGT's own table puts
+        // behind it, and it is the loudest thing in the rotation at -23.4.
+        return {
+            { Kind::Named, 0, "LOADING_TUNE",                            150 },  // EP2_SFX\LOADING_TUNE
+            { Kind::Named, 0, "MENU_MUSIC_1",                            240 },  // EP2_SFX\MENU_MUSIC
+            { Kind::Named, 0, "E2_RADIO_DANCE_MIX_CROOKERS_MIX",         600 },  // Electro-Choc, the Crookers mix
+            { Kind::Named, 0, "E2_RADIO_VLADIVOSTOK_EUROBEAT_MIX",       600 },  // Vladivostok FM, the eurobeat mix
+            { Kind::Named, 0, "RADIO_DANCE_MIX_FK",                      420 },  // Electro-Choc, the Francois K mix
+            { Kind::Named, 0, "DANCING_HERCULES_MIX",                    300 },  // the Hercules dance floor
+            { Kind::Named, 0, "E2_RADIO_K109_THE_STUDIO_DISCOINFERNO",   330 },
+            { Kind::Named, 0, "E2_RADIO_K109_THE_STUDIO_EVERYBODYDANCE", 330 },
+            { Kind::Named, 0, "E2_RADIO_K109_THE_STUDIO_BOOGIEOOGIE",    330 },
+            { Kind::Named, 0, "E2_RADIO_K109_THE_STUDIO_RELIGHTMYFIRE",  330 },
+            { Kind::Named, 0, "E2_RADIO_K109_THE_STUDIO_GREATESTDANCER", 330 },
+            { Kind::Named, 0, "E2_RADIO_K109_THE_STUDIO_YOUNGHEARTSRUNFREE", 330 },
+            { Kind::Named, 0, "E2_RADIO_K109_THE_STUDIO_SHAKEYOURGROOVETHING", 330 },
+            { Kind::Named, 0, "E2_RADIO_K109_THE_STUDIO_MENERGY",        330 },
+            { Kind::Named, 0, "E2_RADIO_K109_THE_STUDIO_PUTURBODYINIT",  330 },
+            { Kind::Named, 0, "E2_RADIO_K109_THE_STUDIO_BUSSTOP",        330 },
+        };
+        // DANCING_HERCULES_MIX (EP2_SFX\HERCULES_CLUB_MIX) is in the list
+        // because it was HEARD, which is not what was expected of it: it is
+        // the club interior's own mix rather than a radio track, so a loading
+        // screen with no listener looked like the wrong place for it. It
+        // played at -32.0 dBFS, six decibels under the radio tracks but
+        // nowhere near silence, so it stays -- the dance floor of the episode
+        // the player is about to load.
+    }
+
+    inline std::vector<Track> DefaultTracks(Episode e)
+    {
+        switch (e)
+        {
+        case Episode::TLAD:  return DefaultTracksTLAD();
+        case Episode::TBoGT: return DefaultTracksTBoGT();
+        case Episode::IV:    return DefaultTracksIV();
+        default: break;
+        }
+        // The episode could not be read, so play the base game's list. Every
+        // name in it is a BASE name, and a base name is the only kind that is
+        // defined whichever episode this turns out to be -- the measurement
+        // that settles it is RADIO_VLADIVOSTOK_CHIKI, played and recorded in
+        // all three (-23.0 dBFS in each, the same spectrum every time), and
+        // the base loading stems and LOADING_TUNE, audible in each as well.
+        // An episode's OWN list would be a gamble here; this one is not.
+        return DefaultTracksIV();
+    }
+
+    // ---------------------------------------------------------------------
+    //  What the gate hands us: the ini, and where to read the episode from.
+    //  One struct rather than five arguments, because the ini gained a key per
+    //  episode and the call site should stay one line.
+    // ---------------------------------------------------------------------
+    struct Options
+    {
+        bool           enabled = true;       // PrecompileWarmMusic
+        std::string    tracks;               // PrecompileWarmMusicTracks, every episode
+        std::string    tracksIV;             // PrecompileWarmMusicTracksIV
+        std::string    tracksTLAD;           // PrecompileWarmMusicTracksTLAD
+        std::string    tracksTBoGT;          // PrecompileWarmMusicTracksTBoGT
+        const int32_t* episode = nullptr;    // comvars' _dwCurrentEpisode
+    };
 
     // ---------------------------------------------------------------------
     //  State. One instance, owned by the gate.
@@ -217,6 +462,7 @@ namespace warmmusic
         bool                validated = false;
         bool                armed = false;       // validated AND turned on in the ini
         bool                running = false;
+        Episode             episode = Episode::Unknown;
         std::vector<Track>  tracks;
         size_t              index = 0;
         int64_t             trackStartUs = 0;
@@ -281,6 +527,32 @@ namespace warmmusic
         if (!Readable((const void*)p, sizeof(T))) return false;
         memcpy(&out, (const void*)p, sizeof(T));
         return true;
+    }
+
+    // The episode index, validated. See the Episode enum above for why this is
+    // the global the whole mod already reads rather than a path or a file list.
+    inline Episode ResolveEpisode(const int32_t* global, std::string& why)
+    {
+        if (!global)
+        {
+            why = "FusionFix never found the episode global in this build";
+            return Episode::Unknown;
+        }
+        int32_t v = -1;
+        if (!Peek((uintptr_t)global, v))
+        {
+            why = "the episode global is not readable at the gate";
+            return Episode::Unknown;
+        }
+        if (v < 0 || v > 2)
+        {
+            char b[96];
+            _snprintf_s(b, sizeof(b), _TRUNCATE,
+                        "the episode global reads %d, which is not 0, 1 or 2", v);
+            why = b;
+            return Episode::Unknown;
+        }
+        return (Episode)v;
     }
 
     inline uintptr_t Entity()
@@ -516,12 +788,30 @@ namespace warmmusic
         return out;
     }
 
+    // Which ini key wins for this episode. The per-episode key is the specific
+    // one, so it beats the all-episodes key; with neither set the episode's own
+    // shipped list plays. Named so the log line can say which was used.
+    inline const std::string& SpecFor(const Options& o, Episode e, const char*& key)
+    {
+        const std::string* per = nullptr;
+        switch (e)
+        {
+        case Episode::IV:    per = &o.tracksIV;    key = "PrecompileWarmMusicTracksIV";    break;
+        case Episode::TLAD:  per = &o.tracksTLAD;  key = "PrecompileWarmMusicTracksTLAD";  break;
+        case Episode::TBoGT: per = &o.tracksTBoGT; key = "PrecompileWarmMusicTracksTBoGT"; break;
+        default: break;
+        }
+        if (per && !per->empty()) return *per;
+        key = "PrecompileWarmMusicTracks";
+        return o.tracks;
+    }
+
     // Begin: the gate is open and the loading screen is pinned.
-    inline void BeginImpl(int64_t nowUs, bool enabled, const std::string& spec)
+    inline void BeginImpl(int64_t nowUs, const Options& o)
     {
         State& s = S();
         s.running = false;
-        if (!enabled) { Say("warm music: off (PrecompileWarmMusic = 0)"); return; }
+        if (!o.enabled) { Say("warm music: off (PrecompileWarmMusic = 0)"); return; }
         std::string why;
         if (!s.validated && !Validate(why))
         {
@@ -533,13 +823,24 @@ namespace warmmusic
             Say("warm music: off - the frontend audio entity is not registered at the gate");
             return;
         }
-        s.tracks = spec.empty() ? DefaultTracks() : ParseTracks(spec);
+
+        // The episode, before the list: a list is only correct for the episode
+        // whose audio data defines its names.
+        std::string noEpisode;
+        s.episode = ResolveEpisode(o.episode, noEpisode);
+        if (s.episode == Episode::Unknown)
+            Say("warm music: %s - playing the tracks every episode has", noEpisode.c_str());
+
+        const char* key = nullptr;
+        const std::string& spec = SpecFor(o, s.episode, key);
+        s.tracks = spec.empty() ? DefaultTracks(s.episode) : ParseTracks(spec);
         if (s.tracks.empty()) { Say("warm music: off - no tracks"); return; }
         s.hadStems = StemsPlaying();
         s.armed = true;
         s.running = true;
         s.played = s.failed = 0;
-        Say("warm music: on, %zu tracks%s", s.tracks.size(),
+        Say("warm music: on for %s, %zu tracks from %s%s", EpisodeName(s.episode), s.tracks.size(),
+            spec.empty() ? "the shipped rotation" : key,
             s.hadStems ? " (the engine's loading stems were playing)" : "");
         StartTrack(0, nowUs);
     }
@@ -632,9 +933,9 @@ namespace warmmusic
         Say("warm music: FAULTED while %s - off for the rest of the load", doing);
     }
 
-    inline void Begin(int64_t nowUs, bool enabled, const std::string& spec)
+    inline void Begin(int64_t nowUs, const Options& o)
     {
-        __try { BeginImpl(nowUs, enabled, spec); }
+        __try { BeginImpl(nowUs, o); }
         __except (EXCEPTION_EXECUTE_HANDLER) { Faulted("starting the rotation"); SweepQuiet(); }
     }
 
